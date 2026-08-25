@@ -1,0 +1,26 @@
+# Secrets & credentials — never commit
+.env
+
+# Generated task exports may contain customer data
+timeline/
+
+# Python virtualenvs
+.venv/
+venv/
+env/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+
+# Personal, machine-specific Claude Code overrides
+.claude/settings.local.json
