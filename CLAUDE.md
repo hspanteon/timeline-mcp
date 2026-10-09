@@ -65,7 +65,7 @@ When a fetched task has neither description nor comments, the MCP tool asks the 
 
 ## Plugin packaging
 
-The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), `.mcp.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`), and `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review). Validate changes with `claude plugin validate .`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
+The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), the `mcpServers` entry inside `plugin.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`; deliberately not a root `.mcp.json`, which Claude Code would also load as a project-scope config where `${CLAUDE_PLUGIN_ROOT}` is undefined), and `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review). Validate changes with `claude plugin validate .`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
 
 ## Testing conventions
 

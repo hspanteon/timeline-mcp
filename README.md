@@ -96,9 +96,11 @@ This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP
 export PANTEON_BEARER_TOKEN="eyJ..."   # add to ~/.bashrc / ~/.zshrc
 
 # Inside Claude Code
-/plugin marketplace add <git-url-or-local-path-of-this-repo>
+/plugin marketplace add <git-url-of-this-repo>
 /plugin install panteon-timeline@panteon-tools
 ```
+
+Add the marketplace from the git URL. A local clone works too, but write it as `./` or an absolute path (a bare `.` is rejected), and note that a local-path install copies the whole working tree, including any `.env` and `timeline/` exports.
 
 Requires [`uv`](https://docs.astral.sh/uv/) on the PATH; the server's dependencies are resolved by `uv run` on launch, so no `.venv` is needed.
 
