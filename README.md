@@ -87,6 +87,25 @@ After saving the config, restart Codex and run `/mcp` in the Codex TUI to confir
 
 ---
 
+## 🔌 Install as a Claude Code plugin
+
+This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP server with the `task-spec` skill, which turns a fetched task into a repo-aware `spec.md`.
+
+```bash
+# One-time: credentials come from your shell environment (the plugin copy has no .env)
+export PANTEON_BEARER_TOKEN="eyJ..."   # add to ~/.bashrc / ~/.zshrc
+
+# Inside Claude Code
+/plugin marketplace add <git-url-or-local-path-of-this-repo>
+/plugin install panteon-timeline@panteon-tools
+```
+
+Requires [`uv`](https://docs.astral.sh/uv/) on the PATH; the server's dependencies are resolved by `uv run` on launch, so no `.venv` is needed.
+
+Then, in any project repo: ask Claude to "write a spec for Panteon task 5461" (or invoke `/panteon-timeline:task-spec 5461`). Output stays project-based: `<project>/timeline/<issue_id>/task.md` and `spec.md`. Make sure `timeline/` is gitignored in each project.
+
+If you previously registered `timeline-mcp` manually (see above), remove that entry to avoid two copies of the server.
+
 ## 🧰 Available Tools
 
 ### `get_task_conversation`

@@ -1,0 +1,14 @@
+{
+  "name": "panteon-tools",
+  "description": "Panteon internal Claude Code tools",
+  "owner": {
+    "name": "Panteon"
+  },
+  "plugins": [
+    {
+      "name": "panteon-timeline",
+      "source": "./",
+      "description": "Panteon Timeline MCP server + task-spec skill"
+    }
+  ]
+}

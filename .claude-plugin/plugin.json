@@ -1,0 +1,6 @@
+{
+  "name": "panteon-timeline",
+  "version": "0.1.0",
+  "description": "Fetch Panteon Timeline tasks (description + conversation + images) and turn them into a repo-aware SPEC before any work starts.",
+  "author": { "name": "Panteon" }
+}

@@ -49,7 +49,7 @@ Fetching a task mirrors the reference browser extension's logic and always happe
 
 ### Markdown rendering contract
 
-`render_task_markdown` produces a `task.md` with a fixed section order (Description, User-Provided Context, Conversation, Acceptance Criteria, Open Questions, Images). Two markdown "layers" are intentionally kept apart: the document's own structure is plain markdown, while all original content (task description, each comment) is wrapped in a fenced code block via `_as_code_block`, sized to a backtick run longer than any backticks already in the content, so embedded content can never break out and corrupt the document structure. Image URLs found inside that content are rewritten to absolute URLs (`absolutize_markdown_images` / `_resolve_url`) before being embedded, since the file is meant to stand alone outside the browser.
+`render_task_markdown` produces a `task.md` (header: ID, Title, Creator, Date Created, Status, Tags; comments by the task creator are labelled "(task creator)" in their heading) with a fixed section order (Description, User-Provided Context, Conversation, Acceptance Criteria, Open Questions, Images). Two markdown "layers" are intentionally kept apart: the document's own structure is plain markdown, while all original content (task description, each comment) is wrapped in a fenced code block via `_as_code_block`, sized to a backtick run longer than any backticks already in the content, so embedded content can never break out and corrupt the document structure. Image URLs found inside that content are rewritten to absolute URLs (`absolutize_markdown_images` / `_resolve_url`) before being embedded, since the file is meant to stand alone outside the browser.
 
 `## Acceptance Criteria` and `## Open Questions` are always emitted as placeholders — they require reasoning over the description that this deterministic fetcher does not attempt, and are left for an AI assistant reading the file to fill in.
 
@@ -62,6 +62,10 @@ When a fetched task has neither description nor comments, the MCP tool asks the 
 ### Authentication
 
 `build_api_headers` in `panteon_client.py` accepts a bearer token or cookie either as function arguments (per-call override, used by the MCP tool's optional args) or via `PANTEON_BEARER_TOKEN` / `PANTEON_COOKIE` env vars, loaded from a `.env` sitting next to `panteon_client.py` (not the caller's cwd) so credentials resolve regardless of which project the server is launched from. 401/403 responses are translated into a `PermissionError` with a consistent message; missing credentials raise before any request is made.
+
+## Plugin packaging
+
+The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), `.mcp.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`), and `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review). Validate changes with `claude plugin validate .`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
 
 ## Testing conventions
 
