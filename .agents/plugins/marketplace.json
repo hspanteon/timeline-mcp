@@ -1,0 +1,12 @@
+{
+  "name": "panteon-tools",
+  "interface": { "displayName": "Panteon tools" },
+  "plugins": [
+    {
+      "name": "panteon-timeline",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_USE" },
+      "category": "Productivity"
+    }
+  ]
+}

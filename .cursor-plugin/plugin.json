@@ -1,0 +1,32 @@
+{
+  "name": "panteon-timeline",
+  "version": "0.1.0",
+  "description": "Fetch Panteon Timeline tasks (description + conversation + images) and turn them into a repo-aware SPEC before any work starts.",
+  "author": { "name": "Panteon" },
+  "skills": "./skills/",
+  "mcpServers": {
+    "timeline-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--with-requirements",
+        "${CURSOR_PLUGIN_ROOT}/requirements.txt",
+        "python",
+        "${CURSOR_PLUGIN_ROOT}/server.py"
+      ],
+      "env": {
+        "PANTEON_BEARER_TOKEN": "${PANTEON_BEARER_TOKEN}"
+      }
+    }
+  },
+  "variables": {
+    "type": "object",
+    "properties": {
+      "PANTEON_BEARER_TOKEN": {
+        "type": "string",
+        "description": "JWT from timeline.panteon.no (starts with eyJ...)"
+      }
+    }
+  }
+}

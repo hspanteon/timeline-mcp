@@ -1,0 +1,12 @@
+{
+  "name": "panteon-tools",
+  "owner": { "name": "Panteon" },
+  "metadata": { "description": "Panteon internal AI tools" },
+  "plugins": [
+    {
+      "name": "panteon-timeline",
+      "source": "./",
+      "description": "Panteon Timeline MCP server + task-spec skill"
+    }
+  ]
+}

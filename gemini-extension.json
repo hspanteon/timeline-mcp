@@ -1,0 +1,26 @@
+{
+  "name": "panteon-timeline",
+  "version": "0.1.0",
+  "description": "Fetch Panteon Timeline tasks (description + conversation + images) and turn them into a repo-aware SPEC before any work starts.",
+  "mcpServers": {
+    "timeline-mcp": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--with-requirements",
+        "${extensionPath}${/}requirements.txt",
+        "python",
+        "${extensionPath}${/}server.py"
+      ]
+    }
+  },
+  "settings": [
+    {
+      "name": "Panteon bearer token",
+      "description": "JWT from timeline.panteon.no (starts with eyJ...). Stored in your system keychain.",
+      "envVar": "PANTEON_BEARER_TOKEN",
+      "sensitive": true
+    }
+  ]
+}

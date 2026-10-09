@@ -108,6 +108,20 @@ Then, in any project repo: ask Claude to "write a spec for Panteon task 5461" (o
 
 If you previously registered `timeline-mcp` manually (see above), remove that entry to avoid two copies of the server.
 
+## 🧩 Install on other AI tools (Codex, Gemini CLI, Cursor)
+
+The same repo carries a wrapper per tool. All of them share the one `skills/task-spec/SKILL.md`.
+
+| Tool | Wrapper files | Install | Gets |
+|---|---|---|---|
+| **Gemini CLI** | `gemini-extension.json` | `gemini extensions install <git-url-of-this-repo>` (asks for your bearer token and keeps it in the system keychain) | MCP server + skill |
+| **Codex** | `.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json` | `codex plugin marketplace add <git-url-of-this-repo>`, then `codex plugin add panteon-timeline@panteon-tools` | Skill only. Add the MCP server through `config.toml` (see "For Codex" above) |
+| **Cursor** | `.cursor-plugin/plugin.json`, `.cursor-plugin/marketplace.json` | Dashboard → Settings → Plugins → Import, paste the git URL; set `PANTEON_BEARER_TOKEN` under Configure | MCP server + skill |
+
+Why Codex is skill-only: Codex starts a plugin's MCP server with the plugin directory as its working directory, so `timeline/<issue_id>/` would be written inside the plugin cache instead of your project. The `config.toml` setup runs the server from your project, which keeps the output project-based.
+
+Status: the Gemini and Codex wrappers were validated and installed with their CLIs; the Cursor wrapper follows Cursor's documented format but has not been run in Cursor. Tools without a plugin system can still use the manual MCP configs above.
+
 ## 🧰 Available Tools
 
 ### `get_task_conversation`

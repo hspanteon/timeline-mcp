@@ -1,0 +1,15 @@
+{
+  "name": "panteon-timeline",
+  "version": "0.1.0",
+  "description": "Turn a Panteon Timeline task into a goal-first, repo-aware SPEC before any work starts. Requires the timeline-mcp server (see README).",
+  "author": { "name": "Panteon" },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Panteon Timeline",
+    "shortDescription": "Turn a Panteon task into a precise, repo-aware spec",
+    "developerName": "Panteon",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["Write a spec for Panteon task 5461"]
+  }
+}
