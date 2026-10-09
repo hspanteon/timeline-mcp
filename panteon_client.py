@@ -397,6 +397,12 @@ def _as_code_block(text: str) -> str:
     return f"{fence}\n{text}\n{fence}"
 
 
+def _is_same_person(a: Optional[str], b: Optional[str]) -> bool:
+    """Case/whitespace-insensitive name match; empty names never match."""
+    a, b = (a or "").strip().casefold(), (b or "").strip().casefold()
+    return bool(a) and a == b
+
+
 def render_task_markdown(
     issue_id: str,
     task_meta: Dict[str, Any],
@@ -406,7 +412,7 @@ def render_task_markdown(
     Renders the task as a `task.md` document:
 
         # Task {id}: {title}
-        **ID / Title / Date Created / Status**
+        **ID / Title / Creator / Date Created / Status / Tags**
         ## Description
         ## User-Provided Context
         ## Conversation
@@ -420,9 +426,12 @@ def render_task_markdown(
     references inside that content are rewritten to absolute URLs so the links remain
     usable.
 
+    Comments written by the task creator are labelled "(task creator)" in their
+    heading, so requirements can be told apart from discussion by other people.
+
     `## Acceptance Criteria` and `## Open Questions` need reasoning over the
-    description, which this deterministic fetcher cannot do, so they are emitted as
-    placeholders for an AI assistant to complete.
+    description and conversation, which this deterministic fetcher cannot do, so
+    they are emitted as placeholders for an AI assistant to complete.
     """
     title = task_meta.get("title") or f"Issue {issue_id}"
     user_context = (task_meta.get("user_context") or "").strip()
@@ -432,13 +441,18 @@ def render_task_markdown(
         extra_descriptions=[user_context] if user_context else None,
     )
 
+    creator = task_meta.get("creator") or ""
+    tags = ", ".join(task_meta.get("tags") or []) or "—"
+
     lines = [
         f"# Task {issue_id}: {title}",
         "",
         f"**ID:** {issue_id}",
         f"**Title:** {title}",
+        f"**Creator:** {creator or '—'}",
         f"**Date Created:** {task_meta.get('created_date') or task_meta.get('created_at') or '—'}",
         f"**Status:** {task_meta.get('status') or '(unknown)'}",
+        f"**Tags:** {tags}",
         "",
     ]
 
@@ -461,6 +475,8 @@ def render_task_markdown(
         lines.append("")
     for comment in comments:
         header = comment["author"] or "Unknown"
+        if _is_same_person(comment["author"], creator):
+            header += " (task creator)"
         if comment.get("created_at"):
             header += f" — {comment['created_at']}"
         lines.append(f"### {header}")
@@ -476,7 +492,7 @@ def render_task_markdown(
 
     lines.append("## Open Questions")
     lines.append("")
-    lines.append("None.")
+    lines.append("_To be derived from the description and conversation above._")
     lines.append("")
 
     lines.append(f"## Images ({len(all_images)})")

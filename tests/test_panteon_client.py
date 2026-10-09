@@ -228,6 +228,38 @@ class TestRenderTaskMarkdown:
         assert "## Conversation (1 comment(s))" in md
         assert "### Alice — 2026-06-26" in md
 
+    def test_header_shows_creator_and_tags(self):
+        md = pc.render_task_markdown(
+            "5461", self._meta(creator="Carol", tags=["bug", "urgent"]), []
+        )
+        assert "**Creator:** Carol" in md
+        assert "**Tags:** bug, urgent" in md
+
+    def test_header_creator_and_tags_fallback(self):
+        md = pc.render_task_markdown("5461", self._meta(), [])
+        assert "**Creator:** —" in md
+        assert "**Tags:** —" in md
+
+    def test_creator_comments_are_marked(self):
+        comments = [
+            {"author": "carol", "created_at": "2026-06-26", "description": "a", "images": []},
+            {"author": "Alice", "created_at": "2026-06-27", "description": "b", "images": []},
+        ]
+        md = pc.render_task_markdown("5461", self._meta(creator="Carol"), comments)
+        assert "### carol (task creator) — 2026-06-26" in md
+        assert "### Alice — 2026-06-27" in md
+
+    def test_no_creator_marking_when_creator_unknown(self):
+        comments = [{"author": "", "created_at": "", "description": "a", "images": []}]
+        md = pc.render_task_markdown("5461", self._meta(creator=""), comments)
+        assert "(task creator)" not in md
+
+    def test_open_questions_is_a_placeholder_not_none(self):
+        md = pc.render_task_markdown("5461", self._meta(), [])
+        open_q = md.split("## Open Questions", 1)[1].split("## Images", 1)[0]
+        assert "None." not in open_q
+        assert "To be derived" in open_q
+
 
 # --------------------------------------------------------------------------- #
 # build_api_headers
