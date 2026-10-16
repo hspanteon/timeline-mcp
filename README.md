@@ -89,7 +89,10 @@ After saving the config, restart Codex and run `/mcp` in the Codex TUI to confir
 
 ## 🔌 Install as a Claude Code plugin
 
-This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP server with the `task-spec` skill, which turns a fetched task into a repo-aware `spec.md`.
+This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP server with two skills:
+
+- `task-spec` turns a fetched task into a repo-aware `spec.md`.
+- `my-day` gives a morning brief from your planner: overdue and soon-due tasks, the latest conversation on your top 3, and where to start.
 
 ```bash
 # One-time: credentials come from your shell environment (the plugin copy has no .env)
@@ -106,11 +109,13 @@ Requires [`uv`](https://docs.astral.sh/uv/) on the PATH; the server's dependenci
 
 Then, in any project repo: ask Claude to "write a spec for Panteon task 5461" (or invoke `/panteon-timeline:task-spec 5461`). Output stays project-based: `<project>/timeline/<issue_id>/task.md` and `spec.md`. Make sure `timeline/` is gitignored in each project.
 
+For a morning brief, ask "what should I work on today?" (or invoke `/panteon-timeline:my-day`). It is read only, apart from the `task.md` files that fetching the top tasks writes.
+
 If you previously registered `timeline-mcp` manually (see above), remove that entry to avoid two copies of the server.
 
 ## 🧩 Install on other AI tools (Codex, Gemini CLI, Cursor)
 
-The same repo carries a wrapper per tool. All of them share the one `skills/task-spec/SKILL.md`.
+The same repo carries a wrapper per tool. All of them share the same `skills/` directory (`task-spec` and `my-day`).
 
 | Tool | Wrapper files | Install | Gets |
 |---|---|---|---|
@@ -146,7 +151,18 @@ including **every image** embedded anywhere, and **writes it to a markdown file*
 Image URLs embedded in comments (markdown `![](…)` or HTML `<img>`) are resolved to absolute
 `https://timeline.panteon.no/...` URLs. Non-image attachment links (e.g. `.csv`) are excluded.
 
-#### Output location
+### `get_my_priority_tasks`
+Lists **your** priority tasks from the employee planner
+(`/api/employee-planner/get-priority-tasks/{now|next|commingup}`) as a markdown table in priority order:
+issue (linked to its task page), title, stage, status, deadline, support flag.
+Deadlines are flagged `(overdue)`, `(due today)` or `(due in Nd)` (within 7 days), and the header counts overdue and due-soon tasks.
+- **Arguments**:
+  - `period` (`now` | `next` | `commingup`, default `now`) — planner column. `commingup` is the API's own spelling ("coming up") and must be used exactly. Other values (including `comingup`) are rejected, because the API silently returns every task for an unknown period.
+  - `user_id` (int, optional) — whose planner to show. Defaults to `PANTEON_USER_ID`, then the `sub` claim of the bearer JWT. Cookie-only auth must set `PANTEON_USER_ID`.
+  - `bearer_token` / `cookie` (str, optional) — override the `.env` credentials per call.
+- **Returns** the markdown directly; nothing is written to disk. Pass any issue number to `get_task_conversation` for the full task.
+
+#### Output location (`get_task_conversation`)
 The file is written to `<base>/timeline/<issue_id>/task.md`, where `<base>` is:
 1. `PANTEON_TIMELINE_DIR` env var, if set (this MCP is configured with it pointing at the
    `duell-admin` project root); otherwise
@@ -168,6 +184,11 @@ The same fetch logic is available from the shell via `fetch_task.py` (credential
 
 # Write under a specific project root instead of PANTEON_TIMELINE_DIR / cwd
 .venv/bin/python fetch_task.py 5461 --base-dir /path/to/project
+
+# Your priority tasks from the employee planner
+.venv/bin/python fetch_task.py --planner
+.venv/bin/python fetch_task.py --planner --period next        # or: commingup
+.venv/bin/python fetch_task.py --planner --user-id 135
 ```
 
 ---

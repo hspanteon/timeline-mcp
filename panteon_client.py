@@ -2,7 +2,7 @@ import base64
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 import requests
 from typing import Any, Dict, List, Optional
@@ -538,6 +538,191 @@ def save_task_markdown(
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(render_task_markdown(issue_id, task_meta, comments))
     return path
+
+
+def resolve_user_id(user_id: Optional[Any] = None, bearer_token: Optional[str] = None) -> int:
+    """
+    Resolves the Panteon user id whose planner should be shown, in order:
+    explicit `user_id` argument, then the PANTEON_USER_ID env var, then the
+    `sub` claim of the bearer JWT (Panteon's tokens carry the user id there).
+    Cookie-only setups have no JWT to read, so they must set PANTEON_USER_ID.
+    """
+    candidate = user_id if user_id not in (None, "") else os.getenv("PANTEON_USER_ID")
+    if candidate in (None, ""):
+        token = (bearer_token or os.getenv("PANTEON_BEARER_TOKEN") or "").replace("Bearer ", "").strip()
+        payload = _decode_jwt_payload(token) if token else None
+        candidate = (payload or {}).get("sub")
+
+    try:
+        return int(str(candidate).strip())
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Could not determine your Panteon user id. Set PANTEON_USER_ID, pass "
+            "`user_id`, or use a PANTEON_BEARER_TOKEN whose JWT carries a numeric `sub`."
+        ) from None
+
+
+# Planner periods (the endpoint's path segment) mapped to a display label.
+# "commingup" (sic) is the real API spelling and is the only one accepted.
+# Unknown segments are NOT rejected by the API — they silently return every
+# planner task (e.g. "comingup") — so callers must validate.
+PLANNER_PERIODS = {
+    "now": "Now",
+    "next": "Next",
+    "commingup": "Coming Up",
+}
+
+
+def normalize_planner_period(period: Optional[str]) -> str:
+    """Returns the API path segment for a planner period (now, next, or
+    commingup). Raises ValueError for anything else."""
+    key = (period or "now").strip().lower()
+    if key not in PLANNER_PERIODS:
+        raise ValueError(
+            f"Unknown planner period '{period}'. Use one of: {', '.join(PLANNER_PERIODS)}."
+        )
+    return key
+
+
+def get_priority_tasks(headers: Dict[str, str], period: str = "now") -> List[Dict[str, Any]]:
+    """
+    Calls /api/employee-planner/get-priority-tasks/{period} (now, next or
+    commingup) and returns the per-user list:
+    [{"user_id", "sort_order", "data": [task, ...]}, ...].
+    The endpoint returns every employee's planner, not just the caller's.
+    """
+    segment = normalize_planner_period(period)
+    url = f"{BASE_URL}/api/employee-planner/get-priority-tasks/{segment}"
+    data = _api_get(url, headers, context=f" when fetching the employee planner ({segment})").json()
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        return data["data"]
+    return data if isinstance(data, list) else []
+
+
+def extract_user_priority_tasks(planner: List[Dict[str, Any]], user_id: int) -> List[Dict[str, Any]]:
+    """
+    Picks one user's tasks out of the planner, ordered by priority_sort_order.
+    Raises LookupError when the user isn't in the planner at all — that almost
+    always means a wrong user id, which is different from having zero tasks.
+    """
+    for entry in planner:
+        if isinstance(entry, dict) and str(entry.get("user_id")) == str(user_id):
+            tasks = [t for t in (entry.get("data") or []) if isinstance(t, dict)]
+            return sorted(tasks, key=lambda t: (t.get("priority_sort_order") is None, t.get("priority_sort_order") or 0))
+    raise LookupError(
+        f"User {user_id} was not found in the employee planner. "
+        "Check PANTEON_USER_ID (or the `user_id` argument)."
+    )
+
+
+def _table_cell(value: Any) -> str:
+    """Flattens a value into a single markdown table cell (no pipes/newlines)."""
+    text = " ".join(str(value if value is not None else "").split())
+    return text.replace("|", "\\|") or "—"
+
+
+DUE_SOON_DAYS = 7
+
+
+def deadline_flag(deadline: Optional[str], today: Optional[date] = None) -> str:
+    """
+    Classifies a deadline relative to `today`: "overdue", "due today",
+    "due in Nd" (within DUE_SOON_DAYS), or "" when it is later, missing or
+    unparseable.
+    """
+    normalized = _normalize_date(deadline or "")
+    try:
+        due = date.fromisoformat(normalized)
+    except ValueError:
+        return ""
+    days = (due - (today or date.today())).days
+    if days < 0:
+        return "overdue"
+    if days == 0:
+        return "due today"
+    if days <= DUE_SOON_DAYS:
+        return f"due in {days}d"
+    return ""
+
+
+def _deadline_cell(deadline: Optional[str], flag: str) -> str:
+    cell = _table_cell(_normalize_date(deadline or ""))
+    return f"{cell} **({flag})**" if flag else cell
+
+
+def render_priority_tasks_markdown(
+    user_id: int,
+    tasks: List[Dict[str, Any]],
+    period: str = "now",
+    today: Optional[date] = None,
+) -> str:
+    """
+    Renders a user's planner tasks as a markdown table in priority order. Each
+    issue links to its task page and can be passed to get_task_conversation.
+    Deadlines that are overdue or due within DUE_SOON_DAYS of `today` are
+    flagged in the Deadline column and counted in the header.
+    """
+    label = PLANNER_PERIODS[normalize_planner_period(period)]
+    today = today or date.today()
+    flags = [deadline_flag(task.get("deadline"), today) for task in tasks]
+    overdue = flags.count("overdue")
+    due_soon = sum(1 for flag in flags if flag and flag != "overdue")
+    lines = [
+        f"# My Priority Tasks — {label}",
+        "",
+        f"**User ID:** {user_id}",
+        f"**Tasks:** {len(tasks)}",
+    ]
+    if tasks:
+        lines.append(
+            f"**Overdue:** {overdue} · **Due within {DUE_SOON_DAYS} days:** {due_soon} "
+            f"(as of {today.isoformat()})"
+        )
+    lines.append("")
+    if not tasks:
+        lines += ["_(no priority tasks)_", ""]
+        return "\n".join(lines)
+
+    lines += [
+        "| # | Issue | Title | Stage | Status | Deadline | Support |",
+        "|---|-------|-------|-------|--------|----------|---------|",
+    ]
+    for i, (task, flag) in enumerate(zip(tasks, flags), 1):
+        issue = task.get("issue_number")
+        code = task.get("code")
+        issue_cell = f"#{issue}"
+        if issue and code:
+            issue_cell = f"[#{issue}]({BASE_URL}/tasks#/list/{code}/edit/{issue})"
+        lines.append(
+            f"| {i} | {issue_cell} | {_table_cell(task.get('title'))} "
+            f"| {_table_cell(task.get('stage_status'))} | {_table_cell(task.get('task_status'))} "
+            f"| {_deadline_cell(task.get('deadline'), flag)} "
+            f"| {'yes' if task.get('support') else 'no'} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def fetch_my_priority_tasks(
+    headers: Dict[str, str],
+    user_id: Optional[Any] = None,
+    bearer_token: Optional[str] = None,
+    period: str = "now",
+) -> Dict[str, Any]:
+    """
+    Shared orchestration for the planner (MCP tool and CLI): resolve the user id,
+    fetch the planner for `period` (now, next or commingup), and return
+    {"user_id", "period", "tasks", "markdown"}. Blocking I/O.
+    """
+    segment = normalize_planner_period(period)
+    resolved = resolve_user_id(user_id, bearer_token=bearer_token)
+    tasks = extract_user_priority_tasks(get_priority_tasks(headers, segment), resolved)
+    return {
+        "user_id": resolved,
+        "period": segment,
+        "tasks": tasks,
+        "markdown": render_priority_tasks_markdown(resolved, tasks, segment),
+    }
 
 
 def fetch_task_data(

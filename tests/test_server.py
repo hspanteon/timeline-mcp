@@ -243,3 +243,38 @@ class TestTaskMarkdownResource:
         monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
         with pytest.raises(FileNotFoundError):
             server.task_markdown_resource("999999")
+
+
+# --------------------------------------------------------------------------- #
+# get_my_priority_tasks tool
+# --------------------------------------------------------------------------- #
+class TestGetMyPriorityTasksTool:
+    @pytest.mark.anyio
+    async def test_returns_markdown(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1", "title": "T"}]}],
+        )
+        result = await server.get_my_priority_tasks(user_id=7, bearer_token="tok")
+        assert "# My Priority Tasks" in result
+        assert "#5" in result
+
+    @pytest.mark.anyio
+    async def test_unknown_user_becomes_tool_error(self, monkeypatch):
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": [])
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_priority_tasks(user_id=7, bearer_token="tok")
+        assert "not found" in str(exc_info.value)
+
+    @pytest.mark.anyio
+    async def test_period_is_forwarded(self, monkeypatch):
+        seen = {}
+
+        def fake(headers, period="now"):
+            seen["period"] = period
+            return [{"user_id": 7, "data": []}]
+
+        monkeypatch.setattr(pc, "get_priority_tasks", fake)
+        result = await server.get_my_priority_tasks(period="next", user_id=7, bearer_token="tok")
+        assert seen["period"] == "next"
+        assert "— Next" in result

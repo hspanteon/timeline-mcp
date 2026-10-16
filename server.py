@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Literal, Optional
 
 import anyio
 import requests
@@ -16,7 +16,10 @@ mcp = FastMCP(
         "Fetches task descriptions and full comment conversations (including images) "
         "from Panteon Timeline (timeline.panteon.no). Use get_task_conversation whenever "
         "the user references a Panteon task URL (containing '/edit/<id>') or a bare issue "
-        "ID and wants its content, history, or context. Use check_auth first if "
+        "ID and wants its content, history, or context. Use get_my_priority_tasks when "
+        "the user asks what they should work on, or about their planner/priority tasks "
+        "(period now, next, or commingup). "
+        "Use check_auth first if "
         "PANTEON_BEARER_TOKEN/PANTEON_COOKIE haven't been verified yet, or after a call "
         "fails with an authentication error, to confirm whether credentials are missing, "
         "invalid, or expired before retrying."
@@ -195,6 +198,48 @@ async def get_task_conversation(
         summary += "\n\n---\n\n" + markdown
 
     return summary
+
+
+@mcp.tool(output_schema=None)
+async def get_my_priority_tasks(
+    period: Literal["now", "next", "commingup"] = "now",
+    user_id: Optional[int] = None,
+    bearer_token: Optional[str] = None,
+    cookie: Optional[str] = None,
+) -> str:
+    """
+    Lists your priority tasks from the Panteon employee planner for one period
+    (now, next, or commingup = coming up), in priority order, as a markdown table (issue link, title, stage, status,
+    deadline, support flag). Pass any issue number to get_task_conversation
+    for the full task.
+
+    Args:
+        period: Planner column — "now" (default), "next", or "commingup" (coming up;
+            the API's own spelling).
+        user_id: Optional Panteon user id. Defaults to PANTEON_USER_ID, then the
+            `sub` claim of the bearer token.
+        bearer_token: Optional JWT Bearer token (defaults to PANTEON_BEARER_TOKEN env var).
+        cookie: Optional raw Cookie header string (defaults to PANTEON_COOKIE env var).
+            Cookie-only auth needs PANTEON_USER_ID or `user_id`.
+
+    Returns:
+        The rendered markdown. Nothing is written to disk.
+    """
+    headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: panteon_client.fetch_my_priority_tasks(
+                headers, user_id=user_id, bearer_token=bearer_token, period=period
+            )
+        )
+    except (ValueError, LookupError) as exc:
+        raise ToolError(str(exc)) from exc
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
+    except requests.RequestException as exc:
+        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
+    return result["markdown"]
 
 
 @mcp.resource("timeline://{issue_id}/task.md")

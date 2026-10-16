@@ -10,6 +10,9 @@ Examples:
     python3 fetch_task.py "https://timeline.panteon.no/tasks#/list/15033/edit/4079"
     python3 fetch_task.py 5461 --print
     python3 fetch_task.py 5461 --base-dir /path/to/project
+    python3 fetch_task.py --planner              # your priority tasks
+    python3 fetch_task.py --planner --period next
+    python3 fetch_task.py --planner --user-id 135
 """
 import argparse
 import sys
@@ -22,7 +25,24 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "issue",
+        nargs="?",
         help="Task URL (…/edit/<id>) or bare numeric issue ID.",
+    )
+    parser.add_argument(
+        "--planner",
+        action="store_true",
+        help="Print your priority tasks from the employee planner instead of fetching a task.",
+    )
+    parser.add_argument(
+        "--period",
+        default="now",
+        choices=list(panteon_client.PLANNER_PERIODS),
+        help="Planner period for --planner (default: now).",
+    )
+    parser.add_argument(
+        "--user-id",
+        default=None,
+        help="Planner user id; defaults to PANTEON_USER_ID, then the bearer token's `sub`.",
     )
     parser.add_argument(
         "--base-dir",
@@ -36,6 +56,20 @@ def main(argv=None) -> int:
         help="Also print the rendered task markdown to stdout.",
     )
     args = parser.parse_args(argv)
+
+    if args.planner:
+        try:
+            result = panteon_client.fetch_my_priority_tasks(
+                panteon_client.build_api_headers(), user_id=args.user_id, period=args.period
+            )
+        except (ValueError, LookupError, PermissionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(result["markdown"])
+        return 0
+
+    if not args.issue:
+        parser.error("an issue URL/ID is required unless --planner is given")
 
     try:
         result = panteon_client.fetch_and_save(args.issue, base_dir=args.base_dir)

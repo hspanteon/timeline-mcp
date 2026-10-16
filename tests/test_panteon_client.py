@@ -3,6 +3,8 @@
 No live Panteon credentials or network access are required: HTTP calls are made
 against a monkeypatched session.
 """
+from datetime import date
+
 import pytest
 
 import panteon_client as pc
@@ -334,3 +336,171 @@ def test_save_and_path_roundtrip(tmp_path):
     assert saved == expected
     with open(saved, encoding="utf-8") as fh:
         assert "# Task 5461: T" in fh.read()
+
+
+# --------------------------------------------------------------------------- #
+# Employee planner: resolve_user_id / get_priority_tasks / rendering
+# --------------------------------------------------------------------------- #
+def _jwt(payload):
+    import base64, json
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"h.{body}.s"
+
+
+_PLANNER = [
+    {"user_id": 34, "sort_order": None, "data": [{"issue_number": 1, "title": "Other"}]},
+    {"user_id": 135, "sort_order": None, "data": [
+        {"issue_number": 6077, "code": "15033", "title": "Second | task", "task_status": "open",
+         "stage_status": "Testing pending", "deadline": "2026-10-20", "priority_sort_order": 63, "support": 1},
+        {"issue_number": 4107, "code": "15033", "title": "First\ntask", "task_status": "open",
+         "stage_status": "QA in progress", "deadline": None, "priority_sort_order": 6, "support": 0},
+    ]},
+    {"user_id": 11, "sort_order": None, "data": []},
+]
+
+
+class TestResolveUserId:
+    def test_explicit_argument_wins(self, monkeypatch):
+        monkeypatch.setenv("PANTEON_USER_ID", "1")
+        assert pc.resolve_user_id("42", bearer_token=_jwt({"sub": "7"})) == 42
+
+    def test_env_var_beats_jwt(self, monkeypatch):
+        monkeypatch.setenv("PANTEON_USER_ID", "99")
+        assert pc.resolve_user_id(bearer_token=_jwt({"sub": "7"})) == 99
+
+    def test_falls_back_to_jwt_sub(self, monkeypatch):
+        monkeypatch.delenv("PANTEON_USER_ID", raising=False)
+        assert pc.resolve_user_id(bearer_token="Bearer " + _jwt({"sub": "135"})) == 135
+
+    def test_unresolvable_raises(self, monkeypatch):
+        monkeypatch.delenv("PANTEON_USER_ID", raising=False)
+        monkeypatch.delenv("PANTEON_BEARER_TOKEN", raising=False)
+        with pytest.raises(ValueError):
+            pc.resolve_user_id()
+
+
+class TestPriorityTasks:
+    def test_get_priority_tasks_unwraps_data(self, monkeypatch):
+        calls = []
+
+        def fake_get(url, **k):
+            calls.append(url)
+            return _FakeResponse(200, {"data": _PLANNER, "status": "success", "code": 200})
+
+        monkeypatch.setattr(pc._SESSION, "get", fake_get)
+        assert pc.get_priority_tasks({}) == _PLANNER
+        assert calls == [f"{pc.BASE_URL}/api/employee-planner/get-priority-tasks/now"]
+
+    def test_get_priority_tasks_401_is_permission_error(self, monkeypatch):
+        monkeypatch.setattr(pc._SESSION, "get", lambda *a, **k: _FakeResponse(401))
+        with pytest.raises(PermissionError):
+            pc.get_priority_tasks({})
+
+    def test_extract_filters_and_sorts_by_priority(self):
+        tasks = pc.extract_user_priority_tasks(_PLANNER, 135)
+        assert [t["issue_number"] for t in tasks] == [4107, 6077]
+
+    def test_extract_user_with_no_tasks(self):
+        assert pc.extract_user_priority_tasks(_PLANNER, 11) == []
+
+    def test_extract_unknown_user_raises(self):
+        with pytest.raises(LookupError):
+            pc.extract_user_priority_tasks(_PLANNER, 555)
+
+    def test_render_table(self):
+        md = pc.render_priority_tasks_markdown(
+            135, pc.extract_user_priority_tasks(_PLANNER, 135), today=date(2026, 9, 1)
+        )
+        assert "**Tasks:** 2" in md
+        assert f"[#4107]({pc.BASE_URL}/tasks#/list/15033/edit/4107)" in md
+        # Titles are flattened so they can't break the table.
+        assert "| First task |" in md
+        assert "Second \\| task" in md
+        assert md.index("#4107") < md.index("#6077")
+        assert "| 2026-10-20 | yes |" in md
+
+    def test_render_empty(self):
+        md = pc.render_priority_tasks_markdown(11, [])
+        assert "_(no priority tasks)_" in md
+        assert "Overdue" not in md
+
+
+class TestDeadlineFlags:
+    TODAY = date(2026, 10, 16)
+
+    @pytest.mark.parametrize("deadline,expected", [
+        ("2026-10-15", "overdue"),
+        ("15.10.2026 09:00", "overdue"),
+        ("2026-10-16T23:59:00", "due today"),
+        ("2026-10-17", "due in 1d"),
+        ("2026-10-23", "due in 7d"),
+        ("2026-10-24", ""),
+        (None, ""),
+        ("", ""),
+        ("soon", ""),
+    ])
+    def test_deadline_flag(self, deadline, expected):
+        assert pc.deadline_flag(deadline, self.TODAY) == expected
+
+    def test_render_flags_and_counts(self):
+        tasks = [
+            {"issue_number": 1, "deadline": "2026-10-01"},
+            {"issue_number": 2, "deadline": "2026-10-20"},
+            {"issue_number": 3, "deadline": "2026-12-01"},
+            {"issue_number": 4, "deadline": None},
+        ]
+        md = pc.render_priority_tasks_markdown(135, tasks, today=self.TODAY)
+        assert "**Overdue:** 1 · **Due within 7 days:** 1 (as of 2026-10-16)" in md
+        assert "| 2026-10-01 **(overdue)** |" in md
+        assert "| 2026-10-20 **(due in 4d)** |" in md
+        assert "| 2026-12-01 |" in md
+
+    def test_fetch_my_priority_tasks(self, monkeypatch):
+        monkeypatch.delenv("PANTEON_USER_ID", raising=False)
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": _PLANNER)
+        result = pc.fetch_my_priority_tasks({}, bearer_token=_jwt({"sub": "135"}))
+        assert result["user_id"] == 135
+        assert len(result["tasks"]) == 2
+        assert result["markdown"].startswith("# My Priority Tasks")
+
+
+class TestPlannerPeriods:
+    @pytest.mark.parametrize("period, segment", [
+        ("now", "now"), ("next", "next"), ("commingup", "commingup"), (None, "now"),
+    ])
+    def test_normalize(self, period, segment):
+        assert pc.normalize_planner_period(period) == segment
+
+    @pytest.mark.parametrize("period", ["later", "comingup", "coming up"])
+    def test_unknown_period_raises(self, period):
+        # The API silently returns every task for unknown segments (including the
+        # single-m "comingup"), so only the exact API spelling is accepted.
+        with pytest.raises(ValueError):
+            pc.normalize_planner_period(period)
+
+    @pytest.mark.parametrize("period", ["next", "commingup"])
+    def test_period_in_url(self, monkeypatch, period):
+        calls = []
+        monkeypatch.setattr(
+            pc._SESSION, "get", lambda url, **k: calls.append(url) or _FakeResponse(200, {"data": []})
+        )
+        pc.get_priority_tasks({}, period)
+        assert calls == [f"{pc.BASE_URL}/api/employee-planner/get-priority-tasks/{period}"]
+
+    def test_render_heading_uses_period_label(self):
+        assert pc.render_priority_tasks_markdown(1, [], "commingup").startswith(
+            "# My Priority Tasks — Coming Up"
+        )
+
+    def test_fetch_passes_period(self, monkeypatch):
+        seen = {}
+
+        def fake(headers, period="now"):
+            seen["period"] = period
+            return _PLANNER
+
+        monkeypatch.setattr(pc, "get_priority_tasks", fake)
+        result = pc.fetch_my_priority_tasks({}, user_id=135, period="commingup")
+        assert seen["period"] == "commingup"
+        assert result["period"] == "commingup"
+        assert "— Coming Up" in result["markdown"]

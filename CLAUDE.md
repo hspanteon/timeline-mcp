@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes one MCP tool (`get_task_conversation`) and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use.
+A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes MCP tools `get_task_conversation`, `get_my_priority_tasks` and `check_auth` and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use.
 
 ## Commands
 
@@ -17,6 +17,7 @@ python3 -m venv .venv
 .venv/bin/python server.py
 
 # Run the CLI fetcher directly
+.venv/bin/python fetch_task.py --planner                # your priority tasks
 .venv/bin/python fetch_task.py 5461
 .venv/bin/python fetch_task.py "https://timeline.panteon.no/tasks#/list/15033/edit/5461" --print
 .venv/bin/python fetch_task.py 5461 --base-dir /path/to/project
@@ -47,6 +48,10 @@ Fetching a task mirrors the reference browser extension's logic and always happe
 
 `extract_issue_id` only accepts a bare numeric ID or a URL containing `/edit/<id>` — it deliberately does NOT fall back to "trailing digits" in the URL, since a list/board URL like `.../list/15033` would otherwise silently resolve to the wrong (board) ID.
 
+### Employee planner
+
+`get_my_priority_tasks` (and `fetch_task.py --planner`) call `GET /api/employee-planner/get-priority-tasks/{period}` (`now`, `next`, or `commingup` — the API's spelling), which returns **every** employee's planner (`[{user_id, data: [task, …]}]`). `fetch_my_priority_tasks` filters it to one user: `resolve_user_id` takes the explicit argument, then `PANTEON_USER_ID`, then the bearer JWT's `sub` claim. A user absent from the planner raises `LookupError` (wrong id), distinct from a user with zero tasks. `normalize_planner_period` rejects any other period — including the single-m `comingup` — because the API silently returns every task for an unknown segment. The rendered table is returned, not written to disk. A task's `code` is its list/board id, so its URL is `/tasks#/list/{code}/edit/{issue_number}`. `deadline_flag` marks deadlines as overdue, due today or due within `DUE_SOON_DAYS` (7); `render_priority_tasks_markdown` takes an optional `today` so tests stay date-independent — always pass it in tests.
+
 ### Markdown rendering contract
 
 `render_task_markdown` produces a `task.md` (header: ID, Title, Creator, Date Created, Status, Tags; comments by the task creator are labelled "(task creator)" in their heading) with a fixed section order (Description, User-Provided Context, Conversation, Acceptance Criteria, Open Questions, Images). Two markdown "layers" are intentionally kept apart: the document's own structure is plain markdown, while all original content (task description, each comment) is wrapped in a fenced code block via `_as_code_block`, sized to a backtick run longer than any backticks already in the content, so embedded content can never break out and corrupt the document structure. Image URLs found inside that content are rewritten to absolute URLs (`absolutize_markdown_images` / `_resolve_url`) before being embedded, since the file is meant to stand alone outside the browser.
@@ -65,9 +70,9 @@ When a fetched task has neither description nor comments, the MCP tool asks the 
 
 ## Plugin packaging
 
-The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), the `mcpServers` entry inside `plugin.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`; deliberately not a root `.mcp.json`, which Claude Code would also load as a project-scope config where `${CLAUDE_PLUGIN_ROOT}` is undefined), and `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review). Validate changes with `claude plugin validate .`.
+The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), the `mcpServers` entry inside `plugin.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`; deliberately not a root `.mcp.json`, which Claude Code would also load as a project-scope config where `${CLAUDE_PLUGIN_ROOT}` is undefined), `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review), and `skills/my-day/SKILL.md` (read-only morning brief: planner `now` + soon-due `next` tasks, latest conversation on the top 3, a recommended starting task). Validate changes with `claude plugin validate .`.
 
-The same repo also carries wrappers for other tools, all sharing `skills/task-spec/SKILL.md`: `gemini-extension.json` (Gemini CLI; validate with `gemini extensions validate .`), `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` (Codex; skill-only, because Codex runs a plugin's MCP server with the plugin dir as cwd and `timeline/` would land in the plugin cache), and `.cursor-plugin/` (Cursor; untested). The `version` field is duplicated across `.claude-plugin/plugin.json`, `gemini-extension.json`, `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` — bump them together. Do not add a root `.mcp.json`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
+The same repo also carries wrappers for other tools, all sharing the `skills/` directory: `gemini-extension.json` (Gemini CLI; validate with `gemini extensions validate .`), `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` (Codex; skill-only, because Codex runs a plugin's MCP server with the plugin dir as cwd and `timeline/` would land in the plugin cache), and `.cursor-plugin/` (Cursor; untested). The `version` field is duplicated across `.claude-plugin/plugin.json`, `gemini-extension.json`, `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` — bump them together. Do not add a root `.mcp.json`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
 
 ## Testing conventions
 
