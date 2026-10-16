@@ -325,3 +325,19 @@ class TestGetMyDayTool:
         with pytest.raises(ToolError) as exc_info:
             await server.get_my_day(user_id=7, bearer_token="tok", save=False)
         assert "HTTP 500" in str(exc_info.value)
+
+
+class TestGetTaskStatusesTool:
+    @pytest.mark.anyio
+    async def test_returns_table(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "get_task_by_issue",
+            lambda issue_id, headers, company_id=None: {"data": {"title": "T", "stage_qa": 4, "stage_liv": 0}},
+        )
+        result = await server.get_task_statuses(["5"], bearer_token="tok")
+        assert "| #5 | T |" in result and "qa approved" in result
+
+    @pytest.mark.anyio
+    async def test_empty_list_is_tool_error(self):
+        with pytest.raises(ToolError):
+            await server.get_task_statuses([], bearer_token="tok")

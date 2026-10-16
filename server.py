@@ -21,6 +21,8 @@ mcp = FastMCP(
         "(period now, next, or commingup). Use get_my_planner_changes when the user asks "
         "what changed in their planner (new, removed, moved or re-dated tasks), and "
         "get_my_day for a daily brief (now tasks, soon-due next tasks and changes in one call). "
+        "Use get_task_statuses to check the workflow stage or QA approval of several tasks "
+        "at once (e.g. for a release); it is lighter than get_task_conversation. "
         "Use check_auth first if "
         "PANTEON_BEARER_TOKEN/PANTEON_COOKIE haven't been verified yet, or after a call "
         "fails with an authentication error, to confirm whether credentials are missing, "
@@ -317,6 +319,39 @@ async def get_my_day(
         )
     )
     return result["markdown"]
+
+
+@mcp.tool(output_schema=None)
+async def get_task_statuses(
+    issue_identifiers: list[str],
+    bearer_token: Optional[str] = None,
+    cookie: Optional[str] = None,
+) -> str:
+    """
+    Looks up the workflow status of several Panteon tasks at once: title,
+    stage (e.g. "QA in progress", "Going live pending"), QA and Live stage
+    progress, and a release state — live, qa approved, in qa, qa blocked or
+    before qa. A task counts as QA-approved once its QA stage is done.
+
+    Lighter than get_task_conversation: one request per task, no conversation,
+    nothing written to disk. Use it for release checks and status overviews.
+
+    Args:
+        issue_identifiers: Issue IDs (e.g. "5461") or task URLs containing /edit/<id>.
+            Duplicates are dropped; unknown or invalid ones are reported per row.
+        bearer_token: Optional JWT Bearer token (defaults to PANTEON_BEARER_TOKEN env var).
+        cookie: Optional raw Cookie header string (defaults to PANTEON_COOKIE env var).
+
+    Returns:
+        A markdown table, one row per task, with QA-approved and release-state counts.
+    """
+    if not issue_identifiers:
+        raise ToolError("Pass at least one issue ID or task URL.")
+    headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
+    statuses = await _run_client(
+        lambda: panteon_client.get_task_statuses(issue_identifiers, headers)
+    )
+    return panteon_client.render_task_statuses_markdown(statuses)
 
 
 @mcp.resource("timeline://{issue_id}/task.md")

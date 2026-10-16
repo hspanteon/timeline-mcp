@@ -6,7 +6,7 @@
     {
       "name": "panteon-timeline",
       "source": "./",
-      "description": "Panteon Timeline MCP server + task-spec and my-day skills"
+      "description": "Panteon Timeline MCP server + task-spec, my-day and release-pr-check skills"
     }
   ]
 }

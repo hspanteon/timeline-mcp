@@ -6,6 +6,7 @@ against a monkeypatched session.
 from datetime import date
 
 import pytest
+import requests
 
 import panteon_client as pc
 
@@ -691,3 +692,75 @@ class TestFetchMyDay:
 def test_changes_subsection_has_no_double_blank_line():
     md = pc.render_planner_changes_markdown({"user_id": 1, "date": "2026-10-16", "tasks": {}}, None, None, level=2)
     assert "\n\n\n" not in md
+
+
+# --------------------------------------------------------------------------- #
+# Workflow stage status
+# --------------------------------------------------------------------------- #
+def _stage_task(title="T", stage_status="QA in progress", **codes):
+    base = {"stage_rsd": 4, "stage_est": 4, "stage_dev": 4, "stage_tst": 4, "stage_qa": 0, "stage_liv": 0}
+    return {"data": {"title": title, "task_status": "open", "stage_status": stage_status, **base, **codes}}
+
+
+class TestTaskStatuses:
+    @pytest.mark.parametrize("qa,live,expected", [
+        (0, 0, "before qa"), (2, 0, "in qa"), (3, 0, "qa blocked"),
+        (4, 0, "qa approved"), (1, 4, "live"), (4, 4, "live"), (None, None, "before qa"),
+    ])
+    def test_release_state(self, qa, live, expected):
+        assert pc.release_state({"stage_qa": qa, "stage_liv": live}) == expected
+
+    def test_extract_task_status(self):
+        status = pc.extract_task_status(_stage_task("Report", "Going live pending", stage_qa=4), "6027")
+        assert status["issue_id"] == "6027"
+        assert status["stage_status"] == "Going live pending"
+        assert status["stages"]["QA"] == "done" and status["stages"]["Live"] == "not started"
+        assert status["release_state"] == "qa approved" and status["qa_approved"] is True
+
+    def test_unknown_stage_code(self):
+        status = pc.extract_task_status({"data": {"stage_qa": "x"}}, "1")
+        assert status["stages"]["QA"] == "unknown" and status["qa_approved"] is False
+
+    def test_bulk_lookup_order_dedupe_and_errors(self, monkeypatch):
+        calls = []
+
+        def fake(issue_id, headers, company_id=None):
+            calls.append(issue_id)
+            if issue_id == "404":
+                raise requests.HTTPError(response=type("R", (), {"status_code": 422})())
+            return _stage_task(f"Task {issue_id}", stage_qa=4 if issue_id == "2" else 2)
+
+        monkeypatch.setattr(pc, "get_task_by_issue", fake)
+        statuses = pc.get_task_statuses(
+            ["1", f"{pc.BASE_URL}/tasks#/list/15033/edit/2", "1", "404", "abc"], {}
+        )
+        assert [s["issue_id"] for s in statuses] == ["1", "2", "404", "abc"]
+        assert sorted(calls) == ["1", "2", "404"]  # duplicate and invalid ids not requested
+        assert statuses[1]["qa_approved"] is True
+        assert statuses[2]["error"] == "not found"
+        assert statuses[3]["error"] == "invalid issue ID"
+
+    def test_bulk_lookup_reraises_other_http_errors(self, monkeypatch):
+        def fake(issue_id, headers, company_id=None):
+            raise requests.HTTPError(response=type("R", (), {"status_code": 500})())
+
+        monkeypatch.setattr(pc, "get_task_by_issue", fake)
+        with pytest.raises(requests.HTTPError):
+            pc.get_task_statuses(["1"], {})
+
+    def test_bulk_lookup_auth_error_raises(self, monkeypatch):
+        monkeypatch.setattr(pc._SESSION, "get", lambda *a, **k: _FakeResponse(401))
+        with pytest.raises(PermissionError):
+            pc.get_task_statuses(["1"], {})
+
+    def test_render(self):
+        statuses = [
+            pc.extract_task_status(_stage_task("Live one", "Completed", stage_qa=1, stage_liv=4), "1"),
+            pc.extract_task_status(_stage_task("In | QA", stage_qa=2), "2"),
+            {"issue_id": "3", "error": "not found"},
+        ]
+        md = pc.render_task_statuses_markdown(statuses)
+        assert "**Tasks:** 3 · **QA approved:** 1 · **Not found / invalid:** 1" in md
+        assert "**By release state:** live 1 · in qa 1" in md
+        assert "| #2 | In \\| QA | QA in progress | in progress | not started | in qa |" in md
+        assert "| #3 | — | _not found_ |" in md

@@ -242,6 +242,145 @@ def extract_task_meta(raw_task: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Workflow stage status (bulk, no timeline fetch, nothing written to disk)
+# --------------------------------------------------------------------------- #
+# Timeline tracks each task through six stages, each with a progress code.
+# task_status stays "open" for every live task, so the stages are the signal.
+TASK_STAGES = {
+    "stage_rsd": "RSD",
+    "stage_est": "Estimate",
+    "stage_dev": "Development",
+    "stage_tst": "Testing",
+    "stage_qa": "QA",
+    "stage_liv": "Live",
+}
+STAGE_PROGRESS = {0: "not started", 1: "skipped", 2: "in progress", 3: "blocked", 4: "done"}
+# HTTP statuses taskbyissue answers with for an issue that doesn't exist.
+_TASK_NOT_FOUND = (404, 422)
+
+
+def _stage_code(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def release_state(stages: Dict[str, Optional[int]]) -> str:
+    """
+    Where a task is on the way to production, from its stage codes:
+    "live" (Live done), "qa approved" (QA done, not live), "in qa",
+    "qa blocked", or "before qa".
+    """
+    qa, live = stages.get("stage_qa"), stages.get("stage_liv")
+    if live == 4:
+        return "live"
+    if qa == 4:
+        return "qa approved"
+    if qa == 2:
+        return "in qa"
+    if qa == 3:
+        return "qa blocked"
+    return "before qa"
+
+
+def extract_task_status(raw_task: Dict[str, Any], issue_id: str) -> Dict[str, Any]:
+    """
+    Pulls the workflow status out of an API-1 (taskbyissue) response:
+    {"issue_id", "title", "task_status", "stage_status", "stages", "release_state",
+    "qa_approved"}. `stages` maps each TASK_STAGES label to its progress word.
+    `qa_approved` is true once QA is done (or the task is already live).
+    """
+    data = raw_task.get("data") if isinstance(raw_task.get("data"), dict) else raw_task
+    data = data or {}
+    codes = {field: _stage_code(data.get(field)) for field in TASK_STAGES}
+    state = release_state(codes)
+    return {
+        "issue_id": str(issue_id),
+        "title": data.get("title") or data.get("name") or "",
+        "task_status": data.get("task_status") or "",
+        "stage_status": data.get("stage_status") or "",
+        "stages": {
+            label: STAGE_PROGRESS.get(codes[field], "unknown") for field, label in TASK_STAGES.items()
+        },
+        "release_state": state,
+        "qa_approved": state in ("qa approved", "live"),
+    }
+
+
+def get_task_statuses(
+    issue_identifiers: List[str],
+    headers: Dict[str, str],
+    max_workers: int = 6,
+) -> List[Dict[str, Any]]:
+    """
+    Looks up the workflow status of several tasks with one taskbyissue call each
+    (no timeline fetch, nothing written to disk), in the order given, without
+    duplicates. A bad identifier or an unknown issue gives an entry with an
+    "error" instead of failing the batch; auth and connection errors still raise.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    ordered: List[str] = []
+    results: Dict[str, Dict[str, Any]] = {}
+    for identifier in issue_identifiers:
+        try:
+            issue_id = extract_issue_id(str(identifier))
+        except ValueError:
+            issue_id = str(identifier)
+            results[issue_id] = {"issue_id": issue_id, "error": "invalid issue ID"}
+        if issue_id not in ordered:
+            ordered.append(issue_id)
+
+    def lookup(issue_id: str) -> Dict[str, Any]:
+        try:
+            return extract_task_status(get_task_by_issue(issue_id, headers), issue_id)
+        except requests.HTTPError as exc:
+            code = exc.response.status_code if exc.response is not None else None
+            if code in _TASK_NOT_FOUND:
+                return {"issue_id": issue_id, "error": "not found"}
+            raise
+
+    pending = [i for i in ordered if i not in results]
+    with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(pending) or 1))) as pool:
+        for issue_id, status in zip(pending, pool.map(lookup, pending)):
+            results[issue_id] = status
+    return [results[i] for i in ordered]
+
+
+def render_task_statuses_markdown(statuses: List[Dict[str, Any]]) -> str:
+    """Renders get_task_statuses output as a table plus release-state counts."""
+    found = [s for s in statuses if "error" not in s]
+    counts: Dict[str, int] = {}
+    for s in found:
+        counts[s["release_state"]] = counts.get(s["release_state"], 0) + 1
+    order = ["live", "qa approved", "in qa", "qa blocked", "before qa"]
+    lines = [
+        "# Task Statuses",
+        "",
+        f"**Tasks:** {len(statuses)} · **QA approved:** {sum(s['qa_approved'] for s in found)}"
+        + (f" · **Not found / invalid:** {len(statuses) - len(found)}" if len(found) < len(statuses) else ""),
+    ]
+    if counts:
+        lines.append("**By release state:** " + " · ".join(f"{k} {counts[k]}" for k in order if k in counts))
+    lines += [
+        "",
+        "| Issue | Title | Stage | QA | Live | Release state |",
+        "|-------|-------|-------|----|------|---------------|",
+    ]
+    for s in statuses:
+        if "error" in s:
+            lines.append(f"| #{_table_cell(s['issue_id'])} | — | _{_table_cell(s['error'])}_ | — | — | — |")
+            continue
+        lines.append(
+            f"| #{s['issue_id']} | {_table_cell(s['title'])} | {_table_cell(s['stage_status'])} "
+            f"| {s['stages']['QA']} | {s['stages']['Live']} | {s['release_state']} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _normalize_date(value: str) -> str:
     """Reduces a timestamp to a YYYY-MM-DD date string. Accepts ISO (2026-06-26T..)
     or Panteon's `dd.mm.yyyy HH:MM` format. Returns '' if it can't be parsed."""

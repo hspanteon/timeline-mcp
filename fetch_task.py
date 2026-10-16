@@ -15,6 +15,7 @@ Examples:
     python3 fetch_task.py --planner --user-id 135
     python3 fetch_task.py --changes              # planner changes since last snapshot
     python3 fetch_task.py --my-day               # now + soon-due next + changes
+    python3 fetch_task.py --status 4054 5627     # workflow stage / QA approval of tasks
 """
 import argparse
 import sys
@@ -39,6 +40,13 @@ def main(argv=None) -> int:
         "--changes",
         action="store_true",
         help="Show planner changes since the last saved day and save today's snapshot.",
+    )
+    parser.add_argument(
+        "--status",
+        nargs="+",
+        metavar="ISSUE",
+        default=None,
+        help="Print the workflow stage and QA approval of these tasks (IDs or URLs).",
     )
     parser.add_argument(
         "--my-day",
@@ -75,7 +83,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     planner_call = None
-    if args.my_day:
+    if args.status:
+        planner_call = lambda headers: {
+            "markdown": panteon_client.render_task_statuses_markdown(
+                panteon_client.get_task_statuses(args.status, headers)
+            )
+        }
+    elif args.my_day:
         planner_call = lambda headers: panteon_client.fetch_my_day(
             headers, user_id=args.user_id, base_dir=args.base_dir, save=not args.no_save
         )
@@ -97,7 +111,7 @@ def main(argv=None) -> int:
         return 0
 
     if not args.issue:
-        parser.error("an issue URL/ID is required unless --planner, --changes or --my-day is given")
+        parser.error("an issue URL/ID is required unless --planner, --changes, --my-day or --status is given")
 
     try:
         result = panteon_client.fetch_and_save(args.issue, base_dir=args.base_dir)

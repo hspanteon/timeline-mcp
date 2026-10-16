@@ -93,6 +93,7 @@ This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP
 
 - `task-spec` turns a fetched task into a repo-aware `spec.md`.
 - `my-day` gives a morning brief from your planner: overdue and soon-due tasks, the latest conversation on your top 3, and where to start.
+- `release-pr-check` (duell-admin only; run it from a duell-admin checkout) checks the open PRs into `qa-release` and `master` against the team's release-note format, counts QA-approved tickets from their Timeline QA stage, flags git/Timeline mismatches, and can draft the production and QA release notes. Report-only; needs `gh` logged in.
 
 ```bash
 # One-time: credentials come from your shell environment (the plugin copy has no .env)
@@ -115,7 +116,7 @@ If you previously registered `timeline-mcp` manually (see above), remove that en
 
 ## 🧩 Install on other AI tools (Codex, Gemini CLI, Cursor)
 
-The same repo carries a wrapper per tool. All of them share the same `skills/` directory (`task-spec` and `my-day`).
+The same repo carries a wrapper per tool. All of them share the same `skills/` directory (`task-spec`, `my-day` and `release-pr-check`).
 
 | Tool | Wrapper files | Install | Gets |
 |---|---|---|---|
@@ -168,6 +169,11 @@ Reports what changed in your planner since the last saved day: **new** tasks, ta
 - The first run has nothing to compare with; it only saves the snapshot.
 - **Arguments**: `user_id`, `bearer_token`, `cookie` as for `get_my_priority_tasks`; `save` (bool, default `true`) — `false` compares without writing anything.
 
+### `get_task_statuses`
+Workflow status of several tasks at once: title, stage (e.g. `QA in progress`, `Going live pending`), QA and Live stage progress, and a **release state** — `live`, `qa approved`, `in qa`, `qa blocked` or `before qa`. A task counts as QA-approved once its QA stage is done; `task_status` is `open` for every live task, so the stage is the real signal.
+- **Arguments**: `issue_identifiers` (list of IDs or `/edit/<id>` URLs; duplicates dropped, unknown or invalid ones reported per row), `bearer_token` / `cookie`.
+- One light request per task (no conversation fetch); nothing is written to disk. Used by the `release-pr-check` skill.
+
 ### `get_my_day`
 One call for a daily brief: your `now` tasks (with deadline flags), `next` tasks that are overdue or due within 7 days, and the changes section from `get_my_planner_changes`. Each planner period is fetched once (3 requests), and today's snapshot is saved unless `save=false`. Same arguments as `get_my_planner_changes`. The `my-day` skill uses this tool.
 
@@ -205,6 +211,9 @@ The same fetch logic is available from the shell via `fetch_task.py` (credential
 
 # Daily brief: now + soon-due next + changes (one fetch per planner period)
 .venv/bin/python fetch_task.py --my-day
+
+# Workflow stage / QA approval of several tasks
+.venv/bin/python fetch_task.py --status 4054 5627 6027
 ```
 
 ---
