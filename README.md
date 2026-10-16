@@ -162,6 +162,12 @@ Deadlines are flagged `(overdue)`, `(due today)` or `(due in Nd)` (within 7 days
   - `bearer_token` / `cookie` (str, optional) — override the `.env` credentials per call.
 - **Returns** the markdown directly; nothing is written to disk. Pass any issue number to `get_task_conversation` for the full task.
 
+### `get_my_planner_changes`
+Reports what changed in your planner since the last saved day: **new** tasks, tasks that **left the planner**, tasks **moved** between now/next/commingup, and **changed** deadlines, stages or statuses. Priority-order shuffles are not reported.
+- Fetches all three periods and saves a snapshot of your tasks to `timeline/planner/<YYYY-MM-DD>.json` (same base directory as `task.md`; a later run the same day replaces it). The diff is always against the latest snapshot from an **earlier** day, so running it twice a day gives the same answer.
+- The first run has nothing to compare with; it only saves the snapshot.
+- **Arguments**: `user_id`, `bearer_token`, `cookie` as for `get_my_priority_tasks`; `save` (bool, default `true`) — `false` compares without writing anything.
+
 #### Output location (`get_task_conversation`)
 The file is written to `<base>/timeline/<issue_id>/task.md`, where `<base>` is:
 1. `PANTEON_TIMELINE_DIR` env var, if set (this MCP is configured with it pointing at the
@@ -189,6 +195,10 @@ The same fetch logic is available from the shell via `fetch_task.py` (credential
 .venv/bin/python fetch_task.py --planner
 .venv/bin/python fetch_task.py --planner --period next        # or: commingup
 .venv/bin/python fetch_task.py --planner --user-id 135
+
+# Planner changes since the last saved day (also saves today's snapshot)
+.venv/bin/python fetch_task.py --changes
+.venv/bin/python fetch_task.py --changes --no-save
 ```
 
 ---

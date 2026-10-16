@@ -278,3 +278,25 @@ class TestGetMyPriorityTasksTool:
         result = await server.get_my_priority_tasks(period="next", user_id=7, bearer_token="tok")
         assert seen["period"] == "next"
         assert "— Next" in result
+
+
+class TestGetMyPlannerChangesTool:
+    @pytest.mark.anyio
+    async def test_first_run_saves_snapshot(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1"}]}],
+        )
+        result = await server.get_my_planner_changes(user_id=7, bearer_token="tok")
+        assert "# My Planner Changes" in result
+        assert "No earlier snapshot" in result
+        assert list((tmp_path / "timeline" / "planner").glob("*.json"))
+
+    @pytest.mark.anyio
+    async def test_unknown_user_becomes_tool_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": [])
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_planner_changes(user_id=7, bearer_token="tok")
+        assert "not found" in str(exc_info.value)

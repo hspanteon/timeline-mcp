@@ -1,11 +1,11 @@
 ---
 name: my-day
-description: Morning brief from the user's Panteon employee planner. Lists their "now" priority tasks, flags overdue and soon-due deadlines, reads the latest conversation on the top tasks, and recommends where to start. Use when the user asks what to work on, to plan or start their day, for their priorities, or for a "my day" summary.
+description: Morning brief from the user's Panteon employee planner. Lists their "now" priority tasks, flags overdue and soon-due deadlines, reports what changed since the last day, reads the latest conversation on the top tasks, and recommends where to start. Use when the user asks what to work on, to plan or start their day, for their priorities, or for a "my day" summary.
 ---
 
 # my-day
 
-Give the user a short, decision-ready brief of their day from the Panteon planner. Read only: do not change anything in Panteon, and do not write files of your own.
+Give the user a short, decision-ready brief of their day from the Panteon planner. Read only: do not change anything in Panteon, and do not write files of your own. The tools save their own files (`timeline/planner/<date>.json`, `timeline/<issue_id>/task.md`); that is expected.
 
 ## 1. Get the planner
 
@@ -19,6 +19,8 @@ The table is already in priority order. Its Deadline column marks `(overdue)`, `
 
 Also call it once with `period: "next"` and keep only tasks flagged overdue or due within 7 days. A deadline coming up on a task that is not in `now` is worth flagging.
 
+Then call `get_my_planner_changes` (default arguments). It compares the planner with the last saved day and saves today's snapshot. Keep its New, Left the planner, Moved and Changed lists for the brief. If it says there is no earlier snapshot, note that changes will show from tomorrow.
+
 ## 2. Pick the focus tasks
 
 Pick at most 3 tasks, in this order:
@@ -26,7 +28,7 @@ Pick at most 3 tasks, in this order:
 2. Tasks due today, then due soonest.
 3. The rest, in planner order.
 
-Within the same group, keep planner order. A task marked `Support: yes` is customer-facing; mention that when you rank it.
+Within the same group, put tasks that are new today or just moved into `now` first, then keep planner order. A task marked `Support: yes` is customer-facing; mention that when you rank it.
 
 ## 3. Read the latest on each focus task
 
@@ -48,6 +50,12 @@ Keep the whole brief readable in under a minute:
 <N> tasks now · <overdue> overdue · <due soon> due within 7 days
 
 **Start with:** #<issue> <title> — <one-line reason: overdue / due date / support / top priority>
+
+### Since <previous date>         (omit if no earlier snapshot or no changes)
+- New: #<issue> <title>, …
+- Moved: #<issue> <title> next → now, …
+- Changed: #<issue> deadline — → <date>, …
+- Left the planner: #<issue> <title>, …   (likely done or reassigned)
 
 ### Focus
 1. **[#<issue>](<link>) <title>** — <stage> · <deadline + flag>

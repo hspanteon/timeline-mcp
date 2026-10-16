@@ -13,6 +13,7 @@ Examples:
     python3 fetch_task.py --planner              # your priority tasks
     python3 fetch_task.py --planner --period next
     python3 fetch_task.py --planner --user-id 135
+    python3 fetch_task.py --changes              # planner changes since last snapshot
 """
 import argparse
 import sys
@@ -32,6 +33,16 @@ def main(argv=None) -> int:
         "--planner",
         action="store_true",
         help="Print your priority tasks from the employee planner instead of fetching a task.",
+    )
+    parser.add_argument(
+        "--changes",
+        action="store_true",
+        help="Show planner changes since the last saved day and save today's snapshot.",
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="With --changes: compare without saving today's snapshot.",
     )
     parser.add_argument(
         "--period",
@@ -57,6 +68,20 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.changes:
+        try:
+            result = panteon_client.fetch_my_planner_changes(
+                panteon_client.build_api_headers(),
+                user_id=args.user_id,
+                base_dir=args.base_dir,
+                save=not args.no_save,
+            )
+        except (ValueError, LookupError, PermissionError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(result["markdown"])
+        return 0
+
     if args.planner:
         try:
             result = panteon_client.fetch_my_priority_tasks(
@@ -69,7 +94,7 @@ def main(argv=None) -> int:
         return 0
 
     if not args.issue:
-        parser.error("an issue URL/ID is required unless --planner is given")
+        parser.error("an issue URL/ID is required unless --planner or --changes is given")
 
     try:
         result = panteon_client.fetch_and_save(args.issue, base_dir=args.base_dir)

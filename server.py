@@ -18,7 +18,8 @@ mcp = FastMCP(
         "the user references a Panteon task URL (containing '/edit/<id>') or a bare issue "
         "ID and wants its content, history, or context. Use get_my_priority_tasks when "
         "the user asks what they should work on, or about their planner/priority tasks "
-        "(period now, next, or commingup). "
+        "(period now, next, or commingup). Use get_my_planner_changes when the user asks "
+        "what changed in their planner (new, removed, moved or re-dated tasks). "
         "Use check_auth first if "
         "PANTEON_BEARER_TOKEN/PANTEON_COOKIE haven't been verified yet, or after a call "
         "fails with an authentication error, to confirm whether credentials are missing, "
@@ -230,6 +231,54 @@ async def get_my_priority_tasks(
         result = await anyio.to_thread.run_sync(
             lambda: panteon_client.fetch_my_priority_tasks(
                 headers, user_id=user_id, bearer_token=bearer_token, period=period
+            )
+        )
+    except (ValueError, LookupError) as exc:
+        raise ToolError(str(exc)) from exc
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
+    except requests.RequestException as exc:
+        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
+    return result["markdown"]
+
+
+@mcp.tool(output_schema=None)
+async def get_my_planner_changes(
+    user_id: Optional[int] = None,
+    save: bool = True,
+    bearer_token: Optional[str] = None,
+    cookie: Optional[str] = None,
+) -> str:
+    """
+    Reports what changed in your Panteon planner since the last saved day:
+    tasks newly assigned, tasks that left the planner, tasks moved between
+    now/next/commingup, and changed deadlines, stages or statuses.
+
+    Fetches all three planner periods, compares them with the most recent
+    snapshot from an earlier day, and (unless save=False) saves today's snapshot.
+    The first run has nothing to compare with and only saves the snapshot.
+
+    Args:
+        user_id: Optional Panteon user id. Defaults to PANTEON_USER_ID, then the
+            `sub` claim of the bearer token.
+        save: Save today's snapshot (default true). Use false to look without
+            recording anything.
+        bearer_token: Optional JWT Bearer token (defaults to PANTEON_BEARER_TOKEN env var).
+        cookie: Optional raw Cookie header string (defaults to PANTEON_COOKIE env var).
+
+    Side effect:
+        Writes `timeline/planner/<YYYY-MM-DD>.json` (under PANTEON_TIMELINE_DIR,
+        or the current working directory). A later run the same day replaces it.
+
+    Returns:
+        The rendered changes markdown.
+    """
+    headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: panteon_client.fetch_my_planner_changes(
+                headers, user_id=user_id, bearer_token=bearer_token, save=save
             )
         )
     except (ValueError, LookupError) as exc:

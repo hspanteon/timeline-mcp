@@ -725,6 +725,217 @@ def fetch_my_priority_tasks(
     }
 
 
+# --------------------------------------------------------------------------- #
+# Planner change tracking: daily snapshots of the user's planner, diffed
+# against the most recent earlier day.
+# --------------------------------------------------------------------------- #
+PLANNER_CHANGE_FIELDS = {
+    "deadline": "deadline",
+    "stage_status": "stage",
+    "task_status": "status",
+}
+
+
+def planner_snapshot_dir(base_dir: Optional[str] = None) -> str:
+    """`<base>/timeline/planner`, with <base> resolved like task_markdown_path."""
+    base = base_dir or os.getenv("PANTEON_TIMELINE_DIR") or os.getcwd()
+    return os.path.abspath(os.path.join(base, "timeline", "planner"))
+
+
+def build_planner_snapshot(
+    planners: Dict[str, List[Dict[str, Any]]],
+    user_id: int,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    Builds a snapshot of one user's tasks across planner periods from
+    {period: raw planner}. Tasks are keyed by issue number; a task listed in
+    several periods keeps the earliest one (now before next before commingup).
+    Raises LookupError if the user is absent from every period.
+    """
+    tasks: Dict[str, Dict[str, Any]] = {}
+    found = False
+    for period in PLANNER_PERIODS:
+        try:
+            period_tasks = extract_user_priority_tasks(planners.get(period) or [], user_id)
+        except LookupError:
+            continue
+        found = True
+        for position, task in enumerate(period_tasks, 1):
+            key = str(task.get("issue_number"))
+            if key in tasks:
+                continue
+            tasks[key] = {
+                "issue_number": task.get("issue_number"),
+                "code": task.get("code"),
+                "title": task.get("title"),
+                "period": period,
+                "position": position,
+                "stage_status": task.get("stage_status"),
+                "task_status": task.get("task_status"),
+                "deadline": _normalize_date(task.get("deadline") or "") or None,
+            }
+    if not found:
+        raise LookupError(f"User {user_id} was not found in any planner period.")
+    return {
+        "user_id": user_id,
+        "date": (today or date.today()).isoformat(),
+        "tasks": tasks,
+    }
+
+
+def save_planner_snapshot(snapshot: Dict[str, Any], base_dir: Optional[str] = None) -> str:
+    """Writes the snapshot to `<snapshot dir>/<date>.json` (one per day; a
+    later run the same day replaces it) and returns the path."""
+    directory = planner_snapshot_dir(base_dir)
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"{snapshot['date']}.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(snapshot, fh, indent=2, ensure_ascii=False)
+    return path
+
+
+def load_previous_planner_snapshot(
+    user_id: int,
+    before: str,
+    base_dir: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Returns the latest snapshot for `user_id` dated strictly before `before`
+    (YYYY-MM-DD), or None. Comparing against an earlier day keeps repeated
+    runs on the same day reporting the same "since last time" changes.
+    """
+    directory = planner_snapshot_dir(base_dir)
+    if not os.path.isdir(directory):
+        return None
+    names = sorted(
+        (n for n in os.listdir(directory) if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", n)),
+        reverse=True,
+    )
+    for name in names:
+        if name[:-5] >= before:
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                snapshot = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if str(snapshot.get("user_id")) == str(user_id):
+            return snapshot
+    return None
+
+
+def diff_planner_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Compares two snapshots. Returns {"added", "removed", "moved", "changed"}:
+    added/removed are task dicts; moved items carry "from"/"to" periods;
+    changed items carry "changes": [(label, old, new), …] for PLANNER_CHANGE_FIELDS.
+    """
+    old_tasks, new_tasks = old.get("tasks", {}), new.get("tasks", {})
+    period_rank = {p: i for i, p in enumerate(PLANNER_PERIODS)}
+
+    def order(task):
+        return (period_rank.get(task.get("period"), 99), task.get("position") or 0)
+
+    added = sorted((t for k, t in new_tasks.items() if k not in old_tasks), key=order)
+    removed = sorted((t for k, t in old_tasks.items() if k not in new_tasks), key=order)
+    moved, changed = [], []
+    for key, task in sorted(new_tasks.items(), key=lambda kv: order(kv[1])):
+        before = old_tasks.get(key)
+        if before is None:
+            continue
+        if before.get("period") != task.get("period"):
+            moved.append({**task, "from": before.get("period"), "to": task.get("period")})
+        changes = [
+            (label, before.get(field), task.get(field))
+            for field, label in PLANNER_CHANGE_FIELDS.items()
+            if (before.get(field) or None) != (task.get(field) or None)
+        ]
+        if changes:
+            changed.append({**task, "changes": changes})
+    return {"added": added, "removed": removed, "moved": moved, "changed": changed}
+
+
+def _planner_task_ref(task: Dict[str, Any]) -> str:
+    issue, code = task.get("issue_number"), task.get("code")
+    ref = f"[#{issue}]({BASE_URL}/tasks#/list/{code}/edit/{issue})" if issue and code else f"#{issue}"
+    return f"{ref} {_table_cell(task.get('title'))}"
+
+
+def render_planner_changes_markdown(
+    snapshot: Dict[str, Any],
+    previous: Optional[Dict[str, Any]],
+    diff: Optional[Dict[str, List[Dict[str, Any]]]],
+    snapshot_path: Optional[str] = None,
+) -> str:
+    """Renders the planner diff (or a first-snapshot notice) as markdown."""
+    since = f" — since {previous['date']}" if previous else ""
+    lines = [f"# My Planner Changes{since}", "", f"**User ID:** {snapshot['user_id']}"]
+    if snapshot_path:
+        lines.append(f"**Snapshot:** {snapshot_path}")
+    lines.append("")
+
+    if previous is None or diff is None:
+        count = len(snapshot["tasks"])
+        if snapshot_path:
+            note = f"Saved today's ({count} tasks); changes show from the next day's run."
+        else:
+            note = f"Found {count} tasks; nothing was saved, so run again with saving on to start tracking."
+        lines += [f"_No earlier snapshot to compare with. {note}_", ""]
+        return "\n".join(lines)
+
+    if not any(diff.values()):
+        lines += ["_(no changes)_", ""]
+        return "\n".join(lines)
+
+    label = PLANNER_PERIODS.get
+    sections = [
+        ("New", diff["added"], lambda t: f"{label(t['period'], t['period'])} · {_table_cell(t.get('stage_status'))}"),
+        ("Left the planner", diff["removed"], lambda t: f"was {label(t['period'], t['period'])}"),
+        ("Moved", diff["moved"], lambda t: f"{label(t['from'], t['from'])} → {label(t['to'], t['to'])}"),
+        ("Changed", diff["changed"], lambda t: "; ".join(
+            f"{name}: {_table_cell(a)} → {_table_cell(b)}" for name, a, b in t["changes"]
+        )),
+    ]
+    for title, items, detail in sections:
+        if not items:
+            continue
+        lines.append(f"## {title} ({len(items)})")
+        lines += [f"- {_planner_task_ref(t)} — {detail(t)}" for t in items]
+        lines.append("")
+    return "\n".join(lines)
+
+
+def fetch_my_planner_changes(
+    headers: Dict[str, str],
+    user_id: Optional[Any] = None,
+    bearer_token: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    save: bool = True,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    Shared orchestration (MCP tool and CLI): fetch every planner period, build
+    today's snapshot for the user, diff it against the latest earlier snapshot,
+    and (if `save`) write today's snapshot. Returns {"user_id", "snapshot",
+    "previous", "diff", "snapshot_path", "markdown"}. Blocking I/O.
+    """
+    resolved = resolve_user_id(user_id, bearer_token=bearer_token)
+    planners = {period: get_priority_tasks(headers, period) for period in PLANNER_PERIODS}
+    snapshot = build_planner_snapshot(planners, resolved, today=today)
+    previous = load_previous_planner_snapshot(resolved, snapshot["date"], base_dir)
+    diff = diff_planner_snapshots(previous, snapshot) if previous else None
+    path = save_planner_snapshot(snapshot, base_dir) if save else None
+    return {
+        "user_id": resolved,
+        "snapshot": snapshot,
+        "previous": previous,
+        "diff": diff,
+        "snapshot_path": path,
+        "markdown": render_planner_changes_markdown(snapshot, previous, diff, path),
+    }
+
+
 def fetch_task_data(
     issue_identifier: str,
     headers: Dict[str, str],

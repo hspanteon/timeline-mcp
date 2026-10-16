@@ -504,3 +504,142 @@ class TestPlannerPeriods:
         assert seen["period"] == "commingup"
         assert result["period"] == "commingup"
         assert "— Coming Up" in result["markdown"]
+
+
+# --------------------------------------------------------------------------- #
+# Planner change tracking: snapshots and diffs
+# --------------------------------------------------------------------------- #
+def _planner_for(user_id, tasks):
+    return [{"user_id": 1, "data": []}, {"user_id": user_id, "data": tasks}]
+
+
+def _task(issue, order, **extra):
+    return {"issue_number": issue, "code": "15033", "title": f"Task {issue}",
+            "priority_sort_order": order, "stage_status": "QA", "task_status": "open",
+            "deadline": None, **extra}
+
+
+class TestPlannerSnapshot:
+    def test_build_snapshot_across_periods(self):
+        planners = {
+            "now": _planner_for(135, [_task(2, 2), _task(1, 1)]),
+            "next": _planner_for(135, [_task(3, 1), _task(1, 5)]),  # 1 duplicated: now wins
+            "commingup": _planner_for(135, []),
+        }
+        snap = pc.build_planner_snapshot(planners, 135, today=date(2026, 10, 16))
+        assert snap["date"] == "2026-10-16"
+        assert {k: (v["period"], v["position"]) for k, v in snap["tasks"].items()} == {
+            "1": ("now", 1), "2": ("now", 2), "3": ("next", 1),
+        }
+
+    def test_build_snapshot_normalizes_deadline(self):
+        planners = {"now": _planner_for(135, [_task(1, 1, deadline="20.10.2026 00:00")])}
+        snap = pc.build_planner_snapshot(planners, 135)
+        assert snap["tasks"]["1"]["deadline"] == "2026-10-20"
+
+    def test_user_absent_from_one_period_is_fine(self):
+        planners = {"now": _planner_for(135, [_task(1, 1)]), "next": [], "commingup": []}
+        assert list(pc.build_planner_snapshot(planners, 135)["tasks"]) == ["1"]
+
+    def test_user_absent_everywhere_raises(self):
+        with pytest.raises(LookupError):
+            pc.build_planner_snapshot({"now": [], "next": [], "commingup": []}, 135)
+
+    def test_save_and_load_previous(self, tmp_path):
+        for day, user in [("2026-10-14", 135), ("2026-10-15", 999), ("2026-10-16", 135)]:
+            pc.save_planner_snapshot({"user_id": user, "date": day, "tasks": {}}, str(tmp_path))
+        (tmp_path / "timeline" / "planner" / "notes.json").write_text("{}")
+        prev = pc.load_previous_planner_snapshot(135, "2026-10-16", str(tmp_path))
+        # Skips today's own snapshot and the other user's.
+        assert prev["date"] == "2026-10-14"
+        assert pc.load_previous_planner_snapshot(135, "2026-10-14", str(tmp_path)) is None
+
+    def test_load_previous_without_directory(self, tmp_path):
+        assert pc.load_previous_planner_snapshot(135, "2026-10-16", str(tmp_path)) is None
+
+
+class TestPlannerDiff:
+    OLD = {"user_id": 135, "date": "2026-10-15", "tasks": {
+        "1": {"issue_number": 1, "code": "1", "title": "Stays", "period": "now", "position": 1,
+              "stage_status": "QA", "task_status": "open", "deadline": None},
+        "2": {"issue_number": 2, "code": "1", "title": "Moves", "period": "next", "position": 1,
+              "stage_status": "QA", "task_status": "open", "deadline": None},
+        "3": {"issue_number": 3, "code": "1", "title": "Gone", "period": "now", "position": 2,
+              "stage_status": "QA", "task_status": "open", "deadline": None},
+    }}
+    NEW = {"user_id": 135, "date": "2026-10-16", "tasks": {
+        "1": {**OLD["tasks"]["1"], "deadline": "2026-10-20", "stage_status": "Done"},
+        "2": {**OLD["tasks"]["2"], "period": "now", "position": 2},
+        "4": {"issue_number": 4, "code": "1", "title": "Fresh", "period": "now", "position": 3,
+              "stage_status": "Dev", "task_status": "open", "deadline": None},
+    }}
+
+    def test_diff(self):
+        diff = pc.diff_planner_snapshots(self.OLD, self.NEW)
+        assert [t["issue_number"] for t in diff["added"]] == [4]
+        assert [t["issue_number"] for t in diff["removed"]] == [3]
+        assert [(t["issue_number"], t["from"], t["to"]) for t in diff["moved"]] == [(2, "next", "now")]
+        assert diff["changed"] == [{**self.NEW["tasks"]["1"], "changes": [
+            ("deadline", None, "2026-10-20"), ("stage", "QA", "Done"),
+        ]}]
+
+    def test_position_only_change_is_not_reported(self):
+        new = {"tasks": {**self.OLD["tasks"], "1": {**self.OLD["tasks"]["1"], "position": 9}}}
+        assert not any(pc.diff_planner_snapshots(self.OLD, new).values())
+
+    def test_render_changes(self):
+        diff = pc.diff_planner_snapshots(self.OLD, self.NEW)
+        md = pc.render_planner_changes_markdown(self.NEW, self.OLD, diff, "/x/2026-10-16.json")
+        assert md.startswith("# My Planner Changes — since 2026-10-15")
+        assert "**Snapshot:** /x/2026-10-16.json" in md
+        assert f"- [#4]({pc.BASE_URL}/tasks#/list/1/edit/4) Fresh — Now · Dev" in md
+        assert "## Left the planner (1)" in md and "Gone — was Now" in md
+        assert "Moves — Next → Now" in md
+        assert "Stays — deadline: — → 2026-10-20; stage: QA → Done" in md
+
+    def test_render_no_changes(self):
+        md = pc.render_planner_changes_markdown(self.OLD, self.OLD, pc.diff_planner_snapshots(self.OLD, self.OLD))
+        assert "_(no changes)_" in md
+
+    def test_render_first_snapshot(self):
+        md = pc.render_planner_changes_markdown(self.NEW, None, None, "/x/2026-10-16.json")
+        assert "No earlier snapshot" in md and "Saved today's (3 tasks)" in md
+
+    def test_render_first_snapshot_not_saved(self):
+        md = pc.render_planner_changes_markdown(self.NEW, None, None)
+        assert "Found 3 tasks; nothing was saved" in md
+
+
+class TestFetchPlannerChanges:
+    def _fake_planner(self, tasks_by_period):
+        def fake(headers, period="now"):
+            return _planner_for(135, tasks_by_period.get(period, []))
+        return fake
+
+    def test_first_run_then_second_day(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "get_priority_tasks", self._fake_planner({"now": [_task(1, 1)]}))
+        first = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), today=date(2026, 10, 15))
+        assert first["previous"] is None
+        assert (tmp_path / "timeline" / "planner" / "2026-10-15.json").exists()
+
+        monkeypatch.setattr(pc, "get_priority_tasks", self._fake_planner({"now": [_task(1, 1), _task(2, 2)]}))
+        second = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), today=date(2026, 10, 16))
+        assert [t["issue_number"] for t in second["diff"]["added"]] == [2]
+        assert "since 2026-10-15" in second["markdown"]
+
+    def test_fetches_every_period(self, monkeypatch, tmp_path):
+        seen = []
+
+        def fake(headers, period="now"):
+            seen.append(period)
+            return _planner_for(135, [])
+
+        monkeypatch.setattr(pc, "get_priority_tasks", fake)
+        pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path))
+        assert seen == list(pc.PLANNER_PERIODS)
+
+    def test_no_save(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "get_priority_tasks", self._fake_planner({}))
+        result = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), save=False)
+        assert result["snapshot_path"] is None
+        assert not (tmp_path / "timeline").exists()
