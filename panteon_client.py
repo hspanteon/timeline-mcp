@@ -517,8 +517,14 @@ def task_markdown_path(issue_id: str, base_dir: Optional[str] = None) -> str:
     base_dir defaults to the PANTEON_TIMELINE_DIR env var, then the current working
     directory. Does not create anything on disk.
     """
+    return os.path.join(timeline_dir(base_dir), str(issue_id), "task.md")
+
+
+def timeline_dir(base_dir: Optional[str] = None) -> str:
+    """`<base>/timeline`, where <base> is base_dir, then PANTEON_TIMELINE_DIR,
+    then the current working directory."""
     base = base_dir or os.getenv("PANTEON_TIMELINE_DIR") or os.getcwd()
-    return os.path.abspath(os.path.join(base, "timeline", str(issue_id), "task.md"))
+    return os.path.abspath(os.path.join(base, "timeline"))
 
 
 def save_task_markdown(
@@ -655,24 +661,27 @@ def render_priority_tasks_markdown(
     tasks: List[Dict[str, Any]],
     period: str = "now",
     today: Optional[date] = None,
+    title: Optional[str] = None,
+    level: int = 1,
 ) -> str:
     """
     Renders a user's planner tasks as a markdown table in priority order. Each
     issue links to its task page and can be passed to get_task_conversation.
     Deadlines that are overdue or due within DUE_SOON_DAYS of `today` are
     flagged in the Deadline column and counted in the header.
+
+    `title`/`level` let fetch_my_day embed this as a sub-section; the User ID
+    line is only shown at the top level.
     """
     label = PLANNER_PERIODS[normalize_planner_period(period)]
     today = today or date.today()
     flags = [deadline_flag(task.get("deadline"), today) for task in tasks]
     overdue = flags.count("overdue")
     due_soon = sum(1 for flag in flags if flag and flag != "overdue")
-    lines = [
-        f"# My Priority Tasks — {label}",
-        "",
-        f"**User ID:** {user_id}",
-        f"**Tasks:** {len(tasks)}",
-    ]
+    lines = [f"{'#' * level} {title or f'My Priority Tasks — {label}'}", ""]
+    if level == 1:
+        lines.append(f"**User ID:** {user_id}")
+    lines.append(f"**Tasks:** {len(tasks)}")
     if tasks:
         lines.append(
             f"**Overdue:** {overdue} · **Due within {DUE_SOON_DAYS} days:** {due_soon} "
@@ -737,9 +746,8 @@ PLANNER_CHANGE_FIELDS = {
 
 
 def planner_snapshot_dir(base_dir: Optional[str] = None) -> str:
-    """`<base>/timeline/planner`, with <base> resolved like task_markdown_path."""
-    base = base_dir or os.getenv("PANTEON_TIMELINE_DIR") or os.getcwd()
-    return os.path.abspath(os.path.join(base, "timeline", "planner"))
+    """`<base>/timeline/planner` (see timeline_dir)."""
+    return os.path.join(timeline_dir(base_dir), "planner")
 
 
 def build_planner_snapshot(
@@ -867,20 +875,27 @@ def render_planner_changes_markdown(
     previous: Optional[Dict[str, Any]],
     diff: Optional[Dict[str, List[Dict[str, Any]]]],
     snapshot_path: Optional[str] = None,
+    level: int = 1,
 ) -> str:
-    """Renders the planner diff (or a first-snapshot notice) as markdown."""
+    """Renders the planner diff (or a first-snapshot notice) as markdown.
+    With level > 1 it is a sub-section (no User ID line, "Changes" title)."""
     since = f" — since {previous['date']}" if previous else ""
-    lines = [f"# My Planner Changes{since}", "", f"**User ID:** {snapshot['user_id']}"]
+    title = f"My Planner Changes{since}" if level == 1 else f"Changes{since}"
+    lines = [f"{'#' * level} {title}", ""]
+    meta = []
+    if level == 1:
+        meta.append(f"**User ID:** {snapshot['user_id']}")
     if snapshot_path:
-        lines.append(f"**Snapshot:** {snapshot_path}")
-    lines.append("")
+        meta.append(f"**Snapshot:** {snapshot_path}")
+    if meta:
+        lines += meta + [""]
 
     if previous is None or diff is None:
         count = len(snapshot["tasks"])
         if snapshot_path:
             note = f"Saved today's ({count} tasks); changes show from the next day's run."
         else:
-            note = f"Found {count} tasks; nothing was saved, so run again with saving on to start tracking."
+            note = f"Found {count} tasks; saving is off, so nothing was recorded."
         lines += [f"_No earlier snapshot to compare with. {note}_", ""]
         return "\n".join(lines)
 
@@ -897,10 +912,10 @@ def render_planner_changes_markdown(
             f"{name}: {_table_cell(a)} → {_table_cell(b)}" for name, a, b in t["changes"]
         )),
     ]
-    for title, items, detail in sections:
+    for section, items, detail in sections:
         if not items:
             continue
-        lines.append(f"## {title} ({len(items)})")
+        lines.append(f"{'#' * (level + 1)} {section} ({len(items)})")
         lines += [f"- {_planner_task_ref(t)} — {detail(t)}" for t in items]
         lines.append("")
     return "\n".join(lines)
@@ -913,15 +928,18 @@ def fetch_my_planner_changes(
     base_dir: Optional[str] = None,
     save: bool = True,
     today: Optional[date] = None,
+    planners: Optional[Dict[str, List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """
-    Shared orchestration (MCP tool and CLI): fetch every planner period, build
-    today's snapshot for the user, diff it against the latest earlier snapshot,
-    and (if `save`) write today's snapshot. Returns {"user_id", "snapshot",
-    "previous", "diff", "snapshot_path", "markdown"}. Blocking I/O.
+    Shared orchestration (MCP tool and CLI): fetch every planner period (unless
+    `planners` is passed in), build today's snapshot for the user, diff it
+    against the latest earlier snapshot, and (if `save`) write today's snapshot.
+    Returns {"user_id", "snapshot", "previous", "diff", "snapshot_path",
+    "markdown"}. Blocking I/O.
     """
     resolved = resolve_user_id(user_id, bearer_token=bearer_token)
-    planners = {period: get_priority_tasks(headers, period) for period in PLANNER_PERIODS}
+    if planners is None:
+        planners = fetch_all_planners(headers)
     snapshot = build_planner_snapshot(planners, resolved, today=today)
     previous = load_previous_planner_snapshot(resolved, snapshot["date"], base_dir)
     diff = diff_planner_snapshots(previous, snapshot) if previous else None
@@ -933,6 +951,64 @@ def fetch_my_planner_changes(
         "diff": diff,
         "snapshot_path": path,
         "markdown": render_planner_changes_markdown(snapshot, previous, diff, path),
+    }
+
+
+def fetch_all_planners(headers: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
+    """One request per planner period: {period: raw planner}. Blocking I/O."""
+    return {period: get_priority_tasks(headers, period) for period in PLANNER_PERIODS}
+
+
+def fetch_my_day(
+    headers: Dict[str, str],
+    user_id: Optional[Any] = None,
+    bearer_token: Optional[str] = None,
+    base_dir: Optional[str] = None,
+    save: bool = True,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    Everything a daily brief needs from one fetch of the three planner periods
+    (3 requests): the `now` table, `next` tasks that are overdue or due within
+    DUE_SOON_DAYS, and the changes since the last saved day (saving today's
+    snapshot unless `save` is false). Returns {"user_id", "now", "due_soon_next",
+    "changes", "markdown"}. Blocking I/O.
+    """
+    today = today or date.today()
+    resolved = resolve_user_id(user_id, bearer_token=bearer_token)
+    planners = fetch_all_planners(headers)
+    changes = fetch_my_planner_changes(
+        headers, user_id=resolved, base_dir=base_dir, save=save, today=today, planners=planners
+    )
+
+    def period_tasks(period):
+        try:
+            return extract_user_priority_tasks(planners[period], resolved)
+        except LookupError:
+            return []
+
+    now = period_tasks("now")
+    due_soon_next = [t for t in period_tasks("next") if deadline_flag(t.get("deadline"), today)]
+
+    sections = [
+        f"# My Day — {today.isoformat()}\n\n**User ID:** {resolved}\n",
+        render_priority_tasks_markdown(resolved, now, "now", today=today, title="Now", level=2),
+    ]
+    if due_soon_next:
+        sections.append(render_priority_tasks_markdown(
+            resolved, due_soon_next, "next", today=today,
+            title=f"Next — due within {DUE_SOON_DAYS} days", level=2,
+        ))
+    changes_md = render_planner_changes_markdown(
+        changes["snapshot"], changes["previous"], changes["diff"], changes["snapshot_path"], level=2
+    )
+    sections.append(changes_md)
+    return {
+        "user_id": resolved,
+        "now": now,
+        "due_soon_next": due_soon_next,
+        "changes": changes,
+        "markdown": "\n".join(sections),
     }
 
 

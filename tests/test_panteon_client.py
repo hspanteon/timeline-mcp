@@ -607,7 +607,7 @@ class TestPlannerDiff:
 
     def test_render_first_snapshot_not_saved(self):
         md = pc.render_planner_changes_markdown(self.NEW, None, None)
-        assert "Found 3 tasks; nothing was saved" in md
+        assert "Found 3 tasks; saving is off" in md
 
 
 class TestFetchPlannerChanges:
@@ -643,3 +643,51 @@ class TestFetchPlannerChanges:
         result = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), save=False)
         assert result["snapshot_path"] is None
         assert not (tmp_path / "timeline").exists()
+
+
+class TestFetchMyDay:
+    def test_one_fetch_per_period_and_single_header(self, monkeypatch, tmp_path):
+        seen = []
+        tasks = {
+            "now": [_task(1, 1, deadline="2026-10-10")],
+            "next": [_task(2, 1, deadline="2026-10-18"), _task(3, 2, deadline="2026-12-01"), _task(4, 3)],
+        }
+
+        def fake(headers, period="now"):
+            seen.append(period)
+            return _planner_for(135, tasks.get(period, []))
+
+        monkeypatch.setattr(pc, "get_priority_tasks", fake)
+        result = pc.fetch_my_day({}, user_id=135, base_dir=str(tmp_path), today=date(2026, 10, 16))
+
+        assert seen == list(pc.PLANNER_PERIODS)  # each period fetched exactly once
+        assert [t["issue_number"] for t in result["due_soon_next"]] == [2]
+        md = result["markdown"]
+        assert md.startswith("# My Day — 2026-10-16")
+        assert md.count("**User ID:**") == 1
+        assert "## Now" in md and "## Next — due within 7 days" in md and "## Changes" in md
+        assert "| 2026-10-10 **(overdue)** |" in md
+        assert "#3" not in md.split("## Changes")[0]  # not due soon, so not listed
+        assert (tmp_path / "timeline" / "planner" / "2026-10-16.json").exists()
+
+    def test_next_section_omitted_when_nothing_due(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": _planner_for(135, []))
+        md = pc.fetch_my_day({}, user_id=135, base_dir=str(tmp_path), save=False)["markdown"]
+        assert "## Next" not in md
+        assert not (tmp_path / "timeline").exists()
+
+    def test_changes_reuse_prefetched_planners(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda *a, **k: pytest.fail("should not fetch"))
+        planners = {p: _planner_for(135, []) for p in pc.PLANNER_PERIODS}
+        result = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), planners=planners)
+        assert result["snapshot"]["tasks"] == {}
+
+    def test_timeline_dir_resolution(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        assert pc.planner_snapshot_dir() == str(tmp_path / "timeline" / "planner")
+        assert pc.task_markdown_path("5") == str(tmp_path / "timeline" / "5" / "task.md")
+
+
+def test_changes_subsection_has_no_double_blank_line():
+    md = pc.render_planner_changes_markdown({"user_id": 1, "date": "2026-10-16", "tasks": {}}, None, None, level=2)
+    assert "\n\n\n" not in md

@@ -300,3 +300,28 @@ class TestGetMyPlannerChangesTool:
         with pytest.raises(ToolError) as exc_info:
             await server.get_my_planner_changes(user_id=7, bearer_token="tok")
         assert "not found" in str(exc_info.value)
+
+
+class TestGetMyDayTool:
+    @pytest.mark.anyio
+    async def test_returns_brief(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1"}]}],
+        )
+        result = await server.get_my_day(user_id=7, bearer_token="tok", save=False)
+        assert result.startswith("# My Day")
+        assert "## Changes" in result
+
+    @pytest.mark.anyio
+    async def test_http_error_becomes_tool_error(self, monkeypatch):
+        import requests
+
+        def boom(headers, period="now"):
+            raise requests.HTTPError(response=type("R", (), {"status_code": 500})())
+
+        monkeypatch.setattr(pc, "get_priority_tasks", boom)
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_day(user_id=7, bearer_token="tok", save=False)
+        assert "HTTP 500" in str(exc_info.value)

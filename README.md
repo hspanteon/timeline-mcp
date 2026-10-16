@@ -168,6 +168,9 @@ Reports what changed in your planner since the last saved day: **new** tasks, ta
 - The first run has nothing to compare with; it only saves the snapshot.
 - **Arguments**: `user_id`, `bearer_token`, `cookie` as for `get_my_priority_tasks`; `save` (bool, default `true`) — `false` compares without writing anything.
 
+### `get_my_day`
+One call for a daily brief: your `now` tasks (with deadline flags), `next` tasks that are overdue or due within 7 days, and the changes section from `get_my_planner_changes`. Each planner period is fetched once (3 requests), and today's snapshot is saved unless `save=false`. Same arguments as `get_my_planner_changes`. The `my-day` skill uses this tool.
+
 #### Output location (`get_task_conversation`)
 The file is written to `<base>/timeline/<issue_id>/task.md`, where `<base>` is:
 1. `PANTEON_TIMELINE_DIR` env var, if set (this MCP is configured with it pointing at the
@@ -199,6 +202,9 @@ The same fetch logic is available from the shell via `fetch_task.py` (credential
 # Planner changes since the last saved day (also saves today's snapshot)
 .venv/bin/python fetch_task.py --changes
 .venv/bin/python fetch_task.py --changes --no-save
+
+# Daily brief: now + soon-due next + changes (one fetch per planner period)
+.venv/bin/python fetch_task.py --my-day
 ```
 
 ---

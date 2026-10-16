@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import anyio
 import requests
@@ -19,7 +19,8 @@ mcp = FastMCP(
         "ID and wants its content, history, or context. Use get_my_priority_tasks when "
         "the user asks what they should work on, or about their planner/priority tasks "
         "(period now, next, or commingup). Use get_my_planner_changes when the user asks "
-        "what changed in their planner (new, removed, moved or re-dated tasks). "
+        "what changed in their planner (new, removed, moved or re-dated tasks), and "
+        "get_my_day for a daily brief (now tasks, soon-due next tasks and changes in one call). "
         "Use check_auth first if "
         "PANTEON_BEARER_TOKEN/PANTEON_COOKIE haven't been verified yet, or after a call "
         "fails with an authentication error, to confirm whether credentials are missing, "
@@ -60,6 +61,25 @@ async def _request_empty_task_context(
     if isinstance(context, str) and context.strip():
         return context.strip()
     return None
+
+
+async def _run_client(call: Callable[[], Any], not_found: Optional[str] = None) -> Any:
+    """
+    Runs a blocking panteon_client call off the event loop (so concurrent tool
+    calls, progress and elicitation aren't stalled) and turns its expected
+    failures into ToolErrors. `not_found` is the message for an HTTP 404.
+    """
+    try:
+        return await anyio.to_thread.run_sync(call)
+    except (ValueError, LookupError) as exc:
+        raise ToolError(str(exc)) from exc
+    except requests.HTTPError as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        if status_code == 404 and not_found:
+            raise ToolError(not_found) from exc
+        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
+    except requests.RequestException as exc:
+        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
 
 
 @mcp.tool()
@@ -146,22 +166,13 @@ async def get_task_conversation(
     await ctx.report_progress(progress=0, total=3)
     await ctx.info(f"Resolving Panteon task from '{issue_identifier}'…")
 
-    # The Panteon client is synchronous (blocking requests); run it off the event
-    # loop so we don't stall concurrent tool calls, progress, or elicitation.
-    try:
-        data = await anyio.to_thread.run_sync(
-            panteon_client.fetch_task_data, issue_identifier, headers
-        )
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        if status_code == 404:
-            raise ToolError(
-                f"Issue '{issue_identifier}' was not found in Panteon Timeline. "
-                "Double-check the issue ID or task URL."
-            ) from exc
-        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
-    except requests.RequestException as exc:
-        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
+    data = await _run_client(
+        lambda: panteon_client.fetch_task_data(issue_identifier, headers),
+        not_found=(
+            f"Issue '{issue_identifier}' was not found in Panteon Timeline. "
+            "Double-check the issue ID or task URL."
+        ),
+    )
     issue_id = data["issue_id"]
     task_id = data["task_id"]
     task_meta = data["task_meta"]
@@ -227,19 +238,11 @@ async def get_my_priority_tasks(
         The rendered markdown. Nothing is written to disk.
     """
     headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
-    try:
-        result = await anyio.to_thread.run_sync(
-            lambda: panteon_client.fetch_my_priority_tasks(
-                headers, user_id=user_id, bearer_token=bearer_token, period=period
-            )
+    result = await _run_client(
+        lambda: panteon_client.fetch_my_priority_tasks(
+            headers, user_id=user_id, bearer_token=bearer_token, period=period
         )
-    except (ValueError, LookupError) as exc:
-        raise ToolError(str(exc)) from exc
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
-    except requests.RequestException as exc:
-        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
+    )
     return result["markdown"]
 
 
@@ -275,19 +278,44 @@ async def get_my_planner_changes(
         The rendered changes markdown.
     """
     headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
-    try:
-        result = await anyio.to_thread.run_sync(
-            lambda: panteon_client.fetch_my_planner_changes(
-                headers, user_id=user_id, bearer_token=bearer_token, save=save
-            )
+    result = await _run_client(
+        lambda: panteon_client.fetch_my_planner_changes(
+            headers, user_id=user_id, bearer_token=bearer_token, save=save
         )
-    except (ValueError, LookupError) as exc:
-        raise ToolError(str(exc)) from exc
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code if exc.response is not None else None
-        raise ToolError(f"Panteon API request failed (HTTP {status_code}): {exc}") from exc
-    except requests.RequestException as exc:
-        raise ToolError(f"Could not reach Panteon Timeline: {exc}") from exc
+    )
+    return result["markdown"]
+
+
+@mcp.tool(output_schema=None)
+async def get_my_day(
+    user_id: Optional[int] = None,
+    save: bool = True,
+    bearer_token: Optional[str] = None,
+    cookie: Optional[str] = None,
+) -> str:
+    """
+    One-call daily brief data from the Panteon planner, fetching each planner
+    period once: your `now` tasks (deadline flags included), `next` tasks that
+    are overdue or due within 7 days, and changes since the last saved day.
+    Prefer this over calling get_my_priority_tasks and get_my_planner_changes
+    separately when you need all of it.
+
+    Args:
+        user_id: Optional Panteon user id. Defaults to PANTEON_USER_ID, then the
+            `sub` claim of the bearer token.
+        save: Save today's planner snapshot (default true), as get_my_planner_changes does.
+        bearer_token: Optional JWT Bearer token (defaults to PANTEON_BEARER_TOKEN env var).
+        cookie: Optional raw Cookie header string (defaults to PANTEON_COOKIE env var).
+
+    Side effect:
+        Writes `timeline/planner/<YYYY-MM-DD>.json` unless save=False.
+    """
+    headers = panteon_client.build_api_headers(bearer_token=bearer_token, cookie=cookie)
+    result = await _run_client(
+        lambda: panteon_client.fetch_my_day(
+            headers, user_id=user_id, bearer_token=bearer_token, save=save
+        )
+    )
     return result["markdown"]
 
 

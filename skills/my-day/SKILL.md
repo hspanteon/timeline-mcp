@@ -9,17 +9,17 @@ Give the user a short, decision-ready brief of their day from the Panteon planne
 
 ## 1. Get the planner
 
-Call the `get_my_priority_tasks` tool of the `timeline-mcp` server with `period: "now"`. The tool is namespaced by the plugin, so match it by its short name.
+Call the `get_my_day` tool of the `timeline-mcp` server with default arguments. The tool is namespaced by the plugin, so match it by its short name. It fetches the planner once and returns three sections:
+
+- **Now:** your `now` tasks in priority order. The Deadline column marks `(overdue)`, `(due today)` and `(due in Nd)`, and the header counts them. Use these flags as given; do not recompute dates.
+- **Next — due within 7 days:** `next` tasks that are overdue or due soon. Absent when there are none.
+- **Changes:** New, Left the planner, Moved and Changed since the last saved day. It also saves today's snapshot. If it says there is no earlier snapshot, note that changes will show from tomorrow.
+
+Do not also call `get_my_priority_tasks` or `get_my_planner_changes`; `get_my_day` already covers them.
 
 - If it fails with an authentication error, call `check_auth`, report the result, and stop.
 - If it reports that the user is not in the planner, say so and suggest setting `PANTEON_USER_ID`. Stop.
-- If the user has no `now` tasks, call it again with `period: "next"` and brief from that instead, saying so.
-
-The table is already in priority order. Its Deadline column marks `(overdue)`, `(due today)` and `(due in Nd)`, and the header counts them. Use these flags as given; do not recompute dates.
-
-Also call it once with `period: "next"` and keep only tasks flagged overdue or due within 7 days. A deadline coming up on a task that is not in `now` is worth flagging.
-
-Then call `get_my_planner_changes` (default arguments). It compares the planner with the last saved day and saves today's snapshot. Keep its New, Left the planner, Moved and Changed lists for the brief. If it says there is no earlier snapshot, note that changes will show from tomorrow.
+- If the Now section is empty, call `get_my_priority_tasks` with `period: "next"` and brief from that instead, saying so.
 
 ## 2. Pick the focus tasks
 

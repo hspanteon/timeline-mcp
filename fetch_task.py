@@ -14,6 +14,7 @@ Examples:
     python3 fetch_task.py --planner --period next
     python3 fetch_task.py --planner --user-id 135
     python3 fetch_task.py --changes              # planner changes since last snapshot
+    python3 fetch_task.py --my-day               # now + soon-due next + changes
 """
 import argparse
 import sys
@@ -40,9 +41,14 @@ def main(argv=None) -> int:
         help="Show planner changes since the last saved day and save today's snapshot.",
     )
     parser.add_argument(
+        "--my-day",
+        action="store_true",
+        help="Daily brief: now tasks, soon-due next tasks and changes (saves today's snapshot).",
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
-        help="With --changes: compare without saving today's snapshot.",
+        help="With --changes or --my-day: compare without saving today's snapshot.",
     )
     parser.add_argument(
         "--period",
@@ -68,25 +74,22 @@ def main(argv=None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.changes:
+    planner_call = None
+    if args.my_day:
+        planner_call = lambda headers: panteon_client.fetch_my_day(
+            headers, user_id=args.user_id, base_dir=args.base_dir, save=not args.no_save
+        )
+    elif args.changes:
+        planner_call = lambda headers: panteon_client.fetch_my_planner_changes(
+            headers, user_id=args.user_id, base_dir=args.base_dir, save=not args.no_save
+        )
+    elif args.planner:
+        planner_call = lambda headers: panteon_client.fetch_my_priority_tasks(
+            headers, user_id=args.user_id, period=args.period
+        )
+    if planner_call:
         try:
-            result = panteon_client.fetch_my_planner_changes(
-                panteon_client.build_api_headers(),
-                user_id=args.user_id,
-                base_dir=args.base_dir,
-                save=not args.no_save,
-            )
-        except (ValueError, LookupError, PermissionError) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
-            return 1
-        print(result["markdown"])
-        return 0
-
-    if args.planner:
-        try:
-            result = panteon_client.fetch_my_priority_tasks(
-                panteon_client.build_api_headers(), user_id=args.user_id, period=args.period
-            )
+            result = planner_call(panteon_client.build_api_headers())
         except (ValueError, LookupError, PermissionError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -94,7 +97,7 @@ def main(argv=None) -> int:
         return 0
 
     if not args.issue:
-        parser.error("an issue URL/ID is required unless --planner or --changes is given")
+        parser.error("an issue URL/ID is required unless --planner, --changes or --my-day is given")
 
     try:
         result = panteon_client.fetch_and_save(args.issue, base_dir=args.base_dir)
