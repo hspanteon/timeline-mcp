@@ -1151,6 +1151,100 @@ def fetch_my_day(
     }
 
 
+# --------------------------------------------------------------------------- #
+# Dashboard data (dashboard.py): JSON-friendly views over the same data
+# --------------------------------------------------------------------------- #
+def task_url(issue_number: Any, code: Any) -> Optional[str]:
+    """Timeline page of a task, or None without both its issue number and list code."""
+    if issue_number and code:
+        return f"{BASE_URL}/tasks#/list/{code}/edit/{issue_number}"
+    return None
+
+
+def planner_overview(
+    planners: Dict[str, List[Dict[str, Any]]],
+    user_id: int,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    One user's tasks in every planner period, in priority order, with deadline
+    flags and task URLs: {"user_id", "today", "periods": {period: {"label",
+    "tasks": [...]}}}. A period the user is absent from is empty. Raises
+    LookupError if the user is absent from every period.
+    """
+    today = today or date.today()
+    periods: Dict[str, Dict[str, Any]] = {}
+    found = False
+    for period, label in PLANNER_PERIODS.items():
+        try:
+            tasks = extract_user_priority_tasks(planners.get(period) or [], user_id)
+            found = True
+        except LookupError:
+            tasks = []
+        periods[period] = {
+            "label": label,
+            "tasks": [
+                {
+                    "issue_number": t.get("issue_number"),
+                    "title": t.get("title") or "",
+                    "stage_status": t.get("stage_status") or "",
+                    "task_status": t.get("task_status") or "",
+                    "deadline": _normalize_date(t.get("deadline") or "") or None,
+                    "deadline_flag": deadline_flag(t.get("deadline"), today),
+                    "support": bool(t.get("support")),
+                    "code": str(t["code"]) if t.get("code") is not None else None,
+                    "url": task_url(t.get("issue_number"), t.get("code")),
+                }
+                for t in tasks
+            ],
+        }
+    if not found:
+        raise LookupError(f"User {user_id} was not found in any planner period.")
+    return {"user_id": user_id, "today": today.isoformat(), "periods": periods}
+
+
+def list_planner_snapshots(user_id: int, base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Every saved snapshot for `user_id`, oldest first. Unreadable files are skipped."""
+    directory = planner_snapshot_dir(base_dir)
+    if not os.path.isdir(directory):
+        return []
+    snapshots = []
+    for name in sorted(os.listdir(directory)):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", name):
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                snapshot = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if str(snapshot.get("user_id")) == str(user_id):
+            snapshots.append(snapshot)
+    return snapshots
+
+
+def planner_history(user_id: int, base_dir: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Day-by-day planner changes from the saved snapshots, newest first:
+    {"user_id", "first_date", "days": [{"date", "previous_date", "diff"}]}.
+    Each task in a diff gets a "url". Days without changes are kept, with an
+    empty diff, so gaps in tracking stay visible.
+    """
+    snapshots = list_planner_snapshots(user_id, base_dir)
+    days = []
+    for previous, current in zip(snapshots, snapshots[1:]):
+        diff = diff_planner_snapshots(previous, current)
+        for items in diff.values():
+            for task in items:
+                task["url"] = task_url(task.get("issue_number"), task.get("code"))
+        days.append({"date": current["date"], "previous_date": previous["date"], "diff": diff})
+    days.reverse()
+    return {
+        "user_id": user_id,
+        "first_date": snapshots[0]["date"] if snapshots else None,
+        "days": days,
+    }
+
+
 def fetch_task_data(
     issue_identifier: str,
     headers: Dict[str, str],

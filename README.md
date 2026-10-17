@@ -185,6 +185,62 @@ The file is written to `<base>/timeline/<issue_id>/task.md`, where `<base>` is:
 
 ---
 
+## 🖥️ Timeline desk (local dashboard)
+
+A web view over the same data: your planner as a board, planner changes day by day, the pending duell-admin releases, and a readable task view. Every task shows a six-segment **stage rail** (RSD → Estimate → Development → Testing → QA → Live), coloured by each stage's progress.
+
+**Always on (recommended, Linux):** install it once as a systemd *user* service. It then starts at login, restarts if it crashes, and lives at **http://timeline.localhost:8765**. No sudo is needed: `*.localhost` names resolve to your own machine without editing `/etc/hosts`.
+
+```bash
+scripts/dashboard-service.sh install     # write the unit, enable and start it
+scripts/dashboard-service.sh restart     # after pulling or changing code
+scripts/dashboard-service.sh status      # state and recent log lines
+scripts/dashboard-service.sh uninstall   # stop and remove it
+```
+
+The service runs the code in this checkout. There is no build step: after editing `web/` files just reload the page (they're served with `Cache-Control: no-cache`); after editing Python files run `scripts/dashboard-service.sh restart`. Keep a branch checked out that has `dashboard.py`. Use `TIMELINE_DESK_PORT=9000 scripts/dashboard-service.sh install` for another port.
+
+**One-off:**
+
+```bash
+.venv/bin/python dashboard.py            # then open http://timeline.localhost:8765
+.venv/bin/python dashboard.py --port 9000 --user-id 135
+```
+
+| View | Shows |
+|---|---|
+| Board | Now / Next / Coming up columns with deadline flags (overdue, due soon), support tasks and stage rails |
+| Changes | New, removed, moved and changed tasks per day, from the saved `timeline/planner/` snapshots; "Save today's snapshot" records one |
+| Release | Pending duell-admin PRs grouped by destination (into `qa-release` / into `master`): verdict (ready / needs notes / blocked), CI, Timeline stage, release-note problems, "not via QA" warnings, and each PR's description. "Check again" runs `git fetch` and the `gh` lookups (about 10 s) |
+| Task | Description and conversation of any task, with safe markdown rendering, and a "Start in Claude" button for planner tasks |
+| Work | The task worktrees "Start in Claude" made: size, uncommitted changes, commits that exist only there; Remove (worktree) or Remove + branch |
+
+### Start in Claude
+
+The button on a board card (or **… in Claude** in the Task view) opens a terminal running an interactive Claude Code session for the task. What it does follows the task's Timeline stage:
+
+| Stage | Button | Session |
+|---|---|---|
+| RSD / Estimate not done | ▶ Spec | Writes `timeline/<id>/spec.md` (via `skills/task-spec`) in a task worktree, lists open questions, and stops. No code. |
+| Estimated / Development | ▶ Implement | Spec, then implements only if no stage is blocked and the spec has no open questions; otherwise it stops and lists them. |
+| Development, worktree exists | ▶ Resume | Reads the spec, the branch's commits and new comments, then continues. |
+| Development done, Testing / QA | ▶ Fix QA | Finds the testing/QA feedback in the conversation and fixes it on the task branch. |
+| Any stage blocked | ⏸ Blocked | Read only, in the main checkout: explains the blocker and drafts a question for the task thread. Posts nothing. |
+| QA done / Live | (none) | Remove the worktree from the Work tab. |
+
+The board label is a hint from the planner; on click the server re-reads the stage codes and picks the action (so Implement becomes Resume when a worktree already exists). Sessions commit locally to the task branch and never push, open PRs or merge. You approve their tool calls as usual.
+
+- The worktree reuses an existing `<id>-…` branch (local or on GitHub), else creates `<id>-<title-slug>` from `origin/<base>`. Worktrees go to `<repo>-worktrees/<branch>`; one costs about 75 MB for duell-admin (git history is shared; dependencies aren't installed there).
+- The prompt contains only the issue ID. The session fetches the task itself and treats its text as data.
+- Set up boards once: `cp timeline-desk.example.json timeline-desk.json` and edit it (board/list id → repo path and base branch, the `claude` binary, the terminal; `gnome-terminal` by default). It's gitignored and re-read on every request. A board without a repo shows no button. If you installed `claude` with nvm, update the path after a Node upgrade.
+- Clean up on the **Work** tab. Removal never forces: git keeps a worktree with uncommitted changes, and `git branch -d` keeps a branch with commits that aren't merged anywhere.
+
+The Release view needs a duell-admin checkout (`DUELL_ADMIN_DIR`, `--repo-dir`, or `../duell-admin` next to this repo) and `gh auth login`. It only reads: `git fetch/log/rev-list` and `gh pr/release list`; it never merges, pushes, comments or creates releases. Release-note drafts, the QA-approval count and the translation/migration checks come from the `release-pr-check` skill.
+
+It uses the `.env` credentials and reads snapshots from `PANTEON_TIMELINE_DIR` (or `--base-dir`, or the current directory). It listens only on `127.0.0.1` and rejects requests whose Host header isn't `127.0.0.1`, `localhost` or `timeline.localhost`, because the pages show customer data. Nothing is written except snapshots you save on purpose.
+
+---
+
 ## 💻 Command-Line Usage
 
 The same fetch logic is available from the shell via `fetch_task.py` (credentials come from `.env`):

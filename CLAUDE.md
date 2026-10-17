@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes MCP tools `get_task_conversation`, `get_my_priority_tasks`, `get_my_planner_changes`, `get_my_day`, `get_task_statuses` and `check_auth` and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use.
+A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes MCP tools `get_task_conversation`, `get_my_priority_tasks`, `get_my_planner_changes`, `get_my_day`, `get_task_statuses` and `check_auth` and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use and a local web dashboard (`dashboard.py` + `release_check.py` + `work_session.py` + `web/`).
 
 ## Commands
 
@@ -29,8 +29,13 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 .venv/bin/python -m pytest tests/test_panteon_client.py::test_name   # single test
 
+# Local dashboard (http://timeline.localhost:8765)
+.venv/bin/python dashboard.py
+scripts/dashboard-service.sh install|restart|status|uninstall   # always-on systemd user service
+
 # Quick syntax check
-.venv/bin/python -m py_compile server.py panteon_client.py fetch_task.py
+.venv/bin/python -m py_compile server.py panteon_client.py fetch_task.py dashboard.py release_check.py work_session.py
+node --check web/app.js
 ```
 
 There is no separate lint/format command configured in this repo.
@@ -64,6 +69,16 @@ In `server.py`, every client call goes through `_run_client`, which runs it off 
 ### Workflow stages
 
 `get_task_statuses` (and `fetch_task.py --status`) calls only API 1 (`taskbyissue`) per task, in a small thread pool, and writes nothing. Timeline tracks six stages (`TASK_STAGES`: `stage_rsd`, `stage_est`, `stage_dev`, `stage_tst`, `stage_qa`, `stage_liv`), each with a progress code (`STAGE_PROGRESS`: 0 not started, 1 skipped, 2 in progress, 3 blocked, 4 done — inferred from live data across every `stage_status`). `task_status` is `open` for every live task, so `release_state` derives the signal from the QA and Live codes, and `qa_approved` means QA done or already live. taskbyissue answers an unknown issue with HTTP 422 (also 404), which becomes a per-row `not found` instead of failing the batch; other HTTP and auth errors still raise.
+
+### Dashboard
+
+`dashboard.py` is a Starlette app (Starlette and uvicorn come with FastMCP, so no extra dependency) serving `web/` (plain HTML/CSS/JS, no build step) and a small JSON API: `/api/planner` (`planner_overview`), `/api/changes` (`planner_history` over the saved snapshots), `POST /api/snapshot`, `/api/statuses?ids=…` (`get_task_statuses`, max 100), `/api/task/{issue}` (`fetch_task_data`, nothing written), `GET /api/release` (the cached release report, or null) and `POST /api/release` (rebuild it). Keep the data shaping in `panteon_client.py` and the endpoints thin; `_respond` maps client errors to JSON (401 auth, 404 not found, 400 bad input, 502 upstream). Sync endpoints run in Starlette's threadpool.
+
+Security rules for the dashboard — keep them when changing it: bind `127.0.0.1` only; `TrustedHostMiddleware` allows only `ALLOWED_HOSTS` (`127.0.0.1`, `localhost`, `timeline.localhost`; blocks DNS rebinding); no CORS; state-changing endpoints require the `X-Timeline-Desk: 1` header (a cross-site form can't send it); the page loads no external fonts or scripts and sends no referrer; all Timeline text is inserted with `textContent` / DOM nodes (`h()`, `richText()` in `app.js`), never `innerHTML`. Tests are in `tests/test_dashboard.py` (Starlette `TestClient`). `web/` files are served with `Cache-Control: no-cache`; in `app.js` use `put(el, …)` rather than `el.replaceChildren(…)`, because `put` skips null children the way `h()` does.
+
+`work_session.py` backs "Start in Claude" (`POST /api/work/start`), the Work tab (`GET /api/work/worktrees`) and `POST /api/work/remove`. Board → repo mapping comes from the gitignored `timeline-desk.json` (example: `timeline-desk.example.json`; `TIMELINE_DESK_CONFIG` overrides the path), re-read per request. `prepare_worktree` reuses a worktree or `<id>-…` branch before creating `<id>-<slug>` from `origin/<base>`; `start_session` picks the action with `choose_action` from fresh `get_task_statuses` stages (spec / implement / resume when the worktree already exists / qa / blocked, which runs read-only in the main checkout without a worktree; done refuses), then opens `terminal` running `claude <prompt>` via an injectable `launcher`. The page's label (`actionFor` in `app.js`, from the planner's stage text) is only a hint; keep the two mappings in step. Keep these rules: the prompt (`build_prompt`) contains only the issue ID and fixed text, never task content; no permission-bypass flags; the session is told never to push, open PRs or merge; removal uses `git worktree remove` and `git branch -d` without force and only for paths inside a configured worktrees folder; both POSTs are header-guarded. Tests in `tests/test_work_session.py` run real git against temporary repos (no network) with a recording launcher.
+
+`release_check.py` builds the release report for duell-admin (`build_report`), following `skills/release-pr-check/SKILL.md` minus the judgement parts. It is git/GitHub-specific, so it lives apart from `panteon_client.py` and gets Timeline statuses through an injected `status_lookup`; a Timeline failure sets `timeline_error` instead of failing the report. The checkout comes from `DUELL_ADMIN_DIR` / `--repo-dir` / `../duell-admin` and must have `origin` = Panteon-norway/duell-admin. Keep it read-only: fixed argument lists through the injectable `runner` (no shell), only `git remote/fetch/log/rev-list` and `gh pr list` / `gh release list`; `POST /api/release` is header-guarded because it runs `git fetch`. Tickets on QA are qa-release merges in `origin/master..origin/qa-release` whose merged commit (second parent) isn't in `origin/master`; a master PR went "via QA" when its tip has no non-merge commits outside qa-release and master. Tests in `tests/test_release_check.py` use a fake runner. The Release view deliberately shows only the pending PRs (`prs`, each with its `body`) grouped by base branch; the report's tickets, mismatches and notes are not rendered. `scripts/dashboard-service.sh` installs it as the `timeline-desk` systemd user service (WorkingDirectory = repo, so snapshots land in the repo's `timeline/planner/`, the same place the scheduled briefs write); after changing dashboard code, run `scripts/dashboard-service.sh restart`. `.claude/launch.json` attaches the preview to that running service instead of starting a second copy.
 
 ### Markdown rendering contract
 

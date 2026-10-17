@@ -1,0 +1,12 @@
+{
+  "repos": {
+    "15033": {
+      "name": "duell-admin",
+      "path": "../duell-admin",
+      "base": "master",
+      "worktrees": "../duell-admin-worktrees"
+    }
+  },
+  "claude": "~/.local/bin/claude",
+  "terminal": "gnome-terminal"
+}

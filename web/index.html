@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Timeline desk</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>Timeline desk</h1>
+      <p class="meta" id="meta">Loading your planner…</p>
+    </div>
+    <nav class="tabs" aria-label="Views">
+      <a href="#/board" data-view="board">Board</a>
+      <a href="#/changes" data-view="changes">Changes</a>
+      <a href="#/release" data-view="release">Release</a>
+      <a href="#/task" data-view="task">Task</a>
+      <a href="#/work" data-view="work">Work</a>
+    </nav>
+    <button type="button" class="btn ghost" id="refresh">Refresh</button>
+  </header>
+
+  <main id="view" tabindex="-1" aria-live="polite"></main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
