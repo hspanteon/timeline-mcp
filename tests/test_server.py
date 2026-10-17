@@ -243,3 +243,101 @@ class TestTaskMarkdownResource:
         monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
         with pytest.raises(FileNotFoundError):
             server.task_markdown_resource("999999")
+
+
+# --------------------------------------------------------------------------- #
+# get_my_priority_tasks tool
+# --------------------------------------------------------------------------- #
+class TestGetMyPriorityTasksTool:
+    @pytest.mark.anyio
+    async def test_returns_markdown(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1", "title": "T"}]}],
+        )
+        result = await server.get_my_priority_tasks(user_id=7, bearer_token="tok")
+        assert "# My Priority Tasks" in result
+        assert "#5" in result
+
+    @pytest.mark.anyio
+    async def test_unknown_user_becomes_tool_error(self, monkeypatch):
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": [])
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_priority_tasks(user_id=7, bearer_token="tok")
+        assert "not found" in str(exc_info.value)
+
+    @pytest.mark.anyio
+    async def test_period_is_forwarded(self, monkeypatch):
+        seen = {}
+
+        def fake(headers, period="now"):
+            seen["period"] = period
+            return [{"user_id": 7, "data": []}]
+
+        monkeypatch.setattr(pc, "get_priority_tasks", fake)
+        result = await server.get_my_priority_tasks(period="next", user_id=7, bearer_token="tok")
+        assert seen["period"] == "next"
+        assert "— Next" in result
+
+
+class TestGetMyPlannerChangesTool:
+    @pytest.mark.anyio
+    async def test_first_run_saves_snapshot(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1"}]}],
+        )
+        result = await server.get_my_planner_changes(user_id=7, bearer_token="tok")
+        assert "# My Planner Changes" in result
+        assert "No earlier snapshot" in result
+        assert list((tmp_path / "timeline" / "planner").glob("*.json"))
+
+    @pytest.mark.anyio
+    async def test_unknown_user_becomes_tool_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": [])
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_planner_changes(user_id=7, bearer_token="tok")
+        assert "not found" in str(exc_info.value)
+
+
+class TestGetMyDayTool:
+    @pytest.mark.anyio
+    async def test_returns_brief(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PANTEON_TIMELINE_DIR", str(tmp_path))
+        monkeypatch.setattr(
+            pc, "get_priority_tasks",
+            lambda headers, period="now": [{"user_id": 7, "data": [{"issue_number": 5, "code": "1"}]}],
+        )
+        result = await server.get_my_day(user_id=7, bearer_token="tok", save=False)
+        assert result.startswith("# My Day")
+        assert "## Changes" in result
+
+    @pytest.mark.anyio
+    async def test_http_error_becomes_tool_error(self, monkeypatch):
+        import requests
+
+        def boom(headers, period="now"):
+            raise requests.HTTPError(response=type("R", (), {"status_code": 500})())
+
+        monkeypatch.setattr(pc, "get_priority_tasks", boom)
+        with pytest.raises(ToolError) as exc_info:
+            await server.get_my_day(user_id=7, bearer_token="tok", save=False)
+        assert "HTTP 500" in str(exc_info.value)
+
+
+class TestGetTaskStatusesTool:
+    @pytest.mark.anyio
+    async def test_returns_table(self, monkeypatch):
+        monkeypatch.setattr(
+            pc, "get_task_by_issue",
+            lambda issue_id, headers, company_id=None: {"data": {"title": "T", "stage_qa": 4, "stage_liv": 0}},
+        )
+        result = await server.get_task_statuses(["5"], bearer_token="tok")
+        assert "| #5 | T |" in result and "qa approved" in result
+
+    @pytest.mark.anyio
+    async def test_empty_list_is_tool_error(self):
+        with pytest.raises(ToolError):
+            await server.get_task_statuses([], bearer_token="tok")

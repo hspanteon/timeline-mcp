@@ -53,9 +53,9 @@ Add the following configuration to your MCP server configuration file (e.g., `cl
 {
   "mcpServers": {
     "timeline-mcp": {
-      "command": "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/.venv/bin/python",
+      "command": "/path/to/timeline-mcp/.venv/bin/python",
       "args": [
-        "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/server.py"
+        "/path/to/timeline-mcp/server.py"
       ],
       "env": {
         "PANTEON_BEARER_TOKEN": "your_jwt_token_here"
@@ -70,9 +70,9 @@ Codex reads MCP servers from `config.toml`. Add this to `~/.codex/config.toml` f
 
 ```toml
 [mcp_servers.timeline_mcp]
-command = "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/.venv/bin/python"
-args = ["/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/server.py"]
-cwd = "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp"
+command = "/path/to/timeline-mcp/.venv/bin/python"
+args = ["/path/to/timeline-mcp/server.py"]
+cwd = "/path/to/timeline-mcp"
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 ```
@@ -89,7 +89,11 @@ After saving the config, restart Codex and run `/mcp` in the Codex TUI to confir
 
 ## 🔌 Install as a Claude Code plugin
 
-This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP server with the `task-spec` skill, which turns a fetched task into a repo-aware `spec.md`.
+This repo is also a Claude Code plugin (`panteon-timeline`) that bundles the MCP server with two skills:
+
+- `task-spec` turns a fetched task into a repo-aware `spec.md`.
+- `my-day` gives a morning brief from your planner: overdue and soon-due tasks, the latest conversation on your top 3, and where to start.
+- `release-pr-check` (duell-admin only; run it from a duell-admin checkout) checks the open PRs into `qa-release` and `master` against the team's release-note format, counts QA-approved tickets from their Timeline QA stage, flags git/Timeline mismatches, and can draft the production and QA release notes. Report-only; needs `gh` logged in.
 
 ```bash
 # One-time: credentials come from your shell environment (the plugin copy has no .env)
@@ -106,11 +110,13 @@ Requires [`uv`](https://docs.astral.sh/uv/) on the PATH; the server's dependenci
 
 Then, in any project repo: ask Claude to "write a spec for Panteon task 5461" (or invoke `/panteon-timeline:task-spec 5461`). Output stays project-based: `<project>/timeline/<issue_id>/task.md` and `spec.md`. Make sure `timeline/` is gitignored in each project.
 
+For a morning brief, ask "what should I work on today?" (or invoke `/panteon-timeline:my-day`). It is read only, apart from the `task.md` files that fetching the top tasks writes.
+
 If you previously registered `timeline-mcp` manually (see above), remove that entry to avoid two copies of the server.
 
 ## 🧩 Install on other AI tools (Codex, Gemini CLI, Cursor)
 
-The same repo carries a wrapper per tool. All of them share the one `skills/task-spec/SKILL.md`.
+The same repo carries a wrapper per tool. All of them share the same `skills/` directory (`task-spec`, `my-day` and `release-pr-check`).
 
 | Tool | Wrapper files | Install | Gets |
 |---|---|---|---|
@@ -121,6 +127,35 @@ The same repo carries a wrapper per tool. All of them share the one `skills/task
 Why Codex is skill-only: Codex starts a plugin's MCP server with the plugin directory as its working directory, so `timeline/<issue_id>/` would be written inside the plugin cache instead of your project. The `config.toml` setup runs the server from your project, which keeps the output project-based.
 
 Status: the Gemini and Codex wrappers were validated and installed with their CLIs; the Cursor wrapper follows Cursor's documented format but has not been run in Cursor. Tools without a plugin system can still use the manual MCP configs above.
+
+## 👥 Setup for colleagues
+
+Everything is per person: your own token, your own planner, your own paths. Nothing in the repo is tied to one user (the planner user comes from your token's `sub` claim).
+
+**Core (all platforms)** — MCP tools, `fetch_task.py`, skills:
+1. Clone, then create the venv and install dependencies (see Installation & Setup above).
+2. `cp .env.example .env` and paste your own Timeline token.
+3. Check it: `.venv/bin/python fetch_task.py --planner`.
+4. Register the server once (user scope, so it works from any project):
+   ```bash
+   claude mcp add timeline-mcp -s user -- "$PWD/.venv/bin/python" "$PWD/server.py"
+   ```
+   Or install it as a plugin (see "Install as a Claude Code plugin" below) to get the skills too.
+
+**Dashboard** — Board, Changes and Task view work right away: `.venv/bin/python dashboard.py`, then open http://timeline.localhost:8765.
+
+| Extra | Needs |
+|---|---|
+| Release view, `release-pr-check` skill | A duell-admin checkout at `../duell-admin` (or `DUELL_ADMIN_DIR`), and `gh auth login` with access to Panteon-norway |
+| Claude buttons, Work tab | `cp timeline-desk.example.json timeline-desk.json`, set `claude` to the output of `which claude` (an nvm path changes when Node is upgraded). Linux with `gnome-terminal` only for now |
+| Always-on service | Linux with systemd: `scripts/dashboard-service.sh install` |
+
+**Not in the repo** — set these up yourself if you want them:
+- Scheduled briefs (my-day at 09:30, 13:00 and 17:00) are Claude app scheduled tasks on each machine. Create your own that run the `my-day` skill.
+- `timeline/` (task exports, planner snapshots) is gitignored, so the Changes view starts empty and fills up from your first day.
+- Personal hooks or permissions go in `.claude/settings.local.json` (gitignored), not `.claude/settings.json`.
+
+---
 
 ## 🧰 Available Tools
 
@@ -146,11 +181,92 @@ including **every image** embedded anywhere, and **writes it to a markdown file*
 Image URLs embedded in comments (markdown `![](…)` or HTML `<img>`) are resolved to absolute
 `https://timeline.panteon.no/...` URLs. Non-image attachment links (e.g. `.csv`) are excluded.
 
-#### Output location
+### `get_my_priority_tasks`
+Lists **your** priority tasks from the employee planner
+(`/api/employee-planner/get-priority-tasks/{now|next|commingup}`) as a markdown table in priority order:
+issue (linked to its task page), title, stage, status, deadline, support flag.
+Deadlines are flagged `(overdue)`, `(due today)` or `(due in Nd)` (within 7 days), and the header counts overdue and due-soon tasks.
+- **Arguments**:
+  - `period` (`now` | `next` | `commingup`, default `now`) — planner column. `commingup` is the API's own spelling ("coming up") and must be used exactly. Other values (including `comingup`) are rejected, because the API silently returns every task for an unknown period.
+  - `user_id` (int, optional) — whose planner to show. Defaults to `PANTEON_USER_ID`, then the `sub` claim of the bearer JWT. Cookie-only auth must set `PANTEON_USER_ID`.
+  - `bearer_token` / `cookie` (str, optional) — override the `.env` credentials per call.
+- **Returns** the markdown directly; nothing is written to disk. Pass any issue number to `get_task_conversation` for the full task.
+
+### `get_my_planner_changes`
+Reports what changed in your planner since the last saved day: **new** tasks, tasks that **left the planner**, tasks **moved** between now/next/commingup, and **changed** deadlines, stages or statuses. Priority-order shuffles are not reported.
+- Fetches all three periods and saves a snapshot of your tasks to `timeline/planner/<YYYY-MM-DD>.json` (same base directory as `task.md`; a later run the same day replaces it). The diff is always against the latest snapshot from an **earlier** day, so running it twice a day gives the same answer.
+- The first run has nothing to compare with; it only saves the snapshot.
+- **Arguments**: `user_id`, `bearer_token`, `cookie` as for `get_my_priority_tasks`; `save` (bool, default `true`) — `false` compares without writing anything.
+
+### `get_task_statuses`
+Workflow status of several tasks at once: title, stage (e.g. `QA in progress`, `Going live pending`), QA and Live stage progress, and a **release state** — `live`, `qa approved`, `in qa`, `qa blocked` or `before qa`. A task counts as QA-approved once its QA stage is done; `task_status` is `open` for every live task, so the stage is the real signal.
+- **Arguments**: `issue_identifiers` (list of IDs or `/edit/<id>` URLs; duplicates dropped, unknown or invalid ones reported per row), `bearer_token` / `cookie`.
+- One light request per task (no conversation fetch); nothing is written to disk. Used by the `release-pr-check` skill.
+
+### `get_my_day`
+One call for a daily brief: your `now` tasks (with deadline flags), `next` tasks that are overdue or due within 7 days, and the changes section from `get_my_planner_changes`. Each planner period is fetched once (3 requests), and today's snapshot is saved unless `save=false`. Same arguments as `get_my_planner_changes`. The `my-day` skill uses this tool.
+
+#### Output location (`get_task_conversation`)
 The file is written to `<base>/timeline/<issue_id>/task.md`, where `<base>` is:
 1. `PANTEON_TIMELINE_DIR` env var, if set (this MCP is configured with it pointing at the
    `duell-admin` project root); otherwise
 2. the current working directory.
+
+---
+
+## 🖥️ Timeline desk (local dashboard)
+
+A web view over the same data: your planner as a board, planner changes day by day, the pending duell-admin releases, and a readable task view. Every task shows a six-segment **stage rail** (RSD → Estimate → Development → Testing → QA → Live), coloured by each stage's progress.
+
+**Always on (recommended, Linux):** install it once as a systemd *user* service. It then starts at login, restarts if it crashes, and lives at **http://timeline.localhost:8765**. No sudo is needed: `*.localhost` names resolve to your own machine without editing `/etc/hosts`.
+
+```bash
+scripts/dashboard-service.sh install     # write the unit, enable and start it
+scripts/dashboard-service.sh restart     # after pulling or changing code
+scripts/dashboard-service.sh status      # state and recent log lines
+scripts/dashboard-service.sh uninstall   # stop and remove it
+```
+
+The service runs the code in this checkout. There is no build step: after editing `web/` files just reload the page (they're served with `Cache-Control: no-cache`); after editing Python files run `scripts/dashboard-service.sh restart`. Keep a branch checked out that has `dashboard.py`. Use `TIMELINE_DESK_PORT=9000 scripts/dashboard-service.sh install` for another port.
+
+**One-off:**
+
+```bash
+.venv/bin/python dashboard.py            # then open http://timeline.localhost:8765
+.venv/bin/python dashboard.py --port 9000 --user-id 135
+```
+
+| View | Shows |
+|---|---|
+| Board | Now / Next / Coming up columns with deadline flags (overdue, due soon), support tasks and stage rails |
+| Changes | New, removed, moved and changed tasks per day, from the saved `timeline/planner/` snapshots; "Save today's snapshot" records one |
+| Release | Pending duell-admin PRs grouped by destination (into `qa-release` / into `master`): verdict (ready / needs notes / blocked), CI, Timeline stage, release-note problems, "not via QA" warnings, and each PR's description. "Check again" runs `git fetch` and the `gh` lookups (about 10 s) |
+| Task | Description and conversation of any task, with safe markdown rendering, and a "Start in Claude" button for planner tasks |
+| Work | The task worktrees "Start in Claude" made: size, uncommitted changes, commits that exist only there; Remove (worktree) or Remove + branch |
+
+### Start in Claude
+
+The button on a board card (or **… in Claude** in the Task view) opens a terminal running an interactive Claude Code session for the task. What it does follows the task's Timeline stage:
+
+| Stage | Button | Session |
+|---|---|---|
+| RSD / Estimate not done | ▶ Spec | Writes `timeline/<id>/spec.md` (via `skills/task-spec`) in a task worktree, lists open questions, and stops. No code. |
+| Estimated / Development | ▶ Implement | Spec, then implements only if no stage is blocked and the spec has no open questions; otherwise it stops and lists them. |
+| Development, worktree exists | ▶ Resume | Reads the spec, the branch's commits and new comments, then continues. |
+| Development done, Testing / QA | ▶ Fix QA | Finds the testing/QA feedback in the conversation and fixes it on the task branch. |
+| Any stage blocked | ⏸ Blocked | Read only, in the main checkout: explains the blocker and drafts a question for the task thread. Posts nothing. |
+| QA done / Live | (none) | Remove the worktree from the Work tab. |
+
+The board label is a hint from the planner; on click the server re-reads the stage codes and picks the action (so Implement becomes Resume when a worktree already exists). Sessions commit locally to the task branch and never push, open PRs or merge. You approve their tool calls as usual.
+
+- The worktree reuses an existing `<id>-…` branch (local or on GitHub), else creates `<id>-<title-slug>` from `origin/<base>`. Worktrees go to `<repo>-worktrees/<branch>`; one costs about 75 MB for duell-admin (git history is shared; dependencies aren't installed there).
+- The prompt contains only the issue ID. The session fetches the task itself and treats its text as data.
+- Set up boards once: `cp timeline-desk.example.json timeline-desk.json` and edit it (board/list id → repo path and base branch, the `claude` binary, the terminal; `gnome-terminal` by default). It's gitignored and re-read on every request. A board without a repo shows no button. If you installed `claude` with nvm, update the path after a Node upgrade.
+- Clean up on the **Work** tab. Removal never forces: git keeps a worktree with uncommitted changes, and `git branch -d` keeps a branch with commits that aren't merged anywhere.
+
+The Release view needs a duell-admin checkout (`DUELL_ADMIN_DIR`, `--repo-dir`, or `../duell-admin` next to this repo) and `gh auth login`. It only reads: `git fetch/log/rev-list` and `gh pr/release list`; it never merges, pushes, comments or creates releases. Release-note drafts, the QA-approval count and the translation/migration checks come from the `release-pr-check` skill.
+
+It uses the `.env` credentials and reads snapshots from `PANTEON_TIMELINE_DIR` (or `--base-dir`, or the current directory). It listens only on `127.0.0.1` and rejects requests whose Host header isn't `127.0.0.1`, `localhost` or `timeline.localhost`, because the pages show customer data. Nothing is written except snapshots you save on purpose.
 
 ---
 
@@ -168,6 +284,21 @@ The same fetch logic is available from the shell via `fetch_task.py` (credential
 
 # Write under a specific project root instead of PANTEON_TIMELINE_DIR / cwd
 .venv/bin/python fetch_task.py 5461 --base-dir /path/to/project
+
+# Your priority tasks from the employee planner
+.venv/bin/python fetch_task.py --planner
+.venv/bin/python fetch_task.py --planner --period next        # or: commingup
+.venv/bin/python fetch_task.py --planner --user-id 135
+
+# Planner changes since the last saved day (also saves today's snapshot)
+.venv/bin/python fetch_task.py --changes
+.venv/bin/python fetch_task.py --changes --no-save
+
+# Daily brief: now + soon-due next + changes (one fetch per planner period)
+.venv/bin/python fetch_task.py --my-day
+
+# Workflow stage / QA approval of several tasks
+.venv/bin/python fetch_task.py --status 4054 5627 6027
 ```
 
 ---

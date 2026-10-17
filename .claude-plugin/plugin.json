@@ -19,7 +19,8 @@
       "env": {
         "PANTEON_BEARER_TOKEN": "${PANTEON_BEARER_TOKEN:-}",
         "PANTEON_COOKIE": "${PANTEON_COOKIE:-}",
-        "PANTEON_XSRF_TOKEN": "${PANTEON_XSRF_TOKEN:-}"
+        "PANTEON_XSRF_TOKEN": "${PANTEON_XSRF_TOKEN:-}",
+        "PANTEON_USER_ID": "${PANTEON_USER_ID:-}"
       }
     }
   }

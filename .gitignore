@@ -24,3 +24,6 @@ __pycache__/
 
 # Personal, machine-specific Claude Code overrides
 .claude/settings.local.json
+
+# Machine-specific dashboard config (repo paths, claude binary); see timeline-desk.example.json
+timeline-desk.json

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes one MCP tool (`get_task_conversation`) and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use.
+A small Python MCP (Model Context Protocol) server, built with FastMCP, that fetches task data and conversation history from Panteon Timeline (`https://timeline.panteon.no`) and renders it to markdown. It exposes MCP tools `get_task_conversation`, `get_my_priority_tasks`, `get_my_planner_changes`, `get_my_day`, `get_task_statuses` and `check_auth` and one MCP resource (`timeline://<issue_id>/task.md`), plus an equivalent CLI (`fetch_task.py`) for shell use and a local web dashboard (`dashboard.py` + `release_check.py` + `work_session.py` + `web/`).
 
 ## Commands
 
@@ -17,6 +17,10 @@ python3 -m venv .venv
 .venv/bin/python server.py
 
 # Run the CLI fetcher directly
+.venv/bin/python fetch_task.py --planner                # your priority tasks
+.venv/bin/python fetch_task.py --changes                # planner changes since last saved day
+.venv/bin/python fetch_task.py --my-day                 # daily brief
+.venv/bin/python fetch_task.py --status 4054 5627       # workflow stage / QA approval
 .venv/bin/python fetch_task.py 5461
 .venv/bin/python fetch_task.py "https://timeline.panteon.no/tasks#/list/15033/edit/5461" --print
 .venv/bin/python fetch_task.py 5461 --base-dir /path/to/project
@@ -25,8 +29,13 @@ python3 -m venv .venv
 .venv/bin/python -m pytest
 .venv/bin/python -m pytest tests/test_panteon_client.py::test_name   # single test
 
+# Local dashboard (http://timeline.localhost:8765)
+.venv/bin/python dashboard.py
+scripts/dashboard-service.sh install|restart|status|uninstall   # always-on systemd user service
+
 # Quick syntax check
-.venv/bin/python -m py_compile server.py panteon_client.py fetch_task.py
+.venv/bin/python -m py_compile server.py panteon_client.py fetch_task.py dashboard.py release_check.py work_session.py
+node --check web/app.js
 ```
 
 There is no separate lint/format command configured in this repo.
@@ -47,6 +56,30 @@ Fetching a task mirrors the reference browser extension's logic and always happe
 
 `extract_issue_id` only accepts a bare numeric ID or a URL containing `/edit/<id>` — it deliberately does NOT fall back to "trailing digits" in the URL, since a list/board URL like `.../list/15033` would otherwise silently resolve to the wrong (board) ID.
 
+### Employee planner
+
+`get_my_priority_tasks` (and `fetch_task.py --planner`) call `GET /api/employee-planner/get-priority-tasks/{period}` (`now`, `next`, or `commingup` — the API's spelling), which returns **every** employee's planner (`[{user_id, data: [task, …]}]`). `fetch_my_priority_tasks` filters it to one user: `resolve_user_id` takes the explicit argument, then `PANTEON_USER_ID`, then the bearer JWT's `sub` claim. A user absent from the planner raises `LookupError` (wrong id), distinct from a user with zero tasks. `normalize_planner_period` rejects any other period — including the single-m `comingup` — because the API silently returns every task for an unknown segment. The rendered table is returned, not written to disk. A task's `code` is its list/board id, so its URL is `/tasks#/list/{code}/edit/{issue_number}`. `deadline_flag` marks deadlines as overdue, due today or due within `DUE_SOON_DAYS` (7); `render_priority_tasks_markdown` takes an optional `today` so tests stay date-independent — always pass it in tests.
+
+`get_my_planner_changes` (and `fetch_task.py --changes`) fetches all three periods, builds a snapshot of the user's tasks keyed by issue number (`build_planner_snapshot`; a task in several periods keeps the earliest), and diffs it (`diff_planner_snapshots`: added, removed, moved, changed deadline/stage/status — priority position is deliberately ignored as noise) against the latest snapshot from an **earlier** day (`load_previous_planner_snapshot`), so same-day reruns are stable. Snapshots live at `<base>/timeline/planner/<YYYY-MM-DD>.json` (gitignored with the rest of `timeline/`). `fetch_my_planner_changes` takes `today` and `base_dir` for tests.
+
+`get_my_day` (and `fetch_task.py --my-day`) is the daily brief: `fetch_my_day` calls `fetch_all_planners` once (one request per period) and hands the result to `fetch_my_planner_changes(planners=…)` so no period is fetched twice. It composes the now table, soon-due `next` tasks and the changes under one `# My Day` header, using the renderers' `title`/`level` arguments (level > 1 drops the per-section User ID line). Keep new planner features on this shared fetch rather than adding calls.
+
+In `server.py`, every client call goes through `_run_client`, which runs it off the event loop and maps `ValueError`/`LookupError`/HTTP/connection errors to `ToolError`; don't repeat that try/except in new tools. Output paths all derive from `timeline_dir`.
+
+### Workflow stages
+
+`get_task_statuses` (and `fetch_task.py --status`) calls only API 1 (`taskbyissue`) per task, in a small thread pool, and writes nothing. Timeline tracks six stages (`TASK_STAGES`: `stage_rsd`, `stage_est`, `stage_dev`, `stage_tst`, `stage_qa`, `stage_liv`), each with a progress code (`STAGE_PROGRESS`: 0 not started, 1 skipped, 2 in progress, 3 blocked, 4 done — inferred from live data across every `stage_status`). `task_status` is `open` for every live task, so `release_state` derives the signal from the QA and Live codes, and `qa_approved` means QA done or already live. taskbyissue answers an unknown issue with HTTP 422 (also 404), which becomes a per-row `not found` instead of failing the batch; other HTTP and auth errors still raise.
+
+### Dashboard
+
+`dashboard.py` is a Starlette app (Starlette and uvicorn come with FastMCP, so no extra dependency) serving `web/` (plain HTML/CSS/JS, no build step) and a small JSON API: `/api/planner` (`planner_overview`), `/api/changes` (`planner_history` over the saved snapshots), `POST /api/snapshot`, `/api/statuses?ids=…` (`get_task_statuses`, max 100), `/api/task/{issue}` (`fetch_task_data`, nothing written), `GET /api/release` (the cached release report, or null) and `POST /api/release` (rebuild it). Keep the data shaping in `panteon_client.py` and the endpoints thin; `_respond` maps client errors to JSON (401 auth, 404 not found, 400 bad input, 502 upstream). Sync endpoints run in Starlette's threadpool.
+
+Security rules for the dashboard — keep them when changing it: bind `127.0.0.1` only; `TrustedHostMiddleware` allows only `ALLOWED_HOSTS` (`127.0.0.1`, `localhost`, `timeline.localhost`; blocks DNS rebinding); no CORS; state-changing endpoints require the `X-Timeline-Desk: 1` header (a cross-site form can't send it); the page loads no external fonts or scripts and sends no referrer; all Timeline text is inserted with `textContent` / DOM nodes (`h()`, `richText()` in `app.js`), never `innerHTML`. Tests are in `tests/test_dashboard.py` (Starlette `TestClient`). `web/` files are served with `Cache-Control: no-cache`; in `app.js` use `put(el, …)` rather than `el.replaceChildren(…)`, because `put` skips null children the way `h()` does.
+
+`work_session.py` backs "Start in Claude" (`POST /api/work/start`), the Work tab (`GET /api/work/worktrees`) and `POST /api/work/remove`. Board → repo mapping comes from the gitignored `timeline-desk.json` (example: `timeline-desk.example.json`; `TIMELINE_DESK_CONFIG` overrides the path), re-read per request. `prepare_worktree` reuses a worktree or `<id>-…` branch before creating `<id>-<slug>` from `origin/<base>`; `start_session` picks the action with `choose_action` from fresh `get_task_statuses` stages (spec / implement / resume when the worktree already exists / qa / blocked, which runs read-only in the main checkout without a worktree; done refuses), then opens `terminal` running `claude <prompt>` via an injectable `launcher`. The page's label (`actionFor` in `app.js`, from the planner's stage text) is only a hint; keep the two mappings in step. Keep these rules: the prompt (`build_prompt`) contains only the issue ID and fixed text, never task content; no permission-bypass flags; the session is told never to push, open PRs or merge; removal uses `git worktree remove` and `git branch -d` without force and only for paths inside a configured worktrees folder; both POSTs are header-guarded. Tests in `tests/test_work_session.py` run real git against temporary repos (no network) with a recording launcher.
+
+`release_check.py` builds the release report for duell-admin (`build_report`), following `skills/release-pr-check/SKILL.md` minus the judgement parts. It is git/GitHub-specific, so it lives apart from `panteon_client.py` and gets Timeline statuses through an injected `status_lookup`; a Timeline failure sets `timeline_error` instead of failing the report. The checkout comes from `DUELL_ADMIN_DIR` / `--repo-dir` / `../duell-admin` and must have `origin` = Panteon-norway/duell-admin. Keep it read-only: fixed argument lists through the injectable `runner` (no shell), only `git remote/fetch/log/rev-list` and `gh pr list` / `gh release list`; `POST /api/release` is header-guarded because it runs `git fetch`. Tickets on QA are qa-release merges in `origin/master..origin/qa-release` whose merged commit (second parent) isn't in `origin/master`; a master PR went "via QA" when its tip has no non-merge commits outside qa-release and master. Tests in `tests/test_release_check.py` use a fake runner. The Release view deliberately shows only the pending PRs (`prs`, each with its `body`) grouped by base branch; the report's tickets, mismatches and notes are not rendered. `scripts/dashboard-service.sh` installs it as the `timeline-desk` systemd user service (WorkingDirectory = repo, so snapshots land in the repo's `timeline/planner/`, the same place the scheduled briefs write); after changing dashboard code, run `scripts/dashboard-service.sh restart`. `.claude/launch.json` attaches the preview to that running service instead of starting a second copy.
+
 ### Markdown rendering contract
 
 `render_task_markdown` produces a `task.md` (header: ID, Title, Creator, Date Created, Status, Tags; comments by the task creator are labelled "(task creator)" in their heading) with a fixed section order (Description, User-Provided Context, Conversation, Acceptance Criteria, Open Questions, Images). Two markdown "layers" are intentionally kept apart: the document's own structure is plain markdown, while all original content (task description, each comment) is wrapped in a fenced code block via `_as_code_block`, sized to a backtick run longer than any backticks already in the content, so embedded content can never break out and corrupt the document structure. Image URLs found inside that content are rewritten to absolute URLs (`absolutize_markdown_images` / `_resolve_url`) before being embedded, since the file is meant to stand alone outside the browser.
@@ -65,9 +98,9 @@ When a fetched task has neither description nor comments, the MCP tool asks the 
 
 ## Plugin packaging
 
-The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), the `mcpServers` entry inside `plugin.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`; deliberately not a root `.mcp.json`, which Claude Code would also load as a project-scope config where `${CLAUDE_PLUGIN_ROOT}` is undefined), and `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review). Validate changes with `claude plugin validate .`.
+The repo doubles as a Claude Code plugin (`panteon-timeline`): `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (so the repo can be added as a marketplace), the `mcpServers` entry inside `plugin.json` (launches `server.py` via `uv run`, credentials from the caller's environment since the installed copy has no `.env`; deliberately not a root `.mcp.json`, which Claude Code would also load as a project-scope config where `${CLAUDE_PLUGIN_ROOT}` is undefined), `skills/task-spec/SKILL.md` (fetch a task → write `timeline/<issue_id>/spec.md`, then stop for review), and `skills/my-day/SKILL.md` (read-only morning brief built on the single `get_my_day` call: planner `now` + soon-due `next` tasks, changes since the last snapshot, latest conversation on the top 3, a recommended starting task), and `skills/release-pr-check/SKILL.md` (duell-admin-specific, moved here from duell-admin's `.claude/skills/`: open PRs into `qa-release`/`master` vs the release-note format, QA approval via one `get_task_statuses` call, release-note drafts; must run from a duell-admin checkout because it uses `git`/`gh` there). Validate changes with `claude plugin validate .`.
 
-The same repo also carries wrappers for other tools, all sharing `skills/task-spec/SKILL.md`: `gemini-extension.json` (Gemini CLI; validate with `gemini extensions validate .`), `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` (Codex; skill-only, because Codex runs a plugin's MCP server with the plugin dir as cwd and `timeline/` would land in the plugin cache), and `.cursor-plugin/` (Cursor; untested). The `version` field is duplicated across `.claude-plugin/plugin.json`, `gemini-extension.json`, `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` — bump them together. Do not add a root `.mcp.json`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
+The same repo also carries wrappers for other tools, all sharing the `skills/` directory: `gemini-extension.json` (Gemini CLI; validate with `gemini extensions validate .`), `.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json` (Codex; skill-only, because Codex runs a plugin's MCP server with the plugin dir as cwd and `timeline/` would land in the plugin cache), and `.cursor-plugin/` (Cursor; untested). The `version` field is duplicated across `.claude-plugin/plugin.json`, `gemini-extension.json`, `.codex-plugin/plugin.json` and `.cursor-plugin/plugin.json` — bump them together. Do not add a root `.mcp.json`. The skill must not depend on edits to `task.md` — it is overwritten on every fetch.
 
 ## Testing conventions
 
