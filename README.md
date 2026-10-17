@@ -53,9 +53,9 @@ Add the following configuration to your MCP server configuration file (e.g., `cl
 {
   "mcpServers": {
     "timeline-mcp": {
-      "command": "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/.venv/bin/python",
+      "command": "/path/to/timeline-mcp/.venv/bin/python",
       "args": [
-        "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/server.py"
+        "/path/to/timeline-mcp/server.py"
       ],
       "env": {
         "PANTEON_BEARER_TOKEN": "your_jwt_token_here"
@@ -70,9 +70,9 @@ Codex reads MCP servers from `config.toml`. Add this to `~/.codex/config.toml` f
 
 ```toml
 [mcp_servers.timeline_mcp]
-command = "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/.venv/bin/python"
-args = ["/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp/server.py"]
-cwd = "/home/harpalsinh.solanki@hs.local/projects/panteon/timeline-mcp"
+command = "/path/to/timeline-mcp/.venv/bin/python"
+args = ["/path/to/timeline-mcp/server.py"]
+cwd = "/path/to/timeline-mcp"
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 ```
@@ -127,6 +127,35 @@ The same repo carries a wrapper per tool. All of them share the same `skills/` d
 Why Codex is skill-only: Codex starts a plugin's MCP server with the plugin directory as its working directory, so `timeline/<issue_id>/` would be written inside the plugin cache instead of your project. The `config.toml` setup runs the server from your project, which keeps the output project-based.
 
 Status: the Gemini and Codex wrappers were validated and installed with their CLIs; the Cursor wrapper follows Cursor's documented format but has not been run in Cursor. Tools without a plugin system can still use the manual MCP configs above.
+
+## 👥 Setup for colleagues
+
+Everything is per person: your own token, your own planner, your own paths. Nothing in the repo is tied to one user (the planner user comes from your token's `sub` claim).
+
+**Core (all platforms)** — MCP tools, `fetch_task.py`, skills:
+1. Clone, then create the venv and install dependencies (see Installation & Setup above).
+2. `cp .env.example .env` and paste your own Timeline token.
+3. Check it: `.venv/bin/python fetch_task.py --planner`.
+4. Register the server once (user scope, so it works from any project):
+   ```bash
+   claude mcp add timeline-mcp -s user -- "$PWD/.venv/bin/python" "$PWD/server.py"
+   ```
+   Or install it as a plugin (see "Install as a Claude Code plugin" below) to get the skills too.
+
+**Dashboard** — Board, Changes and Task view work right away: `.venv/bin/python dashboard.py`, then open http://timeline.localhost:8765.
+
+| Extra | Needs |
+|---|---|
+| Release view, `release-pr-check` skill | A duell-admin checkout at `../duell-admin` (or `DUELL_ADMIN_DIR`), and `gh auth login` with access to Panteon-norway |
+| Claude buttons, Work tab | `cp timeline-desk.example.json timeline-desk.json`, set `claude` to the output of `which claude` (an nvm path changes when Node is upgraded). Linux with `gnome-terminal` only for now |
+| Always-on service | Linux with systemd: `scripts/dashboard-service.sh install` |
+
+**Not in the repo** — set these up yourself if you want them:
+- Scheduled briefs (my-day at 09:30, 13:00 and 17:00) are Claude app scheduled tasks on each machine. Create your own that run the `my-day` skill.
+- `timeline/` (task exports, planner snapshots) is gitignored, so the Changes view starts empty and fills up from your first day.
+- Personal hooks or permissions go in `.claude/settings.local.json` (gitignored), not `.claude/settings.json`.
+
+---
 
 ## 🧰 Available Tools
 
