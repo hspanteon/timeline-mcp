@@ -194,7 +194,7 @@ Deadlines are flagged `(overdue)`, `(due today)` or `(due in Nd)` (within 7 days
 
 ### `get_my_planner_changes`
 Reports what changed in your planner since the last saved day: **new** tasks, tasks that **left the planner**, tasks **moved** between now/next/commingup, and **changed** deadlines, stages or statuses. Priority-order shuffles are not reported.
-- Fetches all three periods and saves a snapshot of your tasks to `timeline/planner/<YYYY-MM-DD>.json` (same base directory as `task.md`; a later run the same day replaces it). The diff is always against the latest snapshot from an **earlier** day, so running it twice a day gives the same answer.
+- Fetches all three periods and records a snapshot of your tasks in the SQLite file `database/timeline_task.db` (same base directory as `task.md`; a row is only added when something changed since the latest one). The diff is always against the latest snapshot from an **earlier** day, so running it twice a day gives the same answer.
 - The first run has nothing to compare with; it only saves the snapshot.
 - **Arguments**: `user_id`, `bearer_token`, `cookie` as for `get_my_priority_tasks`; `save` (bool, default `true`) — `false` compares without writing anything.
 
@@ -239,7 +239,7 @@ The service runs the code in this checkout. There is no build step: after editin
 | View | Shows |
 |---|---|
 | Board | Now / Next / Coming up columns with deadline flags (overdue, due soon), support tasks and stage rails |
-| Changes | New, removed, moved and changed tasks per day, from the saved `timeline/planner/` snapshots; "Save today's snapshot" records one |
+| Changes | New, removed, moved and changed tasks with the time they were detected, from the `database/timeline_task.db` snapshots; the dashboard checks the planner every 30 minutes (`--interval` or `TIMELINE_SNAPSHOT_MINUTES`), Refresh checks it immediately |
 | Release | Pending duell-admin PRs grouped by destination (into `qa-release` / into `master`): verdict (ready / needs notes / blocked), CI, Timeline stage, release-note problems, "not via QA" warnings, and each PR's description. "Check again" runs `git fetch` and the `gh` lookups (about 10 s) |
 | Task | Description and conversation of any task, with safe markdown rendering, and a "Start in Claude" button for planner tasks |
 | Work | The task worktrees "Start in Claude" made: size, uncommitted changes, commits that exist only there; Remove (worktree) or Remove + branch |
@@ -266,7 +266,7 @@ The board label is a hint from the planner; on click the server re-reads the sta
 
 The Release view needs a duell-admin checkout (`DUELL_ADMIN_DIR`, `--repo-dir`, or `../duell-admin` next to this repo) and `gh auth login`. It only reads: `git fetch/log/rev-list` and `gh pr/release list`; it never merges, pushes, comments or creates releases. Release-note drafts, the QA-approval count and the translation/migration checks come from the `release-pr-check` skill.
 
-It uses the `.env` credentials and reads snapshots from `PANTEON_TIMELINE_DIR` (or `--base-dir`, or the current directory). It listens only on `127.0.0.1` and rejects requests whose Host header isn't `127.0.0.1`, `localhost` or `timeline.localhost`, because the pages show customer data. Nothing is written except snapshots you save on purpose.
+It uses the `.env` credentials and reads snapshots from `PANTEON_TIMELINE_DIR` (or `--base-dir`, or the current directory). It listens only on `127.0.0.1` and rejects requests whose Host header isn't `127.0.0.1`, `localhost` or `timeline.localhost`, because the pages show customer data. Nothing is written except the planner snapshot database.
 
 ---
 

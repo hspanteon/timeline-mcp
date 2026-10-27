@@ -5,7 +5,7 @@ description: Morning brief from the user's Panteon employee planner. Lists their
 
 # my-day
 
-Give the user a short, decision-ready brief of their day from the Panteon planner. Read only: do not change anything in Panteon, and do not write files of your own. The tools save their own files (`timeline/planner/<date>.json`, `timeline/<issue_id>/task.md`); that is expected.
+Give the user a short, decision-ready brief of their day from the Panteon planner. Read only: do not change anything in Panteon, and do not write files of your own. The tools save their own files (`database/timeline_task.db`, `timeline/<issue_id>/task.md`); that is expected.
 
 ## 1. Get the planner
 

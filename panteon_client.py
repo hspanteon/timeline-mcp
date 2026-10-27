@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import re
+import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
 import requests
@@ -512,8 +513,10 @@ def parse_conversation_comments(timeline_items: List[Dict[str, Any]]) -> List[Di
         if not desc and not images:
             continue
 
+        photo = employee.get("photo") if isinstance(employee, dict) else None
         comments.append({
             "author": author,
+            "photo": photo if isinstance(photo, str) else None,
             "created_at": item.get("created_at", ""),
             "description": desc,
             "images": images,
@@ -874,8 +877,9 @@ def fetch_my_priority_tasks(
 
 
 # --------------------------------------------------------------------------- #
-# Planner change tracking: daily snapshots of the user's planner, diffed
-# against the most recent earlier day.
+# Planner change tracking: snapshots of the user's planner kept in a SQLite
+# file. A snapshot row is only added when something changed since the latest
+# one, so polling every few minutes stays cheap and every row is a change.
 # --------------------------------------------------------------------------- #
 PLANNER_CHANGE_FIELDS = {
     "deadline": "deadline",
@@ -889,10 +893,73 @@ def planner_snapshot_dir(base_dir: Optional[str] = None) -> str:
     return os.path.join(timeline_dir(base_dir), "planner")
 
 
+def planner_db_path(base_dir: Optional[str] = None) -> str:
+    """`<base>/database/timeline_task.db`, the SQLite file holding the planner
+    snapshots (next to, not inside, the generated `timeline/` exports)."""
+    base = base_dir or os.getenv("PANTEON_TIMELINE_DIR") or os.getcwd()
+    return os.path.abspath(os.path.join(base, "database", "timeline_task.db"))
+
+
+def _import_json_snapshots(conn: sqlite3.Connection, directory: str) -> None:
+    """One-time import of the earlier `<date>.json` snapshots, so switching to
+    SQLite doesn't lose the history. The files are left where they are."""
+    if not os.path.isdir(directory):
+        return
+    for name in sorted(os.listdir(directory)):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", name):
+            continue
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as fh:
+                snapshot = json.load(fh)
+            snapshot["taken_at"] = snapshot.get("taken_at") or f"{snapshot['date']}T00:00:00"
+            _insert_snapshot(conn, snapshot)
+        except (OSError, ValueError, KeyError):
+            continue
+
+
+def _insert_snapshot(conn: sqlite3.Connection, snapshot: Dict[str, Any]) -> None:
+    conn.execute(
+        "INSERT INTO snapshots (user_id, date, taken_at, data) VALUES (?, ?, ?, ?)",
+        (str(snapshot["user_id"]), snapshot["date"], snapshot["taken_at"],
+         json.dumps(snapshot, ensure_ascii=False)),
+    )
+
+
+def _open_planner_db(base_dir: Optional[str], create: bool) -> Optional[sqlite3.Connection]:
+    """Opens the snapshot database. Without `create`, a missing file gives None
+    and nothing is written, so read-only calls leave no trace on disk."""
+    path = planner_db_path(base_dir)
+    if not create and not os.path.exists(path):
+        return None
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=15)  # the dashboard and the MCP server may write at once
+    conn.execute("PRAGMA journal_mode=WAL")
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                taken_at TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS snapshots_user_time ON snapshots (user_id, taken_at);
+            CREATE TABLE IF NOT EXISTS checks (user_id TEXT PRIMARY KEY, checked_at TEXT NOT NULL);
+            """
+        )
+        _import_json_snapshots(conn, planner_snapshot_dir(base_dir))
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    return conn
+
+
 def build_planner_snapshot(
     planners: Dict[str, List[Dict[str, Any]]],
     user_id: int,
     today: Optional[date] = None,
+    now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """
     Builds a snapshot of one user's tasks across planner periods from
@@ -921,25 +988,88 @@ def build_planner_snapshot(
                 "stage_status": task.get("stage_status"),
                 "task_status": task.get("task_status"),
                 "deadline": _normalize_date(task.get("deadline") or "") or None,
+                "support": bool(task.get("support")),
             }
     if not found:
         raise LookupError(f"User {user_id} was not found in any planner period.")
+    moment = now or datetime.now()
+    day = today or moment.date()
     return {
         "user_id": user_id,
-        "date": (today or date.today()).isoformat(),
+        "date": day.isoformat(),
+        "taken_at": datetime.combine(day, moment.time()).isoformat(timespec="seconds"),
         "tasks": tasks,
     }
 
 
+STAGE_DETAIL_FIELDS = ("stages", "release_state", "qa_approved")
+
+
+def attach_task_stages(snapshot: Dict[str, Any], headers: Dict[str, str]) -> None:
+    """
+    Adds each task's six workflow stages, release state and QA approval to the
+    snapshot (one taskbyissue call per task, in a small thread pool). Stage
+    progress is then tracked like any other field. If the lookup fails the
+    snapshot is left without them, so a flaky stage call never blocks the
+    planner check.
+    """
+    tasks = snapshot["tasks"]
+    try:
+        statuses = get_task_statuses([k for k in tasks], headers)
+    except (requests.RequestException, PermissionError):
+        return
+    for status in statuses:
+        task = tasks.get(str(status.get("issue_id")))
+        if task is None or status.get("error"):
+            continue
+        for field in STAGE_DETAIL_FIELDS:
+            task[field] = status.get(field)
+
+
+def _carry_forward_stage_details(latest: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+    """A snapshot taken without stage lookups (the MCP tools) inherits the
+    latest stored stage details for tasks it shares, so a later check that has
+    them reports the change from what was last known."""
+    for key, task in snapshot["tasks"].items():
+        before = latest["tasks"].get(key)
+        if before and "stages" in before and "stages" not in task:
+            for field in STAGE_DETAIL_FIELDS:
+                task[field] = before.get(field)
+
+
 def save_planner_snapshot(snapshot: Dict[str, Any], base_dir: Optional[str] = None) -> str:
-    """Writes the snapshot to `<snapshot dir>/<date>.json` (one per day; a
-    later run the same day replaces it) and returns the path."""
-    directory = planner_snapshot_dir(base_dir)
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, f"{snapshot['date']}.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, indent=2, ensure_ascii=False)
-    return path
+    """
+    Records the snapshot in the database and returns the database path. A row
+    is only added when the tasks differ from the user's latest stored snapshot
+    (priority order alone doesn't count); either way the time of this check is
+    kept, so the page can show when the planner was last looked at.
+    """
+    conn = _open_planner_db(base_dir, create=True)
+    try:
+        user = str(snapshot["user_id"])
+        row = conn.execute(
+            "SELECT data FROM snapshots WHERE user_id = ? ORDER BY taken_at DESC, id DESC LIMIT 1", (user,)
+        ).fetchone()
+        latest = json.loads(row[0]) if row else None
+        if latest is not None:
+            _carry_forward_stage_details(latest, snapshot)
+        # Also record when stage details arrive for tasks stored without them,
+        # so stage tracking has a baseline to compare against.
+        gains_stages = latest is not None and any(
+            "stages" in task and "stages" not in latest["tasks"][key]
+            for key, task in snapshot["tasks"].items() if key in latest["tasks"]
+        )
+        if latest is None or gains_stages or any(diff_planner_snapshots(latest, snapshot).values()):
+            _insert_snapshot(conn, snapshot)
+        conn.execute(
+            "INSERT INTO checks (user_id, checked_at) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET checked_at = excluded.checked_at",
+            (user, snapshot["taken_at"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return planner_db_path(base_dir)
 
 
 def load_previous_planner_snapshot(
@@ -948,28 +1078,21 @@ def load_previous_planner_snapshot(
     base_dir: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Returns the latest snapshot for `user_id` dated strictly before `before`
+    Returns the user's latest snapshot dated strictly before `before`
     (YYYY-MM-DD), or None. Comparing against an earlier day keeps repeated
     runs on the same day reporting the same "since last time" changes.
     """
-    directory = planner_snapshot_dir(base_dir)
-    if not os.path.isdir(directory):
+    conn = _open_planner_db(base_dir, create=False)
+    if conn is None:
         return None
-    names = sorted(
-        (n for n in os.listdir(directory) if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", n)),
-        reverse=True,
-    )
-    for name in names:
-        if name[:-5] >= before:
-            continue
-        try:
-            with open(os.path.join(directory, name), encoding="utf-8") as fh:
-                snapshot = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if str(snapshot.get("user_id")) == str(user_id):
-            return snapshot
-    return None
+    try:
+        row = conn.execute(
+            "SELECT data FROM snapshots WHERE user_id = ? AND date < ? ORDER BY taken_at DESC, id DESC LIMIT 1",
+            (str(user_id), before),
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else None
 
 
 def diff_planner_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -987,6 +1110,21 @@ def diff_planner_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str
     added = sorted((t for k, t in new_tasks.items() if k not in old_tasks), key=order)
     removed = sorted((t for k, t in old_tasks.items() if k not in new_tasks), key=order)
     moved, changed = [], []
+
+    # Priority: compare the order of the tasks both snapshots share in a
+    # period, so a task added on top doesn't make everything below it "move".
+    priority: Dict[str, Any] = {}
+    for period in PLANNER_PERIODS:
+        shared = [k for k, t in new_tasks.items()
+                  if k in old_tasks and t.get("period") == old_tasks[k].get("period") == period]
+        old_rank = {k: i for i, k in enumerate(sorted(shared, key=lambda k: old_tasks[k].get("position") or 0))}
+        new_rank = {k: i for i, k in enumerate(sorted(shared, key=lambda k: new_tasks[k].get("position") or 0))}
+        for k in shared:
+            # Rank decides whether anything really moved; the position must differ
+            # too, or a task that merely got overtaken would be reported as moving.
+            if old_rank[k] != new_rank[k] and old_tasks[k].get("position") != new_tasks[k].get("position"):
+                priority[k] = (f"#{old_tasks[k].get('position')}", f"#{new_tasks[k].get('position')}")
+
     for key, task in sorted(new_tasks.items(), key=lambda kv: order(kv[1])):
         before = old_tasks.get(key)
         if before is None:
@@ -998,6 +1136,17 @@ def diff_planner_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str
             for field, label in PLANNER_CHANGE_FIELDS.items()
             if (before.get(field) or None) != (task.get(field) or None)
         ]
+        # Stage progress and release state, only when both snapshots looked them up.
+        if "stages" in before and "stages" in task:
+            changes += [
+                (name, before["stages"].get(name), now)
+                for name, now in (task["stages"] or {}).items()
+                if before["stages"].get(name) is not None and before["stages"].get(name) != now
+            ]
+            if before.get("release_state") != task.get("release_state"):
+                changes.append(("release", before.get("release_state"), task.get("release_state")))
+        if key in priority:
+            changes.append(("priority", *priority[key]))
         if changes:
             changed.append({**task, "changes": changes})
     return {"added": added, "removed": removed, "moved": moved, "changed": changed}
@@ -1032,7 +1181,7 @@ def render_planner_changes_markdown(
     if previous is None or diff is None:
         count = len(snapshot["tasks"])
         if snapshot_path:
-            note = f"Saved today's ({count} tasks); changes show from the next day's run."
+            note = f"Saved today's ({count} tasks); changes show from the next day."
         else:
             note = f"Found {count} tasks; saving is off, so nothing was recorded."
         lines += [f"_No earlier snapshot to compare with. {note}_", ""]
@@ -1068,18 +1217,25 @@ def fetch_my_planner_changes(
     save: bool = True,
     today: Optional[date] = None,
     planners: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    now: Optional[datetime] = None,
+    with_stages: bool = False,
 ) -> Dict[str, Any]:
     """
     Shared orchestration (MCP tool and CLI): fetch every planner period (unless
-    `planners` is passed in), build today's snapshot for the user, diff it
-    against the latest earlier snapshot, and (if `save`) write today's snapshot.
+    `planners` is passed in), build the current snapshot for the user, diff it
+    against the latest snapshot from an earlier day, and (if `save`) record it
+    (see save_planner_snapshot). `with_stages` also looks up each task's workflow
+    stages (one extra request per task) so stage progress is tracked; the
+    dashboard turns it on, the MCP tools leave it off.
     Returns {"user_id", "snapshot", "previous", "diff", "snapshot_path",
     "markdown"}. Blocking I/O.
     """
     resolved = resolve_user_id(user_id, bearer_token=bearer_token)
     if planners is None:
         planners = fetch_all_planners(headers)
-    snapshot = build_planner_snapshot(planners, resolved, today=today)
+    snapshot = build_planner_snapshot(planners, resolved, today=today, now=now)
+    if with_stages:
+        attach_task_stages(snapshot, headers)
     previous = load_previous_planner_snapshot(resolved, snapshot["date"], base_dir)
     diff = diff_planner_snapshots(previous, snapshot) if previous else None
     path = save_planner_snapshot(snapshot, base_dir) if save else None
@@ -1203,45 +1359,148 @@ def planner_overview(
     return {"user_id": user_id, "today": today.isoformat(), "periods": periods}
 
 
+# The project tasks endpoint describes each stage as {"id", "name"} with its own ids.
+PROJECT_STAGE_PROGRESS = {0: "not started", 1: "skipped", 4: "in progress", 5: "done", 6: "in progress"}
+
+
+def _project_stages(task: Dict[str, Any]) -> Dict[str, str]:
+    """A project-list task's six stages as progress words, keyed by TASK_STAGES label."""
+    out = {}
+    for field, label in TASK_STAGES.items():
+        stage = task.get(field)
+        out[label] = PROJECT_STAGE_PROGRESS.get(_stage_code(stage.get("id")) if isinstance(stage, dict) else None, "not started")
+    return out
+
+
+def fetch_project_tasks(
+    project_id: Any,
+    headers: Dict[str, str],
+    user_id: Optional[Any] = None,
+    code: Optional[Any] = None,
+    tab: Optional[str] = None,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    The user's open tasks in one project, as Timeline lists them: tabs (with
+    counts) and, for the active tab, its groups of tasks. `project_id` is the
+    API id (not the list code in task URLs); `code` is that list code, used for
+    task URLs. Without `tab` Timeline answers with its first tab. Read-only,
+    although the endpoint itself is a POST.
+    {"project_id", "tab", "tabs": [{"name", "count"}], "groups": [{"name", "tasks"}]}
+    """
+    project_id = int(project_id)
+    body: Dict[str, Any] = {"subscribed_by": resolve_user_id(user_id), "tag_id": 0, "status": "open"}
+    if tab:
+        body["tab_name"] = tab
+    response = _SESSION.post(f"{BASE_URL}/api/project/{project_id}/tasks", headers=headers, json=body, timeout=30)
+    if response.status_code in (401, 403):
+        raise PermissionError(
+            f"Authentication failed (HTTP {response.status_code}) when fetching project {project_id} tasks. "
+            "Please verify your PANTEON_BEARER_TOKEN or PANTEON_COOKIE."
+        )
+    if response.status_code in _TASK_NOT_FOUND:
+        raise LookupError(f"Project {project_id} was not found.")
+    response.raise_for_status()
+    data = (response.json() or {}).get("data") or {}
+    tabs = sorted(data.get("tabs") or [], key=lambda t: t.get("tab_sort_order") or 0)
+    today = today or date.today()
+    groups = []
+    for group in data.get("grouptasks") or []:
+        tasks = []
+        for t in group.get("tasks") or []:
+            deadline = _normalize_date(t.get("deadline") or "") or None
+            tasks.append({
+                "issue_number": t.get("issue_number"),
+                "title": t.get("title") or "",
+                "stage_status": t.get("stage_status") or "",
+                "stages": _project_stages(t),
+                "deadline": deadline,
+                "deadline_flag": deadline_flag(t.get("deadline"), today),
+                "hours_spent": t.get("hours_spent_decimal"),
+                "hours_estimated": t.get("estimated_hours"),
+                "release": t.get("release"),
+                "tags": [{"name": g.get("name") or "", "color": g.get("color")} for g in t.get("task_tags") or []],
+                "subscribers": [{"name": s.get("name") or "", "photo": s.get("photo")} for s in t.get("task_subscribers") or []],
+                "code": str(code) if code else None,
+                "url": task_url(t.get("issue_number"), code),
+            })
+        groups.append({"name": group.get("name") or "", "tasks": tasks})
+    active = tab or (data.get("tabs") and tabs[0].get("tab_name")) or None
+    return {
+        "project_id": project_id,
+        "tab": active,
+        "tabs": [{"name": t.get("tab_name") or "", "count": t.get("tab_task_count") or 0} for t in tabs],
+        "groups": groups,
+        "today": today.isoformat(),
+    }
+
+
 def list_planner_snapshots(user_id: int, base_dir: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Every saved snapshot for `user_id`, oldest first. Unreadable files are skipped."""
-    directory = planner_snapshot_dir(base_dir)
-    if not os.path.isdir(directory):
+    """Every stored snapshot for `user_id`, oldest first."""
+    conn = _open_planner_db(base_dir, create=False)
+    if conn is None:
         return []
-    snapshots = []
-    for name in sorted(os.listdir(directory)):
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}\.json", name):
-            continue
-        try:
-            with open(os.path.join(directory, name), encoding="utf-8") as fh:
-                snapshot = json.load(fh)
-        except (OSError, ValueError):
-            continue
-        if str(snapshot.get("user_id")) == str(user_id):
-            snapshots.append(snapshot)
-    return snapshots
+    try:
+        rows = conn.execute(
+            "SELECT data FROM snapshots WHERE user_id = ? ORDER BY taken_at, id", (str(user_id),)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [json.loads(data) for (data,) in rows]
+
+
+def last_planner_check(user_id: int, base_dir: Optional[str] = None) -> Optional[str]:
+    """When the planner was last fetched and recorded for `user_id` (ISO time)."""
+    conn = _open_planner_db(base_dir, create=False)
+    if conn is None:
+        return None
+    try:
+        row = conn.execute("SELECT checked_at FROM checks WHERE user_id = ?", (str(user_id),)).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
 
 
 def planner_history(user_id: int, base_dir: Optional[str] = None) -> Dict[str, Any]:
     """
-    Day-by-day planner changes from the saved snapshots, newest first:
-    {"user_id", "first_date", "days": [{"date", "previous_date", "diff"}]}.
-    Each task in a diff gets a "url". Days without changes are kept, with an
-    empty diff, so gaps in tracking stay visible.
+    Planner changes between consecutive stored snapshots, newest first:
+    {"user_id", "tracking_since", "last_checked", "changes": [{"taken_at",
+    "previous_taken_at", "diff"}]}. Each task in a diff gets a "url".
     """
     snapshots = list_planner_snapshots(user_id, base_dir)
-    days = []
-    for previous, current in zip(snapshots, snapshots[1:]):
+
+    def on_planner_since(index: int, key: str) -> Optional[str]:
+        """When the task's unbroken stretch on the planner began, as of
+        snapshots[index]; None if it isn't there."""
+        if key not in snapshots[index]["tasks"]:
+            return None
+        while index > 0 and key in snapshots[index - 1]["tasks"]:
+            index -= 1
+        return snapshots[index]["taken_at"]
+
+    changes = []
+    for index in range(1, len(snapshots)):
+        previous, current = snapshots[index - 1], snapshots[index]
         diff = diff_planner_snapshots(previous, current)
-        for items in diff.values():
+        if not any(diff.values()):
+            continue
+        for kind, items in diff.items():
             for task in items:
                 task["url"] = task_url(task.get("issue_number"), task.get("code"))
-        days.append({"date": current["date"], "previous_date": previous["date"], "diff": diff})
-    days.reverse()
+                task["deadline_flag"] = deadline_flag(task.get("deadline"))
+                if kind != "added":
+                    # Removed tasks are looked up as of the snapshot they were last in.
+                    since = on_planner_since(index - 1 if kind == "removed" else index, str(task.get("issue_number")))
+                    task["on_planner_since"] = since
+                    # The first snapshot is only where tracking began, not when the task arrived.
+                    task["since_tracking_start"] = since == snapshots[0]["taken_at"]
+        changes.append({"taken_at": current["taken_at"], "previous_taken_at": previous["taken_at"], "diff": diff})
+    changes.reverse()
     return {
         "user_id": user_id,
-        "first_date": snapshots[0]["date"] if snapshots else None,
-        "days": days,
+        "tracking_since": snapshots[0]["taken_at"] if snapshots else None,
+        "last_checked": last_planner_check(user_id, base_dir),
+        "changes": changes,
     }
 
 

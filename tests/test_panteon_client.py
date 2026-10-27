@@ -548,12 +548,18 @@ class TestPlannerSnapshot:
 
     def test_save_and_load_previous(self, tmp_path):
         for day, user in [("2026-10-14", 135), ("2026-10-15", 999), ("2026-10-16", 135)]:
-            pc.save_planner_snapshot({"user_id": user, "date": day, "tasks": {}}, str(tmp_path))
-        (tmp_path / "timeline" / "planner" / "notes.json").write_text("{}")
+            pc.save_planner_snapshot(
+                {"user_id": user, "date": day, "taken_at": f"{day}T10:00:00", "tasks": {}}, str(tmp_path))
         prev = pc.load_previous_planner_snapshot(135, "2026-10-16", str(tmp_path))
         # Skips today's own snapshot and the other user's.
         assert prev["date"] == "2026-10-14"
         assert pc.load_previous_planner_snapshot(135, "2026-10-14", str(tmp_path)) is None
+
+    def test_unchanged_snapshot_adds_no_row_but_updates_last_check(self, tmp_path):
+        for at in ("2026-10-16T09:00:00", "2026-10-16T09:15:00"):
+            pc.save_planner_snapshot({"user_id": 135, "date": "2026-10-16", "taken_at": at, "tasks": {}}, str(tmp_path))
+        assert len(pc.list_planner_snapshots(135, str(tmp_path))) == 1
+        assert pc.last_planner_check(135, str(tmp_path)) == "2026-10-16T09:15:00"
 
     def test_load_previous_without_directory(self, tmp_path):
         assert pc.load_previous_planner_snapshot(135, "2026-10-16", str(tmp_path)) is None
@@ -584,9 +590,27 @@ class TestPlannerDiff:
             ("deadline", None, "2026-10-20"), ("stage", "QA", "Done"),
         ]}]
 
-    def test_position_only_change_is_not_reported(self):
+    def test_reorder_among_shared_tasks_is_a_priority_change(self):
         new = {"tasks": {**self.OLD["tasks"], "1": {**self.OLD["tasks"]["1"], "position": 9}}}
-        assert not any(pc.diff_planner_snapshots(self.OLD, new).values())
+        diff = pc.diff_planner_snapshots(self.OLD, new)
+        assert diff["changed"][0]["changes"] == [("priority", "#1", "#9")]
+
+    def test_task_added_on_top_does_not_shift_the_others(self):
+        tasks = {k: {**t, "position": t["position"] + 1} if t["period"] == "now" else t
+                 for k, t in self.OLD["tasks"].items()}
+        tasks["9"] = {**self.OLD["tasks"]["1"], "issue_number": 9, "position": 1}
+        diff = pc.diff_planner_snapshots(self.OLD, {"tasks": tasks})
+        assert diff["changed"] == [] and [t["issue_number"] for t in diff["added"]] == [9]
+
+    def test_stage_and_release_changes_need_both_sides(self):
+        old = {"tasks": {"1": {**self.OLD["tasks"]["1"], "stages": {"Testing": "in progress", "QA": "not started"},
+                               "release_state": "before qa"}}}
+        new = {"tasks": {"1": {**self.OLD["tasks"]["1"], "stages": {"Testing": "done", "QA": "not started"},
+                               "release_state": "on qa"}}}
+        assert pc.diff_planner_snapshots(old, new)["changed"][0]["changes"] == [
+            ("Testing", "in progress", "done"), ("release", "before qa", "on qa")]
+        bare = {"tasks": {"1": self.OLD["tasks"]["1"]}}
+        assert not any(pc.diff_planner_snapshots(bare, new).values())  # no stage data before: nothing to compare
 
     def test_render_changes(self):
         diff = pc.diff_planner_snapshots(self.OLD, self.NEW)
@@ -621,7 +645,7 @@ class TestFetchPlannerChanges:
         monkeypatch.setattr(pc, "get_priority_tasks", self._fake_planner({"now": [_task(1, 1)]}))
         first = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), today=date(2026, 10, 15))
         assert first["previous"] is None
-        assert (tmp_path / "timeline" / "planner" / "2026-10-15.json").exists()
+        assert (tmp_path / "database" / "timeline_task.db").exists()
 
         monkeypatch.setattr(pc, "get_priority_tasks", self._fake_planner({"now": [_task(1, 1), _task(2, 2)]}))
         second = pc.fetch_my_planner_changes({}, user_id=135, base_dir=str(tmp_path), today=date(2026, 10, 16))
@@ -669,7 +693,7 @@ class TestFetchMyDay:
         assert "## Now" in md and "## Next — due within 7 days" in md and "## Changes" in md
         assert "| 2026-10-10 **(overdue)** |" in md
         assert "#3" not in md.split("## Changes")[0]  # not due soon, so not listed
-        assert (tmp_path / "timeline" / "planner" / "2026-10-16.json").exists()
+        assert (tmp_path / "database" / "timeline_task.db").exists()
 
     def test_next_section_omitted_when_nothing_due(self, monkeypatch, tmp_path):
         monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period="now": _planner_for(135, []))

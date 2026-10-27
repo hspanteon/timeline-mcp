@@ -14,6 +14,7 @@ Examples:
 """
 import argparse
 import os
+import re
 import threading
 from typing import Any, Callable, Dict, Optional
 
@@ -23,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -38,6 +39,9 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOSTNAME = "timeline.localhost"
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", HOSTNAME]
 MAX_STATUS_IDS = 100
+# How often the planner is fetched and recorded (besides at startup). Only
+# real changes add a row to the database, so a short interval stays cheap.
+DEFAULT_SNAPSHOT_MINUTES = 30
 
 
 class _FreshStaticFiles(StaticFiles):
@@ -47,6 +51,9 @@ class _FreshStaticFiles(StaticFiles):
         response = super().file_response(*args, **kwargs)
         response.headers["Cache-Control"] = "no-cache"
         return response
+
+
+STORAGE_NAME = re.compile(r"[A-Za-z0-9_-]+\.(?:jpe?g|png|gif|webp)")
 
 
 def _respond(call: Callable[[], Any]) -> JSONResponse:
@@ -115,9 +122,9 @@ def create_app(
 
         def save():
             result = panteon_client.fetch_my_planner_changes(
-                headers(), user_id=resolved_user(), base_dir=base_dir, save=True
+                headers(), user_id=resolved_user(), base_dir=base_dir, save=True, with_stages=True
             )
-            return {"date": result["snapshot"]["date"], "tasks": len(result["snapshot"]["tasks"])}
+            return {"taken_at": result["snapshot"]["taken_at"], "tasks": len(result["snapshot"]["tasks"])}
         return _respond(save)
 
     def api_statuses(request: Request):
@@ -147,6 +154,26 @@ def create_app(
             }
         return _respond(load)
 
+    def storage_proxy(folder: str):
+        # Timeline's profile photos and attachments are public, but the page
+        # loads nothing external, so they are proxied: no credentials sent,
+        # bare filename only, fixed folder, no redirects.
+        def proxy(request: Request):
+            name = request.path_params["name"]
+            if not STORAGE_NAME.fullmatch(name):
+                return JSONResponse({"error": "Not found."}, status_code=404)
+            try:
+                upstream = requests.get(f"{panteon_client.BASE_URL}/storage/{folder}/{name}",
+                                        timeout=10, allow_redirects=False)
+            except requests.RequestException:
+                return JSONResponse({"error": "Image unavailable."}, status_code=502)
+            content_type = upstream.headers.get("content-type", "").split(";")[0]
+            if upstream.status_code != 200 or not content_type.startswith("image/") or "svg" in content_type:
+                return JSONResponse({"error": "Not found."}, status_code=404)
+            return Response(upstream.content, media_type=content_type,
+                            headers={"Cache-Control": "private, max-age=86400"})
+        return proxy
+
     def api_release(request: Request):
         return JSONResponse({"report": release["report"]})
 
@@ -175,6 +202,21 @@ def create_app(
         except ValueError:
             body = None
         return body if isinstance(body, dict) else {}
+
+    def api_project_tasks(request: Request):
+        # Only projects listed (with an "id") in timeline-desk.json can be read.
+        def load():
+            try:
+                wanted = int(request.path_params["project"])
+            except ValueError:
+                raise LookupError("Unknown project.")
+            projects = {p["id"]: p for p in work_session.public_config(work_config())["projects"]}
+            if wanted not in projects:
+                raise LookupError("Unknown project.")
+            return panteon_client.fetch_project_tasks(
+                wanted, headers(), resolved_user(), code=projects[wanted]["code"],
+                tab=request.query_params.get("tab") or None)
+        return _respond(load)
 
     def api_work_config(request: Request):
         return _respond(lambda: work_session.public_config(work_config()))
@@ -219,8 +261,11 @@ def create_app(
         Route("/api/snapshot", api_snapshot, methods=["POST"]),
         Route("/api/statuses", api_statuses),
         Route("/api/task/{issue}", api_task),
+        Route("/api/photo/{name}", storage_proxy("users")),
+        Route("/api/attachment/{name}", storage_proxy("attachments")),
         Route("/api/release", api_release),
         Route("/api/release", api_release_refresh, methods=["POST"]),
+        Route("/api/project/{project}/tasks", api_project_tasks),
         Route("/api/work/config", api_work_config),
         Route("/api/work/start", api_work_start, methods=["POST"]),
         Route("/api/work/worktrees", api_work_list),
@@ -235,18 +280,51 @@ def create_app(
     return Starlette(routes=routes, middleware=middleware)
 
 
+def run_snapshot_scheduler(
+    take_snapshot: Callable[[], Any],
+    stop: threading.Event,
+    interval_seconds: float = DEFAULT_SNAPSHOT_MINUTES * 60,
+) -> None:
+    """Records a snapshot at startup, then every `interval_seconds`, until
+    `stop` is set. A failed attempt (offline, expired token) is logged and the
+    loop carries on with the next interval."""
+    while True:
+        try:
+            take_snapshot()
+        except Exception as exc:  # keep the scheduler alive whatever fails
+            print(f"Planner snapshot failed: {exc}", flush=True)
+        if stop.wait(interval_seconds):
+            return
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8765, help="Port on 127.0.0.1 (default 8765).")
     parser.add_argument("--user-id", default=None, help="Planner user id; defaults to PANTEON_USER_ID, then the bearer token's `sub`.")
     parser.add_argument("--repo-dir", default=None, help="duell-admin checkout for the Release view; defaults to DUELL_ADMIN_DIR, then ../duell-admin.")
-    parser.add_argument("--base-dir", default=None, help="Where timeline/planner snapshots live; defaults to PANTEON_TIMELINE_DIR or the current directory.")
+    parser.add_argument("--base-dir", default=None, help="Where database/timeline_task.db (the planner snapshots) lives; defaults to PANTEON_TIMELINE_DIR or the current directory.")
+    parser.add_argument("--interval", type=float, default=float(os.getenv("TIMELINE_SNAPSHOT_MINUTES") or DEFAULT_SNAPSHOT_MINUTES),
+                        help=f"Minutes between planner checks (default {DEFAULT_SNAPSHOT_MINUTES}, or TIMELINE_SNAPSHOT_MINUTES).")
     args = parser.parse_args(argv)
 
     import uvicorn
 
     print(f"Timeline desk: http://{HOSTNAME}:{args.port}  (or http://127.0.0.1:{args.port})", flush=True)
-    uvicorn.run(create_app(args.user_id, args.base_dir, args.repo_dir), host="127.0.0.1", port=args.port, log_level="warning")
+    def take_snapshot():
+        result = panteon_client.fetch_my_planner_changes(
+            panteon_client.build_api_headers(),
+            user_id=panteon_client.resolve_user_id(args.user_id),
+            base_dir=args.base_dir,
+            save=True, with_stages=True,
+        )
+        print(f"{result['snapshot']['taken_at']} planner checked: {len(result['snapshot']['tasks'])} tasks", flush=True)
+
+    stop = threading.Event()
+    threading.Thread(target=run_snapshot_scheduler, args=(take_snapshot, stop, max(args.interval, 1) * 60), daemon=True).start()
+    try:
+        uvicorn.run(create_app(args.user_id, args.base_dir, args.repo_dir), host="127.0.0.1", port=args.port, log_level="warning")
+    finally:
+        stop.set()
     return 0
 
 
