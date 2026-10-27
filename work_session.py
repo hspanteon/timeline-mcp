@@ -44,7 +44,7 @@ def config_path() -> str:
 
 def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     """
-    {"repos": {code: {"name", "path", "base", "worktrees"}}, "claude", "terminal"}
+    {"repos": {code: {"id" (API project id), "name", "path", "base", "worktrees"}}, "claude", "terminal"}
     with paths made absolute (relative ones resolve against the config file).
     A missing file means no repos, so no Start buttons.
     """
@@ -65,6 +65,7 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     for code, repo in (raw.get("repos") or {}).items():
         repo_path = absolute(repo["path"])
         repos[str(code)] = {
+            "id": repo.get("id"),
             "name": repo.get("name") or os.path.basename(repo_path),
             "path": repo_path,
             "base": repo.get("base") or "master",
@@ -79,7 +80,11 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
 
 def public_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """What the page needs: which boards have a repo."""
-    return {"boards": {code: repo["name"] for code, repo in config["repos"].items()}}
+    return {
+        "boards": {code: repo["name"] for code, repo in config["repos"].items()},
+        "projects": [{"code": code, "id": repo["id"], "name": repo["name"]}
+                     for code, repo in config["repos"].items() if repo.get("id")],
+    }
 
 
 # ---- naming ----------------------------------------------------------------

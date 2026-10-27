@@ -1,6 +1,7 @@
 {
   "repos": {
     "15033": {
+      "id": 16,
       "name": "duell-admin",
       "path": "../duell-admin",
       "base": "master",

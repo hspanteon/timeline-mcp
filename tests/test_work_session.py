@@ -188,7 +188,7 @@ def client(setup, monkeypatch, tmp_path):
 
 
 def test_work_endpoints(client, setup):
-    assert client.get("/api/work/config").json() == {"boards": {"15033": "duell-admin"}}
+    assert client.get("/api/work/config").json() == {"boards": {"15033": "duell-admin"}, "projects": []}
     assert client.post("/api/work/start", json={"issue": "5001", "code": "15033"}).status_code == 403
 
     h = {"X-Timeline-Desk": "1"}

@@ -6,7 +6,7 @@ const STAGE_SHORT = ["RSD", "Est", "Dev", "Test", "QA", "Live"];
 
 const view = document.getElementById("view");
 const meta = document.getElementById("meta");
-const cache = { planner: null, statuses: new Map(), boards: null };
+const cache = { planner: null, statuses: new Map(), boards: null, projects: null, projectTasks: new Map() };
 
 // ---- helpers --------------------------------------------------------------
 function h(tag, attrs, ...children) {
@@ -62,6 +62,12 @@ function absolute(url) {
   try { return new URL(url, "https://timeline.panteon.no").href; } catch { return null; }
 }
 
+// Only Timeline's own attachments are previewed, through the local proxy.
+function attachmentSrc(href) {
+  const m = href.match(/^https:\/\/timeline\.panteon\.no\/storage\/attachments\/([\w-]+\.(?:jpe?g|png|gif|webp))$/i);
+  return m ? `/api/attachment/${m[1]}` : null;
+}
+
 function inline(text) {
   const out = [];
   const pattern = /!\[([^\]]*)\]\(([^)\s]+)[^)]*\)|\[([^\]]+)\]\(([^)\s]+)[^)]*\)|\*\*([^*]+)\*\*|\*([^*\n]+)\*|`([^`]+)`/g;
@@ -72,6 +78,12 @@ function inline(text) {
     const href = absolute(m[2] || m[4] || "");
     if (m[2] !== undefined || m[4] !== undefined) {
       const label = m[2] !== undefined ? `[image${m[1] ? `: ${m[1]}` : ""}]` : m[3];
+      const preview = m[2] !== undefined && href && attachmentSrc(href);
+      if (preview) {
+        out.push(h("a", { class: "preview", href, target: "_blank", rel: "noopener noreferrer", title: "Open full size" },
+          h("img", { src: preview, alt: m[1] || "image", loading: "lazy" })));
+        continue;
+      }
       out.push(href && /^https?:/.test(href)
         ? h("a", { href, target: "_blank", rel: "noopener noreferrer" }, label)
         : label);
@@ -83,17 +95,65 @@ function inline(text) {
   return out;
 }
 
+const TABLE_SEPARATOR = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+function tableCells(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+}
+
+function tableBlock(header, separator, rows) {
+  const align = tableCells(separator).map((c) => (c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : null));
+  const cell = (tag, text, i) => h(tag, align[i] ? { style: `text-align: ${align[i]}` } : {}, inline(text));
+  return h("div", { class: "md-table" }, h("table", {},
+    h("thead", {}, h("tr", {}, tableCells(header).map((c, i) => cell("th", c, i)))),
+    h("tbody", {}, rows.map((r) => h("tr", {}, tableCells(r).map((c, i) => cell("td", c, i)))))));
+}
+
 function richText(source) {
-  const text = plainText(source);
+  const lines = plainText(source).split("\n");
   const root = h("div", { class: "body rich" });
-  for (const line of text.split("\n")) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
     const item = line.match(/^\s*([-*]|\d+[.)])\s+(.*)$/);
-    if (heading) root.append(h("strong", { class: "md-h" }, inline(heading[2])));
+    const fence = line.match(/^\s*(```|~~~)/);
+    if (fence) {
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence[1]); i++) code.push(lines[i]);
+      root.append(h("pre", { class: "md-code" }, code.join("\n")));
+    } else if (line.includes("|") && i + 1 < lines.length && lines[i + 1].includes("|") && TABLE_SEPARATOR.test(lines[i + 1])) {
+      const rows = [];
+      let j = i + 2;
+      while (j < lines.length && lines[j].includes("|") && lines[j].trim()) rows.push(lines[j++]);
+      root.append(tableBlock(line, lines[i + 1], rows));
+      i = j - 1;
+    } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) root.append(h("hr", {}));
+    else if (/^\s*>/.test(line)) {
+      const quote = [];
+      for (; i < lines.length && /^\s*>/.test(lines[i]); i++) quote.push(lines[i].replace(/^\s*>\s?/, ""));
+      i--;
+      root.append(h("blockquote", {}, quote.map((q) => h("div", {}, q ? inline(q) : " "))));
+    } else if (heading) root.append(h("strong", { class: `md-h md-h${heading[1].length}` }, inline(heading[2])));
     else if (item) root.append(h("div", { class: "md-li" }, `${/\d/.test(item[1]) ? item[1] : "•"} `, inline(item[2])));
-    else root.append(h("div", {}, line ? inline(line) : "\u00a0"));
+    else root.append(h("div", {}, line ? inline(line) : " "));
   }
   return root;
+}
+
+// Avatar: initials, with the profile photo (via the local proxy) over them once it loads.
+function initials(name) {
+  return (name || "?").split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join("");
+}
+
+function avatar(name, photo, title) {
+  const el = h("span", { class: "avatar", "aria-hidden": title ? null : "true", title }, initials(name));
+  if (photo) {
+    const img = h("img", { src: `/api/photo/${encodeURIComponent(photo)}`, alt: "", loading: "lazy" });
+    img.addEventListener("load", () => el.classList.add("has-photo"));
+    img.addEventListener("error", () => img.remove());
+    el.append(img);
+  }
+  return el;
 }
 
 function showError(error) {
@@ -142,22 +202,6 @@ async function loadStatuses(ids) {
   return ids.map((id) => cache.statuses.get(String(id)));
 }
 
-// Replace placeholder rails once stage codes arrive.
-async function fillRails(root) {
-  const holders = [...root.querySelectorAll("[data-rail]")];
-  if (!holders.length) return;
-  try {
-    await loadStatuses([...new Set(holders.map((el) => el.dataset.rail))]);
-  } catch {
-    return; // Rails stay dashed; the rest of the view still works.
-  }
-  for (const holder of holders) {
-    const fresh = rail(cache.statuses.get(holder.dataset.rail));
-    fresh.classList.add("lit");
-    holder.querySelector(".rail").replaceWith(fresh);
-  }
-}
-
 // ---- board ----------------------------------------------------------------
 async function getPlanner(force) {
   if (!cache.planner || force) cache.planner = await api("/api/planner");
@@ -174,22 +218,25 @@ function flagBadge(flag) {
 
 function taskCard(task, boards) {
   const start = startButton(task.issue_number, task.code, boards, true, task.stage_status);
-  const card = h("a", { class: "card", href: `#/task/${task.issue_number}`, "data-rail": task.issue_number },
+  const card = h("a", { class: "card", href: `#/task/${task.issue_number}` },
     h("div", { class: "head" },
       h("span", { class: "issue" }, `#${task.issue_number}`),
       flagBadge(task.deadline_flag),
       task.support ? h("span", { class: "badge support" }, "support") : null),
     h("p", { class: "title" }, task.title),
-    rail(null),
+    rail(cache.statuses.get(String(task.issue_number))),
     h("div", { class: "foot" },
       h("span", { class: "stage" }, task.stage_status || "No stage"),
       h("span", {}, task.deadline ? niceDate(task.deadline) : "No deadline")));
   return start ? h("div", { class: "card-wrap" }, card, start) : card;
 }
 
-async function showBoard(force) {
+async function showPlanner(force) {
   loading("Loading your planner…");
   const [p, boards] = await Promise.all([getPlanner(force), getBoards()]);
+  // Stages aren't in the planner response: fetch them first so each card is drawn once, final.
+  const ids = Object.values(p.periods).flatMap((period) => period.tasks.map((t) => t.issue_number));
+  await loadStatuses(ids).catch(() => null); // on failure the rails stay dashed
   const columns = Object.entries(p.periods).map(([key, period]) => {
     const overdue = period.tasks.filter((t) => t.deadline_flag === "overdue").length;
     return h("section", { class: "column", "aria-labelledby": `col-${key}` },
@@ -202,60 +249,210 @@ async function showBoard(force) {
         : h("p", { class: "note" }, "Nothing planned here."));
   });
   put(view, legend(), h("div", { class: "board" }, columns));
-  fillRails(view);
 }
 
 // ---- changes --------------------------------------------------------------
-const CHANGE_GROUPS = [
-  ["added", "New", (t) => `${t.period} · ${t.stage_status || "no stage"}`],
-  ["removed", "Left the planner", (t) => `was in ${t.period}`],
-  ["moved", "Moved", (t) => `${t.from} → ${t.to}`],
-  ["changed", "Changed", (t) => t.changes.map(([name, a, b]) => `${name}: ${a || "—"} → ${b || "—"}`).join("; ")],
+const PERIOD_LABEL = { now: "Now", next: "Next", commingup: "Coming up" };
+const periodLabel = (p) => PERIOD_LABEL[p] || p || "—";
+
+// What happened, in the order people care about. Colour is kept for deadlines only.
+const CHANGE_KINDS = [
+  { key: "added", label: "New", short: "New", icon: "+" },
+  { key: "removed", label: "Left the planner", short: "Left", icon: "−" },
+  { key: "moved", label: "Moved", short: "Moved", icon: "⇄" },
+  { key: "changed", label: "Changed", short: "Changed", icon: "✎" },
 ];
 
-function changeItem(task, detail) {
-  return h("li", {},
-    h("a", { href: `#/task/${task.issue_number}` }, h("span", { class: "issue" }, `#${task.issue_number}`)),
-    " ", task.title || "", " ",
-    h("span", { class: "detail" }, `— ${detail(task)}`));
+const chip = (text, tone, title) => h("span", { class: `chip ${tone || ""}`, title: title || null }, text);
+
+// "in 2 days", "tomorrow", "3 days overdue": how far the deadline is from today.
+function countdown(deadline) {
+  const days = Math.round((new Date(`${deadline}T00:00:00`) - new Date(new Date().toDateString())) / 86400000);
+  if (Number.isNaN(days)) return "";
+  if (days === 0) return "today";
+  if (days === 1) return "tomorrow";
+  if (days > 1) return `in ${days} days`;
+  return `${-days} day${days === -1 ? "" : "s"} overdue`;
 }
 
-async function showChanges() {
-  loading("Loading planner history…");
-  const history = await api("/api/changes");
-  const save = h("button", { type: "button", class: "btn", onclick: saveSnapshot }, "Save today's snapshot");
-  const status = h("span", { class: "note", id: "snapshot-status" });
-  const days = history.days.map((day) => {
-    const groups = CHANGE_GROUPS
-      .filter(([key]) => day.diff[key].length)
-      .map(([key, title, detail]) => h("ul", { class: `change ${key}` },
-        h("h3", {}, `${title} (${day.diff[key].length})`),
-        day.diff[key].map((t) => changeItem(t, detail))));
-    return h("section", { class: "day" },
-      h("h2", {}, niceDate(day.date), h("small", {}, `since ${niceDate(day.previous_date)}`)),
-      groups.length ? groups : h("p", { class: "note" }, "No changes."));
-  });
-  let intro;
-  if (!history.first_date) intro = "No snapshots yet. Save today's snapshot to start tracking.";
-  else if (!days.length) intro = `Tracking started ${niceDate(history.first_date)}. Changes appear after the next day's snapshot.`;
-  put(view, 
-    h("div", { class: "toolbar" }, save, status),
-    intro ? h("p", { class: "note" }, intro) : null,
-    days);
+function deadlineChip(task) {
+  if (!task.deadline) return chip("No deadline", "muted");
+  const flag = task.deadline_flag;
+  return chip(`${niceDate(task.deadline)} · ${countdown(task.deadline)}`,
+    flag === "overdue" ? "overdue" : flag ? "soon" : "");
 }
 
-async function saveSnapshot(event) {
-  const button = event.currentTarget;
-  button.disabled = true;
-  try {
-    const result = await api("/api/snapshot", { method: "POST", headers: { "X-Timeline-Desk": "1" } });
-    await showChanges();
-    document.getElementById("snapshot-status").textContent =
-      `Saved ${niceDate(result.date)} (${result.tasks} tasks).`;
-  } catch (error) {
-    button.disabled = false;
-    document.getElementById("snapshot-status").textContent = error.message;
+function spanText(from, to) {
+  const minutes = Math.round((new Date(to) - new Date(from)) / 60000);
+  if (Number.isNaN(minutes) || minutes < 0) return "";
+  if (minutes < 60) return "under an hour";
+  if (minutes < 60 * 24) return `${Math.round(minutes / 60)} h`;
+  const days = Math.round(minutes / 1440);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+const RELEASE_LABEL = { "before qa": "Before QA", "in qa": "In QA", "qa blocked": "QA blocked", "qa approved": "QA approved", live: "Live" };
+
+// One "before → after" line; the old value is struck through, the new one bold.
+function deltaLine(name, before, after) {
+  return h("div", { class: "delta" },
+    h("span", { class: "field" }, name),
+    h("span", { class: "was" }, before || "—"),
+    h("span", { class: "arrow" }, "→"),
+    h("span", { class: "now" }, after || "—"));
+}
+
+function fieldChange([name, before, after]) {
+  const show = (v) => (name === "deadline" && v ? niceDate(v) : v);
+  return deltaLine(name, show(before), show(after));
+}
+
+let changeBoards = {};
+
+function changeItem(task, kind, at) {
+  let facts;
+  if (kind.key === "removed") {
+    facts = [h("span", { class: "note" }, `was in ${periodLabel(task.period)} · ${task.stage_status || "no stage"}`)];
+  } else {
+    facts = [
+      chip(`${periodLabel(task.period)} · #${task.position}`, "", "Priority position in this period"),
+      chip(task.stage_status || "No stage"),
+      deadlineChip(task),
+      task.release_state ? chip(RELEASE_LABEL[task.release_state] || task.release_state) : null,
+      task.support ? chip("Support") : null,
+      task.code ? chip(changeBoards[String(task.code)] || `Board ${task.code}`, "muted") : null,
+    ];
   }
+  // Under an hour says nothing useful, so the note starts at an hour.
+  const onPlanner = task.on_planner_since ? spanText(task.on_planner_since, at) : "";
+  if (onPlanner && onPlanner !== "under an hour") {
+    facts.push(h("span", { class: "note" },
+      `on your planner for ${task.since_tracking_start ? "at least " : ""}${onPlanner}`));
+  }
+  const details = kind.key === "changed" ? task.changes.map(fieldChange)
+    : kind.key === "moved" ? [deltaLine("period", periodLabel(task.from), periodLabel(task.to))] : [];
+  return h("li", { class: "item" },
+    h("div", { class: "item-head" },
+      h("span", { class: "kind" }, h("b", { "aria-hidden": "true" }, kind.icon), kind.short),
+      h("a", { href: `#/task/${task.issue_number}` }, h("span", { class: "issue" }, `#${task.issue_number}`)),
+      h("span", { class: "item-title" }, task.title || ""),
+      task.url ? h("a", { class: "ext", href: task.url, target: "_blank", rel: "noopener noreferrer", title: "Open in Timeline" }, "↗") : null),
+    details.length ? h("div", { class: "deltas" }, details) : null,
+    task.stages && kind.key !== "removed" ? h("div", { class: "stages" }, rail({ stages: task.stages }), railKey()) : null,
+    h("div", { class: "facts" }, facts));
+}
+
+function ago(iso) {
+  const minutes = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  if (Number.isNaN(minutes)) return "";
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  if (minutes < 60 * 24) return `${Math.round(minutes / 60)} h ago`;
+  return `${Math.round(minutes / 1440)} d ago`;
+}
+
+
+function dayNote(date) {
+  const day = (d) => new Date(d).toDateString();
+  if (day(`${date}T12:00:00`) === day(Date.now())) return "Today";
+  if (day(`${date}T12:00:00`) === day(Date.now() - 86400000)) return "Yesterday";
+  return "";
+}
+
+// Remembered per browser, so entries found since your last visit stand out.
+// Read once per page load: a background refresh must not mark them seen.
+let changesSeenAt = "";
+try { changesSeenAt = localStorage.getItem("changesSeenAt") || ""; } catch { /* storage blocked */ }
+let changesFilter = "all";
+
+function niceTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}, ${d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+const CHANGES_REFRESH_MS = 60 * 1000;
+let changesTimer = null;
+
+const recordSnapshot = () => api("/api/snapshot", { method: "POST", headers: { "X-Timeline-Desk": "1" } });
+
+// `check` fetches the planner from Timeline first, so a task added a minute
+// ago shows up; otherwise this only reads what the background check stored.
+async function showChanges(quiet = false, check = false) {
+  clearTimeout(changesTimer);
+  if (!quiet) loading(check ? "Checking the planner…" : "Loading planner history…");
+  let checkError = "";
+  if (check) {
+    try { await recordSnapshot(); } catch (error) { checkError = error.message; }
+  }
+  const [history, boards] = await Promise.all([api("/api/changes"), getBoards()]);
+  changeBoards = boards || {};
+  const status = h("span", { class: "note", id: "snapshot-status" },
+    checkError || (history.last_checked ? `Last checked ${niceTime(history.last_checked)} (${ago(history.last_checked)})` : ""));
+
+  // Totals for the last 24 hours double as filters.
+  const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const recent = history.changes.filter((e) => new Date(e.taken_at).getTime() >= dayAgo);
+  const total = (list, key) => list.reduce((n, e) => n + e.diff[key].length, 0);
+  const filters = h("div", { class: "filters", role: "group", "aria-label": "Filter changes" },
+    h("button", { type: "button", class: "filter", "aria-pressed": String(changesFilter === "all"),
+      onclick: () => { changesFilter = "all"; showChanges(true); } }, "All"),
+    CHANGE_KINDS.map((k) => h("button", { type: "button", class: `filter ${k.key}`,
+      "aria-pressed": String(changesFilter === k.key),
+      title: "Last 24 hours",
+      onclick: () => { changesFilter = changesFilter === k.key ? "all" : k.key; showChanges(true); } },
+      h("b", { "aria-hidden": "true" }, k.icon), `${k.label} `, h("span", { class: "count" }, total(recent, k.key)))));
+
+  const unseen = (e) => changesSeenAt && e.taken_at > changesSeenAt;
+  // One section per day (the main level); inside it, one row per detection time.
+  const days = new Map();
+  for (const entry of history.changes) {
+    const items = CHANGE_KINDS
+      .filter((k) => changesFilter === "all" || changesFilter === k.key)
+      .flatMap((k) => entry.diff[k.key].map((t) => ({ task: t, kind: k })));
+    if (!items.length) continue;
+    const date = entry.taken_at.slice(0, 10);
+    if (!days.has(date)) days.set(date, []);
+    days.get(date).push({ entry, items });
+  }
+  // One continuous rail: a big marker per day, a dot per detection time.
+  const rail = (kind) => h("div", { class: "rail-col", "aria-hidden": "true" }, h("i", { class: `dot ${kind}` }));
+  const rows = [];
+  for (const [date, slots] of days) {
+    const count = slots.reduce((n, r) => n + r.items.length, 0);
+    rows.push(h("div", { class: "row day-row" },
+      h("div", { class: "when" }),
+      rail("day"),
+      h("h2", {}, niceDate(date), dayNote(date) ? h("span", { class: "today" }, dayNote(date)) : null,
+        h("small", {}, `${count} change${count === 1 ? "" : "s"}`))));
+    for (const { entry, items } of slots) {
+      rows.push(h("div", { class: "row slot" },
+        h("div", { class: "when" },
+          h("span", { class: "clock" }, clock(entry.taken_at)),
+          h("span", { class: "ago" }, ago(entry.taken_at))),
+        rail(unseen(entry) ? "unseen" : "time"),
+        h("ul", { class: "change" }, items.map(({ task, kind }) => changeItem(task, kind, entry.taken_at)))));
+    }
+  }
+  const entries = rows.length ? h("div", { class: "timeline" }, rows) : null;
+
+  let intro;
+  if (!history.tracking_since) intro = "No snapshots yet. Press Refresh to start tracking.";
+  else if (!history.changes.length) intro = `Tracking since ${niceTime(history.tracking_since)}. Nothing has changed yet; the planner is checked every few minutes.`;
+  else if (!entries) intro = "No changes of this kind. Pick another filter.";
+  put(view,
+    h("div", { class: "toolbar" }, status),
+    history.changes.length ? filters : null,
+    intro ? h("p", { class: "note" }, intro) : null,
+    entries);
+  if (history.changes.length) {
+    try { localStorage.setItem("changesSeenAt", history.changes[0].taken_at); } catch { /* storage blocked */ }
+  }
+  // The dashboard checks the planner in the background; pick up what it found.
+  changesTimer = setTimeout(() => {
+    if (location.hash === "#/changes") showChanges(true).catch(() => {});
+  }, CHANGES_REFRESH_MS);
 }
 
 // ---- release --------------------------------------------------------------
@@ -462,18 +659,154 @@ async function showWork() {
     h("p", { class: "note" }, "Remove never forces: git keeps a worktree with uncommitted changes and a branch with commits that aren't merged anywhere."));
 }
 
+// ---- my tasks (project list) ----------------------------------------------
+const listState = { project: null, tab: null, q: "", tag: "", stage: "", overdue: false, closed: new Set() };
+let listToken = 0;
+const TAG_COLOR = /^#[0-9a-f]{3,8}$/i;
+
+async function getProjects() {
+  if (!cache.projects) cache.projects = (await api("/api/work/config").catch(() => ({ projects: [] }))).projects || [];
+  return cache.projects;
+}
+
+async function getProjectTasks(project, tab, refresh) {
+  const key = `${project.id}|${tab || ""}`;
+  if (refresh || !cache.projectTasks.has(key)) {
+    cache.projectTasks.set(key, await api(`/api/project/${project.id}/tasks${tab ? `?tab=${encodeURIComponent(tab)}` : ""}`));
+  }
+  return cache.projectTasks.get(key);
+}
+
+function tagChip(tag) {
+  const style = TAG_COLOR.test(tag.color || "") ? `--tag: ${tag.color}` : null;
+  return h("span", { class: "tag", style }, tag.name);
+}
+
+function hoursText(t) {
+  const fmt = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(1));
+  const spent = Number(t.hours_spent) || 0;
+  const estimate = parseFloat(String(t.hours_estimated ?? "").replace(",", "."));
+  if (!spent && !(estimate > 0)) return "–";
+  return estimate > 0 ? `${fmt(spent)} / ${fmt(estimate)}h` : `${fmt(spent)}h`;
+}
+
+function taskRow(t, boards) {
+  return h("a", { class: "trow", href: `#/task/${t.issue_number}` },
+    h("span", { class: "issue" }, `#${t.issue_number}`),
+    h("div", { class: "ttitle" },
+      h("span", { class: "tname" }, t.title),
+      t.tags.length ? h("span", { class: "tags" }, t.tags.map(tagChip)) : null),
+    rail(t),
+    h("span", { class: "stage" }, t.stage_status || "–"),
+    h("span", { class: "tdue" }, t.deadline ? niceDate(t.deadline, false) : "–", flagBadge(t.deadline_flag)),
+    h("span", { class: "thours" }, hoursText(t)),
+    h("span", { class: "people" }, t.subscribers.map((p) => avatar(p.name, p.photo, p.name))),
+    h("span", { class: "tact" }, startButton(t.issue_number, t.code, boards, true, t.stage_status)));
+}
+
+async function showTaskList(toolbar, refresh) {
+  const projects = await getProjects();
+  if (!projects.length) {
+    put(view, toolbar, h("p", { class: "note" }, 'No project set up. Add an "id" (the API project id) to a repo in timeline-desk.json.'));
+    return;
+  }
+  const project = projects.find((p) => p.id === listState.project) || projects[0];
+  listState.project = project.id;
+  const boards = await getBoards();
+  const body = h("div", { class: "mytasks" });
+  put(view, toolbar, body);
+  const token = ++listToken;
+
+  const draw = (data) => {
+    const all = data.groups.flatMap((g) => g.tasks);
+    const tagNames = [...new Set(all.flatMap((t) => t.tags.map((x) => x.name)))].sort();
+    const stageNames = [...new Set(all.map((t) => t.stage_status).filter(Boolean))].sort();
+    if (listState.tag && !tagNames.includes(listState.tag)) listState.tag = "";
+    if (listState.stage && !stageNames.includes(listState.stage)) listState.stage = "";
+
+    const select = (label, options, key) => {
+      const el = h("select", { "aria-label": label }, h("option", { value: "" }, label), options.map((o) => h("option", { value: o }, o)));
+      el.value = listState[key];
+      el.addEventListener("change", () => { listState[key] = el.value; renderList(); });
+      return el;
+    };
+    const search = h("input", { type: "text", placeholder: "Filter tasks…", "aria-label": "Filter tasks", value: listState.q, size: "22" });
+    search.addEventListener("input", () => { listState.q = search.value; renderList(); });
+    const overdue = h("input", { type: "checkbox" });
+    overdue.checked = listState.overdue;
+    overdue.addEventListener("change", () => { listState.overdue = overdue.checked; renderList(); });
+    const projectPicker = projects.length > 1
+      ? h("select", { "aria-label": "Project", onchange: (e) => { listState.project = Number(e.target.value); listState.tab = null; showTaskList(toolbar); } },
+        projects.map((p) => h("option", { value: p.id, selected: p.id === project.id }, p.name)))
+      : null;
+    const summary = h("span", { class: "note" });
+    const listEl = h("div", { class: "tlist" });
+
+    const renderList = () => {
+      const q = listState.q.trim().toLowerCase();
+      const keep = (t) => (!q || `#${t.issue_number} ${t.title} ${t.tags.map((x) => x.name).join(" ")}`.toLowerCase().includes(q))
+        && (!listState.tag || t.tags.some((x) => x.name === listState.tag))
+        && (!listState.stage || t.stage_status === listState.stage)
+        && (!listState.overdue || t.deadline_flag === "overdue");
+      const groups = data.groups.map((g) => ({ name: g.name, tasks: g.tasks.filter(keep) })).filter((g) => g.tasks.length);
+      const shown = groups.reduce((n, g) => n + g.tasks.length, 0);
+      const late = all.filter((t) => t.deadline_flag === "overdue").length;
+      summary.textContent = `${shown} of ${all.length} task${all.length === 1 ? "" : "s"}${late ? ` · ${late} overdue` : ""}`;
+      put(listEl,
+        shown ? h("div", { class: "trow thead", "aria-hidden": "true" },
+          h("span"), h("span", {}, "Task"), railKey(), h("span", {}, "Stage"), h("span", {}, "Due"), h("span", {}, "Hours"), h("span", {}, "People"), h("span")) : null,
+        groups.map((g) => {
+          const id = `${data.tab}|${g.name}`;
+          const details = h("details", { class: "tgroup", open: !listState.closed.has(id) },
+            h("summary", {}, h("span", { class: "gname" }, g.name), h("span", { class: "count" }, g.tasks.length)),
+            g.tasks.map((t) => taskRow(t, boards)));
+          details.addEventListener("toggle", () => {
+            if (details.open) listState.closed.delete(id); else listState.closed.add(id);
+          });
+          return details;
+        }),
+        shown ? null : h("p", { class: "note" }, "No tasks match."));
+    };
+
+    put(body,
+      h("div", { class: "list-head" }, h("h2", {}, "My tasks"), projectPicker, summary),
+      h("nav", { class: "subtabs", "aria-label": "Task tabs" }, data.tabs.map((t) => h("button", {
+        type: "button", class: "subtab", "aria-current": t.name === data.tab ? "page" : null, onclick: () => load(t.name),
+      }, t.name, h("span", { class: "count" }, t.count)))),
+      h("div", { class: "filters" }, search, select("All tags", tagNames, "tag"), select("All stages", stageNames, "stage"),
+        h("label", { class: "check" }, overdue, " Overdue only")),
+      listEl);
+    renderList();
+  };
+
+  const load = async (tab, force) => {
+    put(body, h("p", { class: "note" }, "Loading your tasks…"));
+    let data;
+    try {
+      data = await getProjectTasks(project, tab, force);
+    } catch (error) {
+      if (token === listToken) put(body, h("p", { class: "error", role: "alert" }, error.message));
+      return;
+    }
+    if (token !== listToken) return;
+    listState.tab = data.tab;
+    draw(data);
+  };
+  await load(listState.tab, refresh);
+}
+
 // ---- task -----------------------------------------------------------------
-async function showTask(issue) {
+async function showTask(issue, force) {
   const input = h("input", { type: "text", id: "task-id", value: issue || "", "aria-label": "Issue ID or task URL", placeholder: "Issue ID or task URL", size: "34" });
   const open = () => {
     const id = parseIds(input.value)[0] || input.value.trim();
     if (id) location.hash = `#/task/${id}`;
   };
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
-  const toolbar = h("div", { class: "toolbar" }, input, h("button", { type: "button", class: "btn", onclick: open }, "Open task"));
+  const toolbar = h("div", { class: "toolbar" }, input, h("button", { type: "button", class: "btn", onclick: open }, "Open task"),
+    issue ? h("a", { href: "#/task", class: "back" }, "← My tasks") : null);
   if (!issue) {
-    put(view, toolbar, h("p", { class: "note" }, "Open a task from the board, or enter its issue ID."));
-    input.focus();
+    await showTaskList(toolbar, force);
     return;
   }
   put(view, toolbar, h("p", { class: "note" }, `Loading #${issue}…`));
@@ -502,32 +835,49 @@ async function showTask(issue) {
     railKey(),
     rail(status && !status.error ? status : null));
   const description = plainText(task.description);
-  const comments = task.comments.map((c) => h("li", {},
-    h("div", { class: "who" }, c.author,
-      c.author && c.author === task.creator ? h("span", { class: "creator" }, "task creator") : null,
-      h("small", {}, c.created_at)),
-    plainText(c.description) ? richText(c.description) : null));
-  put(view, 
+  const copyIcon = () => new DOMParser().parseFromString(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>',
+    "image/svg+xml").documentElement;
+  const copyText = async (text) => {
+    try { await navigator.clipboard.writeText(text); toast("Copied to clipboard."); }
+    catch { toast("Couldn't copy — clipboard not available.", true); }
+  };
+  const photos = new Map(task.comments.filter((c) => c.photo).map((c) => [c.author, c.photo]));
+  const post = (author, date, content, label, text, photo) => h("li", { class: "post" },
+    avatar(author, photo),
+    h("div", { class: "post-card" },
+      h("div", { class: "post-head" },
+        h("strong", {}, author || "Unknown"),
+        h("button", { type: "button", class: "icon-btn", title: "Copy text", "aria-label": "Copy text", onclick: () => copyText(text || "") }, copyIcon()),
+        label ? h("span", { class: "creator" }, label) : null,
+        h("small", {}, date || "")),
+      content));
+  const comments = task.comments.map((c) => post(c.author, c.created_at,
+    plainText(c.description) ? richText(c.description) : h("p", { class: "note" }, "(no text)"),
+    c.author && c.author === task.creator ? "task creator" : null, plainText(c.description), c.photo));
+  put(view,
     toolbar, head,
     h("h3", { class: "task-section" }, "Description"),
-    description ? richText(task.description) : h("p", { class: "note" }, "No description."),
+    h("ol", { class: "comments" }, post(task.creator, task.created_date ? niceDate(task.created_date, false) : "",
+      description ? richText(task.description) : h("p", { class: "note" }, "No description."), "task creator", description, photos.get(task.creator))),
     h("h3", { class: "task-section" }, `Conversation (${task.comments.length})`),
     comments.length ? h("ol", { class: "comments" }, comments) : h("p", { class: "note" }, "No comments yet."));
 }
 
 // ---- routing --------------------------------------------------------------
 async function route(force) {
-  const [, name = "board", arg] = (location.hash || "#/board").split("/");
+  const [, rawName = "planner", arg] = (location.hash || "#/planner").split("/");
+  const name = rawName === "board" ? "planner" : rawName; // old #/board links keep working
   for (const tab of document.querySelectorAll(".tabs a")) {
     if (tab.dataset.view === name) tab.setAttribute("aria-current", "page");
     else tab.removeAttribute("aria-current");
   }
   try {
-    if (name === "changes") await showChanges();
+    if (name === "changes") await showChanges(false, force);
     else if (name === "release") await showRelease(force);
     else if (name === "work") await showWork();
-    else if (name === "task") await showTask(arg ? decodeURIComponent(arg) : "");
-    else await showBoard(force);
+    else if (name === "task") await showTask(arg ? decodeURIComponent(arg) : "", force);
+    else await showPlanner(force);
   } catch (error) {
     showError(error);
   }
@@ -536,10 +886,11 @@ async function route(force) {
 document.getElementById("refresh").addEventListener("click", async () => {
   cache.statuses.clear();
   cache.planner = null;
+  cache.projectTasks.clear();
   await route(true);
   getPlanner().catch(() => {});
 });
 
 window.addEventListener("hashchange", () => route(false));
 route(false);
-if (!location.hash.startsWith("#/board") && location.hash) getPlanner().catch(() => {});
+if (!/^#\/(planner|board)/.test(location.hash) && location.hash) getPlanner().catch(() => {});

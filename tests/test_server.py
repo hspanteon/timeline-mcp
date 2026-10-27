@@ -291,7 +291,7 @@ class TestGetMyPlannerChangesTool:
         result = await server.get_my_planner_changes(user_id=7, bearer_token="tok")
         assert "# My Planner Changes" in result
         assert "No earlier snapshot" in result
-        assert list((tmp_path / "timeline" / "planner").glob("*.json"))
+        assert (tmp_path / "database" / "timeline_task.db").exists()
 
     @pytest.mark.anyio
     async def test_unknown_user_becomes_tool_error(self, monkeypatch, tmp_path):

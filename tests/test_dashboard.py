@@ -48,27 +48,71 @@ class TestPlannerOverview:
 
 
 class TestPlannerHistory:
-    def _save(self, tmp_path, day, tasks, user=135):
-        snap = {"user_id": user, "date": day, "tasks": tasks}
+    T1 = {"issue_number": 1, "code": "9", "title": "A", "period": "now", "position": 1,
+          "stage_status": "QA", "task_status": "open", "deadline": None}
+
+    def _save(self, tmp_path, taken_at, tasks, user=135):
+        snap = {"user_id": user, "date": taken_at[:10], "taken_at": taken_at, "tasks": tasks}
         pc.save_planner_snapshot(snap, str(tmp_path))
 
     def test_history_newest_first_with_urls(self, tmp_path):
-        t1 = {"issue_number": 1, "code": "9", "title": "A", "period": "now", "position": 1,
-              "stage_status": "QA", "task_status": "open", "deadline": None}
-        t2 = {**t1, "issue_number": 2, "title": "B"}
-        self._save(tmp_path, "2026-10-14", {"1": t1})
-        self._save(tmp_path, "2026-10-15", {"1": t1})
-        self._save(tmp_path, "2026-10-16", {"1": t1, "2": t2})
-        self._save(tmp_path, "2026-10-13", {}, user=999)
+        t1, t2 = self.T1, {**self.T1, "issue_number": 2, "title": "B"}
+        self._save(tmp_path, "2026-10-14T09:00:00", {"1": t1})
+        self._save(tmp_path, "2026-10-14T09:15:00", {"1": t1})  # unchanged: no new row
+        self._save(tmp_path, "2026-10-14T09:30:00", {"1": t1, "2": t2})
+        self._save(tmp_path, "2026-10-14T09:45:00", {"1": {**t1, "stage_status": "Done"}, "2": t2})
+        self._save(tmp_path, "2026-10-13T09:00:00", {}, user=999)
         history = pc.planner_history(135, str(tmp_path))
-        assert history["first_date"] == "2026-10-14"
-        assert [d["date"] for d in history["days"]] == ["2026-10-16", "2026-10-15"]
-        assert history["days"][1]["diff"] == {"added": [], "removed": [], "moved": [], "changed": []}
-        added = history["days"][0]["diff"]["added"]
+        assert history["tracking_since"] == "2026-10-14T09:00:00"
+        assert history["last_checked"] == "2026-10-14T09:45:00"
+        assert [c["taken_at"] for c in history["changes"]] == ["2026-10-14T09:45:00", "2026-10-14T09:30:00"]
+        assert history["changes"][1]["previous_taken_at"] == "2026-10-14T09:00:00"
+        added = history["changes"][1]["diff"]["added"]
         assert added[0]["issue_number"] == 2 and added[0]["url"].endswith("/list/9/edit/2")
+        assert history["changes"][0]["diff"]["changed"][0]["changes"] == [("stage", "QA", "Done")]
+
+    def test_position_only_change_is_not_stored(self, tmp_path):
+        self._save(tmp_path, "2026-10-14T09:00:00", {"1": self.T1})
+        self._save(tmp_path, "2026-10-14T09:15:00", {"1": {**self.T1, "position": 3}})
+        assert len(pc.list_planner_snapshots(135, str(tmp_path))) == 1
+
+    def test_on_planner_since_and_carried_stages(self, tmp_path):
+        staged = {"stages": {"QA": "in progress"}, "release_state": "on qa", "qa_approved": False}
+        self._save(tmp_path, "2026-10-14T09:00:00", {"1": {**self.T1, **staged}})
+        # Taken without stage lookups (MCP tool): inherits the stored stages.
+        self._save(tmp_path, "2026-10-15T09:00:00", {"1": {**self.T1, "deadline": "2026-10-30"}})
+        assert pc.list_planner_snapshots(135, str(tmp_path))[1]["tasks"]["1"]["stages"] == staged["stages"]
+        # Later check with stages sees the real change.
+        self._save(tmp_path, "2026-10-16T09:00:00", {"1": {**self.T1, "deadline": "2026-10-30",
+                   **{**staged, "stages": {"QA": "done"}}}})
+        history = pc.planner_history(135, str(tmp_path))
+        newest = history["changes"][0]["diff"]["changed"][0]
+        assert newest["changes"] == [("QA", "in progress", "done")]
+        assert newest["on_planner_since"] == "2026-10-14T09:00:00" and newest["since_tracking_start"] is True
+
+    def test_stage_details_arriving_are_recorded_once(self, tmp_path):
+        self._save(tmp_path, "2026-10-14T09:00:00", {"1": self.T1})
+        staged = {"1": {**self.T1, "stages": {"QA": "in progress"}, "release_state": "on qa", "qa_approved": False}}
+        self._save(tmp_path, "2026-10-14T09:30:00", staged)
+        self._save(tmp_path, "2026-10-14T10:00:00", staged)
+        assert len(pc.list_planner_snapshots(135, str(tmp_path))) == 2
+        assert pc.planner_history(135, str(tmp_path))["changes"] == []  # a baseline, not a change
 
     def test_empty_history(self, tmp_path):
-        assert pc.planner_history(135, str(tmp_path)) == {"user_id": 135, "first_date": None, "days": []}
+        assert pc.planner_history(135, str(tmp_path)) == {
+            "user_id": 135, "tracking_since": None, "last_checked": None, "changes": []}
+        assert not (tmp_path / "timeline").exists()
+
+    def test_imports_earlier_json_snapshots_once(self, tmp_path):
+        directory = tmp_path / "timeline" / "planner"
+        directory.mkdir(parents=True)
+        (directory / "2026-10-13.json").write_text(json.dumps(
+            {"user_id": 135, "date": "2026-10-13", "tasks": {"1": self.T1}}))
+        (directory / "notes.json").write_text("{}")
+        self._save(tmp_path, "2026-10-14T09:00:00", {})
+        snaps = pc.list_planner_snapshots(135, str(tmp_path))
+        assert [s["taken_at"] for s in snaps] == ["2026-10-13T00:00:00", "2026-10-14T09:00:00"]
+        assert [c["diff"]["removed"][0]["issue_number"] for c in pc.planner_history(135, str(tmp_path))["changes"]] == [1]
 
 
 class TestDashboardHttp:
@@ -128,6 +172,24 @@ class TestDashboardHttp:
         assert body["title"] == "Hello" and body["comments"][0]["author"] == "Ann"
         assert body["description"] == "Body ![](/img/a.png)"
 
+    def test_images_proxied_without_credentials(self, client, monkeypatch):
+        seen = {}
+        def fake_get(url, **kwargs):
+            seen.update(url=url, **kwargs)
+            return type("R", (), {"status_code": 200, "content": b"JPEG", "headers": {"content-type": "image/jpeg"}})()
+        monkeypatch.setattr(requests, "get", fake_get)
+        r = client.get("/api/photo/1712642413.jpg")
+        assert r.status_code == 200 and r.content == b"JPEG" and r.headers["content-type"] == "image/jpeg"
+        assert seen["url"] == f"{pc.BASE_URL}/storage/users/1712642413.jpg"
+        assert "headers" not in seen and seen["allow_redirects"] is False
+        r = client.get("/api/attachment/image_1790233365.png")
+        assert r.status_code == 200 and seen["url"] == f"{pc.BASE_URL}/storage/attachments/image_1790233365.png"
+
+    @pytest.mark.parametrize("name", ["..%2Fsecret.jpg", "a.php", "x.jpg%00.png", "a b.jpg"])
+    def test_photo_rejects_odd_names(self, client, monkeypatch, name):
+        monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("must not fetch"))
+        assert client.get(f"/api/photo/{name}").status_code == 404
+
     def test_unknown_task_is_404(self, client, monkeypatch):
         def missing(ident, headers):
             raise requests.HTTPError(response=type("R", (), {"status_code": 422})())
@@ -143,8 +205,94 @@ class TestDashboardHttp:
                             lambda headers, period="now": _planners({"now": [_task(7)]})[period])
         response = client.post("/api/snapshot", headers={"X-Timeline-Desk": "1"})
         assert response.status_code == 200 and response.json()["tasks"] == 1
-        saved = list((tmp_path / "timeline" / "planner").glob("*.json"))
-        assert len(saved) == 1 and json.loads(saved[0].read_text())["user_id"] == 135
+        assert (tmp_path / "database" / "timeline_task.db").exists()
+        snapshots = pc.list_planner_snapshots(135, str(tmp_path))
+        assert len(snapshots) == 1 and list(snapshots[0]["tasks"]) == ["7"]
 
     def test_changes(self, client):
-        assert client.get("/api/changes").json()["days"] == []
+        assert client.get("/api/changes").json()["changes"] == []
+
+
+class TestSnapshotScheduler:
+    def test_checks_at_startup_then_every_interval_and_survives_failure(self):
+        import threading
+        calls = []
+        stop = threading.Event()
+
+        def take():
+            calls.append(1)
+            if len(calls) == 3:
+                stop.set()
+            raise RuntimeError("offline")
+
+        dashboard.run_snapshot_scheduler(take, stop, interval_seconds=0)
+        assert len(calls) == 3  # errors swallowed, loop kept going until stopped
+
+
+# ---- project task list -----------------------------------------------------
+PROJECT_PAYLOAD = {"status": "success", "data": {
+    "tabs": [{"tab_name": "DOCS", "tab_task_count": 1, "tab_sort_order": 5},
+             {"tab_name": "Priority", "tab_task_count": 2, "tab_sort_order": 1}],
+    "grouptasks": [{"name": "In progress", "tasks": [{
+        "issue_number": 5916, "title": "Whitelabel", "stage_status": "Testing pending",
+        "stage_rsd": {"id": 5, "name": "Completed"}, "stage_est": {"id": 1, "name": "Not needed"},
+        "stage_dev": {"id": 4, "name": "In progress"}, "stage_tst": {"id": 0, "name": ""},
+        "stage_qa": {"id": 6, "name": "To Discuss"}, "stage_liv": None,
+        "deadline": "20.10.2026", "hours_spent_decimal": 3, "estimated_hours": None, "release": None,
+        "task_tags": [{"name": "BO", "color": "#596780", "id": 21}],
+        "task_subscribers": [{"name": "Ann", "photo": "1.jpg"}]}]}]}}
+
+
+class FakeResponse:
+    def __init__(self, status=200, payload=None):
+        self.status_code, self._payload = status, payload
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(response=self)
+
+
+def test_fetch_project_tasks_shapes_and_posts(monkeypatch):
+    sent = {}
+    def fake_post(url, headers=None, json=None, timeout=None):
+        sent.update(url=url, json=json)
+        return FakeResponse(200, PROJECT_PAYLOAD)
+    monkeypatch.setattr(pc._SESSION, "post", fake_post)
+    out = pc.fetch_project_tasks(16, {}, 111, code=15033, tab="DOCS", today=__import__("datetime").date(2026, 10, 27))
+    assert sent["url"].endswith("/api/project/16/tasks")
+    assert sent["json"] == {"subscribed_by": 111, "tag_id": 0, "status": "open", "tab_name": "DOCS"}
+    assert [t["name"] for t in out["tabs"]] == ["Priority", "DOCS"] and out["tab"] == "DOCS"
+    task = out["groups"][0]["tasks"][0]
+    assert task["stages"] == {"RSD": "done", "Estimate": "skipped", "Development": "in progress",
+                              "Testing": "not started", "QA": "in progress", "Live": "not started"}
+    assert task["deadline"] == "2026-10-20" and task["deadline_flag"] == "overdue"
+    assert task["url"].endswith("/tasks#/list/15033/edit/5916") and task["tags"][0]["name"] == "BO"
+
+
+def test_fetch_project_tasks_default_tab_is_first(monkeypatch):
+    monkeypatch.setattr(pc._SESSION, "post", lambda *a, **k: FakeResponse(200, PROJECT_PAYLOAD))
+    assert pc.fetch_project_tasks(16, {}, 111)["tab"] == "Priority"
+
+
+def test_fetch_project_tasks_auth_error(monkeypatch):
+    monkeypatch.setattr(pc._SESSION, "post", lambda *a, **k: FakeResponse(401, {}))
+    with pytest.raises(PermissionError):
+        pc.fetch_project_tasks(16, {}, 111)
+
+
+def test_project_endpoint_only_serves_configured_projects(monkeypatch, tmp_path):
+    monkeypatch.setenv("PANTEON_BEARER_TOKEN", "tok")
+    seen = {}
+    monkeypatch.setattr(pc, "fetch_project_tasks", lambda pid, headers, user, code=None, tab=None: seen.update(
+        pid=pid, code=code, tab=tab) or {"project_id": pid, "tabs": [], "groups": []})
+    config = {"repos": {"15033": {"id": 16, "name": "duell-admin"}}}
+    app = dashboard.create_app(user_id=111, base_dir=str(tmp_path), work_config=lambda: config)
+    client = TestClient(app, base_url="http://127.0.0.1:8765")
+    assert client.get("/api/project/16/tasks?tab=DOCS").status_code == 200
+    assert seen == {"pid": 16, "code": "15033", "tab": "DOCS"}
+    assert client.get("/api/project/99/tasks").status_code == 404
+    assert client.get("/api/project/abc/tasks").status_code == 404
+    assert client.get("/api/work/config").json()["projects"] == [{"code": "15033", "id": 16, "name": "duell-admin"}]

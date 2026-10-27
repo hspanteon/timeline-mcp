@@ -4,6 +4,9 @@
 # Generated task exports may contain customer data
 timeline/
 
+# Planner snapshot database (task titles from Timeline)
+database/
+
 # Python virtualenvs
 .venv/
 venv/
