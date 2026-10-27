@@ -39,10 +39,10 @@ timeline/{task-id}/progress.md
 timeline/{task-id}/release-note.md   # if it exists
 ```
 
-If the folder does not exist, stop and say:
+If `timeline/{task-id}/analysis.md` does not exist, intake has not run (no folder, or only a fetched `task.md`). Stop and say:
 
 ```text
-No timeline folder found for task {task-id}. Run timeline-intake {task-id} first.
+No intake for task {task-id} yet. Run timeline-intake {task-id} first.
 ```
 
 ### Scope this release

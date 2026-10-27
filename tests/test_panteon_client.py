@@ -5,6 +5,8 @@ against a monkeypatched session.
 """
 from datetime import date
 
+import json
+
 import pytest
 import requests
 
@@ -301,6 +303,63 @@ class _FakeResponse:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class TestPollingHelpers:
+    PLANNER = [{"user_id": 7, "data": [{"issue_number": 1, "stage_status": "Dev", "task_status": "open", "deadline": "2026-11-01"}]}]
+
+    def test_fingerprint_changes_only_with_visible_fields(self):
+        base = pc.planner_fingerprint(self.PLANNER, 7)
+        assert base == pc.planner_fingerprint(self.PLANNER, 7)
+        other = [{"user_id": 7, "data": [{**self.PLANNER[0]["data"][0], "stage_status": "QA"}]}]
+        assert pc.planner_fingerprint(other, 7) != base
+        assert pc.planner_fingerprint(self.PLANNER, 99) != base  # user absent -> empty list
+
+    def test_known_periods_are_not_requested_again(self, monkeypatch):
+        asked = []
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period: asked.append(period) or [])
+        got = pc.fetch_all_planners({}, known={"now": self.PLANNER})
+        assert got["now"] is self.PLANNER and asked == ["next", "commingup"]
+
+    def test_pacing_spaces_out_requests(self, monkeypatch):
+        sleeps, clock = [], [100.0]
+        monkeypatch.setenv("PANTEON_MIN_REQUEST_GAP_MS", "200")
+        monkeypatch.setattr(pc, "_next_slot", 0.0)
+        monkeypatch.setattr(pc.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(pc.time, "sleep", sleeps.append)
+        for _ in range(3):
+            pc._pace()
+        assert sleeps == [pytest.approx(0.2), pytest.approx(0.4)]  # first goes at once
+
+
+class TestRequestLog:
+    def _lines(self):
+        files = list(pc.request_log_dir().glob("timeline-requests-*.jsonl"))
+        assert len(files) == 1
+        return [json.loads(line) for line in files[0].read_text().splitlines()]
+
+    def test_logs_status_and_duration_without_query_or_headers(self, monkeypatch):
+        monkeypatch.setattr(pc._SESSION, "get", lambda *a, **k: _FakeResponse(200))
+        pc._api_get("https://timeline.panteon.no/api/task/9/timeline?token=secret", {"Authorization": "Bearer s3cret"})
+        (entry,) = self._lines()
+        assert entry["method"] == "GET" and entry["path"] == "/api/task/9/timeline"
+        assert entry["status"] == 200 and isinstance(entry["ms"], int)
+        assert "secret" not in json.dumps(entry)
+
+    def test_logs_auth_failure_status(self, monkeypatch):
+        monkeypatch.setattr(pc._SESSION, "get", lambda *a, **k: _FakeResponse(401))
+        with pytest.raises(PermissionError):
+            pc._api_get("http://x/api/a", {})
+        assert self._lines()[0]["status"] == 401
+
+    def test_logs_connection_error(self, monkeypatch):
+        def boom(*a, **k):
+            raise requests.ConnectionError("down")
+        monkeypatch.setattr(pc._SESSION, "get", boom)
+        with pytest.raises(requests.ConnectionError):
+            pc._api_get("http://x/api/a", {})
+        entry = self._lines()[0]
+        assert entry["status"] is None and entry["error"] == "ConnectionError"
 
 
 class TestApiGet:
@@ -788,3 +847,14 @@ class TestTaskStatuses:
         assert "**By release state:** live 1 · in qa 1" in md
         assert "| #2 | In \\| QA | QA in progress | in progress | not started | in qa |" in md
         assert "| #3 | — | _not found_ |" in md
+
+
+def test_rendered_comment_heading_has_timeline_comment_id():
+    """A workflow points at one QA finding by Timeline's comment id, so task.md shows it."""
+    comments = pc.parse_conversation_comments([
+        {"id": 4242, "type": "task_comment", "employee": {"name": "Kari"}, "created_at": "2026-10-27 10:00",
+         "task_comment": {"description": "Total is wrong"}},
+    ])
+    assert comments[0]["id"] == 4242
+    md = pc.render_task_markdown("5001", {"title": "T", "description": "d"}, comments)
+    assert "### Kari — 2026-10-27 10:00 · comment id 4242" in md

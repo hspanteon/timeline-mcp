@@ -241,27 +241,51 @@ The service runs the code in this checkout. There is no build step: after editin
 | Board | Now / Next / Coming up columns with deadline flags (overdue, due soon), support tasks and stage rails |
 | Changes | New, removed, moved and changed tasks with the time they were detected, from the `database/timeline_task.db` snapshots; the dashboard checks the planner every 30 minutes (`--interval` or `TIMELINE_SNAPSHOT_MINUTES`), Refresh checks it immediately |
 | Release | Pending duell-admin PRs grouped by destination (into `qa-release` / into `master`): verdict (ready / needs notes / blocked), CI, Timeline stage, release-note problems, "not via QA" warnings, and each PR's description. "Check again" runs `git fetch` and the `gh` lookups (about 10 s) |
-| Task | Description and conversation of any task, with safe markdown rendering, and a "Start in Claude" button for planner tasks |
-| Work | The task worktrees "Start in Claude" made: size, uncommitted changes, commits that exist only there; Remove (worktree) or Remove + branch |
+| Task | Description and conversation of any task, with safe markdown rendering, and the task's **workflow** panel (see below) |
+| Work | The task worktrees the workflows made: size, uncommitted changes, commits that exist only there, the workflow's status; Remove (worktree) or Remove + branch |
 
-### Start in Claude
+### Task workflows
 
-The button on a board card (or **… in Claude** in the Task view) opens a terminal running an interactive Claude Code session for the task. What it does follows the task's Timeline stage:
+Each task can have a **workflow**: a fixed flow the desk tracks step by step, with Claude doing the work in a terminal and you deciding every move. Board cards, task rows and worktrees show a badge with where the workflow stands (`+ Workflow` when there is none); the task page has the panel.
 
-| Stage | Button | Session |
+```
+Intake → Estimate (optional) → Develop (one step per run) → Self-review → Release to QA
+  → Waiting on QA → Fix QA findings (one finding per run) → back to Waiting on QA … → Release to prod → Close
+```
+
+| Step | Skill (from this repo's `skills/`, by path) | Writes |
 |---|---|---|
-| RSD / Estimate not done | ▶ Spec | Writes `timeline/<id>/spec.md` (via `skills/task-spec`) in a task worktree, lists open questions, and stops. No code. |
-| Estimated / Development | ▶ Implement | Spec, then implements only if no stage is blocked and the spec has no open questions; otherwise it stops and lists them. |
-| Development, worktree exists | ▶ Resume | Reads the spec, the branch's commits and new comments, then continues. |
-| Development done, Testing / QA | ▶ Fix QA | Finds the testing/QA feedback in the conversation and fixes it on the task branch. |
-| Any stage blocked | ⏸ Blocked | Read only, in the main checkout: explains the blocker and drafts a question for the task thread. Posts nothing. |
-| QA done / Live | (none) | Remove the worktree from the Work tab. |
+| Intake | `timeline-intake` | `timeline/<id>/task.md`, `analysis.md`, `progress.md` |
+| Estimate | `timeline-estimate` | `analysis.md` Time Analysis |
+| Develop | `timeline-progress` work, phase dev (it hands the edit to the specialist skill) | code, one `progress.md` row and one local commit per run |
+| Self-review | `upgrade-verification` | `review.md` |
+| Release to QA | `timeline-release` qa | `release-note.md` section, `qa-plan.md` |
+| Waiting on QA | (your decision: QA found issues / QA approved) | — |
+| Fix QA findings | `timeline-progress` work, phase qa-fix | the fix, one `progress.md` row and one local commit per finding |
+| Release to prod | `timeline-release` prod | `release-note.md` section |
+| Close | (your decision) | — |
 
-The board label is a hint from the planner; on click the server re-reads the stage codes and picks the action (so Implement becomes Resume when a worktree already exists). Sessions commit locally to the task branch and never push, open PRs or merge. You approve their tool calls as usual.
+What you see and decide on the task page:
+
+- **Before a run:** the current step's skills, what it reads and writes, what it won't do, where it runs, what you'll be approving, and the exact prompt.
+- **Start**: suggested from Timeline's stages and the task docs (with the reason); steps before the one you pick are recorded as skipped.
+- **Run in terminal** opens Claude in the task's worktree with `--session-id`, so Claude still asks before every edit and command. Develop and Fix QA also stop to agree the plan (or which finding is a real bug) with you before editing, and do one item per run.
+- **Each run reports back** by writing `timeline/<id>/runs/<run>.result.json` (status, summary, files, commits, questions, what's left); the terminal writes `<run>.exit` when Claude exits. The page checks every 10 seconds while a run is open and shows the result, the prompt, and the conversation (read from Claude Code's own session log).
+- **Decisions**: Approve result, Reject (with a reason), Continue in terminal (`claude --resume` the same session), Finish step, Skip step (with a reason), Back to Develop, QA found issues / QA approved, Stop / Reopen, Close. **Reset…** erases the task's workflow and its `timeline/<id>/` folder after you type the task number (the worktree and branch stay). Only the buttons that apply right now are shown; the server checks every request against the same rules.
+- **History**: every run (prompt, session, result, your decision) and every decision with its time and reason stays in `database/timeline_task.db`, and the task docs list shows `timeline/<id>/` with each file readable on the page.
+
+Sessions commit locally to the task branch and never push, open PRs or merge. The prompt contains only the issue ID and fixed text; the session fetches the task itself and treats its text as data.
+
+More on the same page (see `docs/workflow-roadmap.md` §10 for details):
+
+- **Follows Timeline.** Workflow tasks are watched; stage changes, QA comments, deadlines and commits show as "New in Timeline" with the decision they suggest (outlined button). Nothing runs by itself. "Mark as seen" clears them. The **Workflows** tab lists every workflow by what it needs: you, Claude, QA, or nothing. Put `"me": "<your name as Timeline shows it>"` in `timeline-desk.json` so your own comments don't count.
+- **QA findings.** Each QA comment becomes a finding you mark Bug / Question / Not a bug / Won't fix (or add one in your own words). Fix QA findings fixes one Bug per run, pointing Claude at the comment by its id; a Question can get a drafted reply. A closed workflow can start a **prod fix** (Fix live bug → Release hotfix).
+- **Runs on the page.** Steps that only read code and write task docs (Intake, Estimate, Self-review, the release notes, Explain the blocker, reply drafts) run in the background with live output: limited tools, writes only under `timeline/<id>/`, Stop and Answer buttons. Code steps stay in the terminal.
+- **Approvals on the page** (optional): with the Claude Agent SDK installed (`.venv/bin/python -m pip install claude-agent-sdk`), any step can "Run here with approvals": every edit and command waits for Allow / Deny on the task page, and you can write to Claude there.
 
 - The worktree reuses an existing `<id>-…` branch (local or on GitHub), else creates `<id>-<title-slug>` from `origin/<base>`. Worktrees go to `<repo>-worktrees/<branch>`; one costs about 75 MB for duell-admin (git history is shared; dependencies aren't installed there).
-- The prompt contains only the issue ID. The session fetches the task itself and treats its text as data.
-- Set up boards once: `cp timeline-desk.example.json timeline-desk.json` and edit it (board/list id → repo path and base branch, the `claude` binary, the terminal; `gnome-terminal` by default). It's gitignored and re-read on every request. A board without a repo shows no button. If you installed `claude` with nvm, update the path after a Node upgrade.
+- The worktree's `timeline/` is a symlink to the main checkout's `timeline/`, so task docs are shared between sessions and survive removing the worktree. A real `timeline/` folder in an older worktree is merged into the main checkout the next time the workflow uses it (identical files dropped, differing ones left in place with a note). `/timeline` goes into the repo's `.git/info/exclude` when needed, because a `timeline/` gitignore line doesn't match a symlink.
+- Set up boards once: `cp timeline-desk.example.json timeline-desk.json` and edit it (board/list id → repo path and base branch, the `claude` binary, the terminal; `gnome-terminal` by default). It's gitignored and re-read on every request. A board without a repo shows no workflow badge, and its tasks can't start one. If you installed `claude` with nvm, update the path after a Node upgrade.
 - Clean up on the **Work** tab. Removal never forces: git keeps a worktree with uncommitted changes, and `git branch -d` keeps a branch with commits that aren't merged anywhere.
 
 The Release view needs a duell-admin checkout (`DUELL_ADMIN_DIR`, `--repo-dir`, or `../duell-admin` next to this repo) and `gh auth login`. It only reads: `git fetch/log/rev-list` and `gh pr/release list`; it never merges, pushes, comments or creates releases. Release-note drafts, the QA-approval count and the translation/migration checks come from the `release-pr-check` skill.

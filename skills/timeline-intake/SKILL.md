@@ -26,7 +26,9 @@ timeline/{task-id}/progress.md
 
 Ask for a task ID when missing. Never guess a task ID.
 
-If `timeline/{task-id}/` already exists, stop and say so — hand off to `timeline-progress` rather than overwriting an in-flight task's files.
+If `timeline/{task-id}/analysis.md` already exists, intake has already run: stop and say so — hand off to `timeline-progress` rather than overwriting an in-flight task's files.
+
+A folder without `analysis.md` has not been through intake — a task fetch (the timeline MCP, the dashboard, `my-day`) or `task-spec` may have left `task.md` or `spec.md` there. Carry on: the fetch below refreshes `task.md`, read an existing `spec.md` as input for `analysis.md` and leave it in place, and never overwrite an existing `progress.md`.
 
 ## Input
 
@@ -62,7 +64,7 @@ Intake does not estimate. `timeline-estimate` owns every number in this repo —
 
 Leave `analysis.md`'s Time Analysis section as the not-estimated stub below. When the user wants a number, they run `timeline-estimate {task-id}`, which fills that section in.
 
-**Never invoke `timeline-estimate` from intake.** The dependency runs one way only: `timeline-estimate` calls intake when a task's folder is missing. Calling back would loop.
+**Never invoke `timeline-estimate` from intake.** The dependency runs one way only: `timeline-estimate` calls intake when a task has no `analysis.md`. Calling back would loop.
 
 ## task.md (only when not fetched via MCP)
 
@@ -231,6 +233,6 @@ NEXT: timeline-progress {task-id}
 
 - Do not implement code.
 - Do not create `release-note.md` or `qa-plan.md`.
-- Do not overwrite an existing timeline folder.
+- Do not overwrite a task that already has `analysis.md`, or an existing `progress.md`.
 - Do not invent acceptance criteria the description does not support — mark derived ones `[inferred]`.
 - Do not declare a schema change "new" without checking the live DB via `db-access`.

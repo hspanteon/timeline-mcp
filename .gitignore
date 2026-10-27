@@ -7,6 +7,9 @@ timeline/
 # Planner snapshot database (task titles from Timeline)
 database/
 
+# Daily Timeline request logs (see panteon_client.log_request)
+logs/
+
 # Python virtualenvs
 .venv/
 venv/

@@ -55,9 +55,6 @@ def test_slug_and_prompt():
     assert ws.branch_name("6034", "BUG: Cannot delete Course") == "6034-cannot-delete-course"
     assert ws.slugify("Søk på ordre") == "sk-pa-ordre"  # ascii only
     assert ws.slugify("!!!") == "task"
-    repo = {"name": "duell-admin", "base": "master"}
-    prompt = ws.build_prompt("6034", repo, "6034-x")
-    assert "#6034" in prompt and "`6034-x`" in prompt and "Never push" in prompt and ws.TASK_SPEC_SKILL in prompt
 
 
 def test_load_config_defaults(tmp_path):
@@ -72,86 +69,41 @@ def test_load_config_defaults(tmp_path):
         ws.load_config(str(cfg))
 
 
-def test_start_creates_then_reuses(setup):
+def test_worktree_created_then_reused(setup):
     cfg = setup["config"]
-    result = ws.start_session(cfg, "15033", "5001", "New report", launcher=setup["launcher"])
+    result = ws.worktree_for(cfg, "15033", "5001", "New report")
     path = os.path.join(cfg["repos"]["15033"]["worktrees"], "5001-new-report")
-    assert result == {"path": path, "branch": "5001-new-report", "created": True, "repo": "duell-admin",
-                      "action": "implement", "label": "Implement"}
+    assert result == {"path": path, "branch": "5001-new-report", "created": True, "repo": "duell-admin"}
     assert os.path.isfile(os.path.join(path, "a.txt"))
-    args, env = setup["launched"][0]
-    assert args[0] == "gnome-terminal" and f"--working-directory={path}" in args
-    assert args[-3:-1] == [path, "/opt/node/bin/claude"] and "#5001" in args[-1]
-    assert "New report" not in args[-1]  # task text never goes into the prompt
-    assert env["PATH"].startswith("/opt/node/bin" + os.pathsep)
-
-    again = ws.start_session(cfg, "15033", "5001", "Renamed", launcher=setup["launcher"])
-    assert again["created"] is False and again["path"] == path and again["action"] == "resume"
-    assert "Resume" in setup["launched"][-1][0][-1]
+    again = ws.worktree_for(cfg, "15033", "5001", "Renamed")
+    assert again["created"] is False and again["path"] == path
 
 
-def stages(**progress):
-    base = {label: "not started" for label in ("RSD", "Estimate", "Development", "Testing", "QA", "Live")}
-    return {**base, **progress}
-
-
-@pytest.mark.parametrize("progress, action", [
-    ({}, "spec"),
-    ({"RSD": "in progress"}, "spec"),
-    ({"RSD": "done", "Estimate": "done"}, "implement"),
-    ({"Estimate": "skipped"}, "implement"),
-    ({"Development": "in progress"}, "implement"),
-    ({"Development": "done"}, "qa"),
-    ({"Development": "done", "Testing": "done", "QA": "in progress"}, "qa"),
-    ({"Development": "done", "QA": "done"}, "done"),
-    ({"QA": "done", "Live": "done"}, "done"),
-    ({"Development": "in progress", "Testing": "blocked"}, "blocked"),
-])
-def test_choose_action(progress, action):
-    assert ws.choose_action(stages(**progress)) == action
-    assert ws.choose_action(None) == "spec"
-
-
-def test_start_by_stage(setup):
-    cfg, launched = setup["config"], setup["launched"]
-    spec = ws.start_session(cfg, "15033", "5003", "Spec me", stages=stages(), launcher=setup["launcher"])
-    assert spec["action"] == "spec" and spec["created"] is True
-    assert "don't implement" in launched[-1][0][-1]
-
-    qa = ws.start_session(cfg, "15033", "6034", "x", stages=stages(Development="done", QA="in progress"), launcher=setup["launcher"])
-    assert qa["action"] == "qa" and qa["branch"] == "6034-existing"
-    assert "QA feedback" in launched[-1][0][-1] and "Never push" in launched[-1][0][-1]
-
-    blocked = ws.start_session(cfg, "15033", "5004", "x", stages=stages(Development="blocked"), launcher=setup["launcher"])
-    assert blocked["action"] == "blocked" and blocked["branch"] is None and blocked["path"] == cfg["repos"]["15033"]["path"]
-    assert "read only" in launched[-1][0][-1]
-    assert not any(i["issue_id"] == "5004" for i in ws.list_worktrees(cfg))  # no worktree for a blocked task
-
-    count = len(launched)
-    with pytest.raises(ValueError, match="passed QA"):
-        ws.start_session(cfg, "15033", "5005", "x", stages=stages(QA="done"), launcher=setup["launcher"])
-    assert len(launched) == count
-
-
-def test_start_reuses_remote_branch(setup):
-    result = ws.start_session(setup["config"], "15033", "6034", "Whatever", launcher=setup["launcher"])
+def test_worktree_reuses_remote_branch(setup):
+    result = ws.worktree_for(setup["config"], "15033", "6034", "Whatever")
     assert result["branch"] == "6034-existing" and result["created"] is True
     assert os.path.isfile(os.path.join(result["path"], "b.txt"))
     assert git(result["path"], "rev-parse", "--abbrev-ref", "@{u}").strip() == "origin/6034-existing"
 
 
-def test_start_validates(setup):
+def test_worktree_validates(setup):
     with pytest.raises(ValueError, match="no repo"):
-        ws.start_session(setup["config"], "999", "5001", "x", launcher=setup["launcher"])
+        ws.worktree_for(setup["config"], "999", "5001", "x")
     with pytest.raises(ValueError, match="number"):
-        ws.start_session(setup["config"], "15033", "50; rm", "x", launcher=setup["launcher"])
-    assert setup["launched"] == []
+        ws.worktree_for(setup["config"], "15033", "50; rm", "x")
+
+
+def test_terminal_command_passes_args_and_exit_file(setup):
+    args = ws.terminal_command(setup["config"], "/w", "#1", ["--session-id", "abc", "the prompt"], "/w/x.exit")
+    assert args[0] == "gnome-terminal" and "--working-directory=/w" in args
+    assert args[-6:] == ["/w", "/w/x.exit", "/opt/node/bin/claude", "--session-id", "abc", "the prompt"]
+    assert ws.launch_env(setup["config"])["PATH"].startswith("/opt/node/bin" + os.pathsep)
 
 
 def test_list_and_remove(setup):
     cfg = setup["config"]
-    clean = ws.start_session(cfg, "15033", "5001", "Clean one", launcher=setup["launcher"])["path"]
-    work = ws.start_session(cfg, "15033", "5002", "Work one", launcher=setup["launcher"])["path"]
+    clean = ws.worktree_for(cfg, "15033", "5001", "Clean one")["path"]
+    work = ws.worktree_for(cfg, "15033", "5002", "Work one")["path"]
     (setup["repo"].parent / "duell-admin-worktrees" / "5002-work-one" / "c.txt").write_text("c\n")
 
     items = {i["issue_id"]: i for i in ws.list_worktrees(cfg)}
@@ -176,6 +128,51 @@ def test_list_and_remove(setup):
         ws.remove_worktree(cfg, str(setup["repo"]))  # never the main checkout
 
 
+def test_worktree_timeline_links_to_main_checkout(setup):
+    cfg, repo = setup["config"], setup["repo"]
+    path = ws.worktree_for(cfg, "15033", "5001", "New report")["path"]
+    link = os.path.join(path, "timeline")
+    assert os.path.islink(link) and os.path.realpath(link) == os.path.realpath(repo / "timeline")
+    (repo / "timeline" / "5001").mkdir()
+    (repo / "timeline" / "5001" / "analysis.md").write_text("plan\n")
+    assert open(os.path.join(link, "5001", "analysis.md")).read() == "plan\n"  # same files on both sides
+
+    # git ignores the link (a `timeline/` gitignore line alone wouldn't), so the worktree stays clean
+    assert git(path, "status", "--porcelain") == ""
+    assert {i["issue_id"]: i for i in ws.list_worktrees(cfg)}["5001"]["dirty"] == 0
+    excluded = open(repo / ".git" / "info" / "exclude").read()
+    ws.worktree_for(cfg, "15033", "5001", "New report")
+    assert open(repo / ".git" / "info" / "exclude").read() == excluded  # added once
+
+    # removing the worktree drops the link, never the task docs
+    ws.remove_worktree(cfg, path)
+    assert not os.path.exists(path) and (repo / "timeline" / "5001" / "analysis.md").read_text() == "plan\n"
+
+
+def test_old_worktree_timeline_is_merged(setup):
+    cfg, repo = setup["config"], setup["repo"]
+    path = ws.worktree_for(cfg, "15033", "5001", "x")["path"]
+    os.remove(os.path.join(path, "timeline"))  # a worktree from before the link existed
+    old = os.path.join(path, "timeline", "5001")
+    os.makedirs(old)
+    for name, text in {"spec.md": "spec\n", "task.md": "same\n", "progress.md": "mine\n"}.items():
+        with open(os.path.join(old, name), "w") as fh:
+            fh.write(text)
+    (repo / "timeline" / "5001").mkdir(parents=True)
+    (repo / "timeline" / "5001" / "task.md").write_text("same\n")
+    (repo / "timeline" / "5001" / "progress.md").write_text("theirs\n")
+
+    result = ws.worktree_for(cfg, "15033", "5001", "x")
+    assert "5001/progress.md" in result["note"] and not os.path.islink(os.path.join(path, "timeline"))
+    assert (repo / "timeline" / "5001" / "spec.md").read_text() == "spec\n"  # moved over
+    assert sorted(os.listdir(old)) == ["progress.md"]  # identical task.md dropped, the clash kept
+
+    os.remove(os.path.join(old, "progress.md"))
+    result = ws.worktree_for(cfg, "15033", "5001", "x")
+    assert "note" not in result and os.path.islink(os.path.join(path, "timeline"))
+    assert (repo / "timeline" / "5001" / "progress.md").read_text() == "theirs\n"
+
+
 # ---- dashboard endpoints ------------------------------------------------
 @pytest.fixture
 def client(setup, monkeypatch, tmp_path):
@@ -189,13 +186,10 @@ def client(setup, monkeypatch, tmp_path):
 
 def test_work_endpoints(client, setup):
     assert client.get("/api/work/config").json() == {"boards": {"15033": "duell-admin"}, "projects": []}
-    assert client.post("/api/work/start", json={"issue": "5001", "code": "15033"}).status_code == 403
+    assert client.post("/api/work/start", json={"issue": "5001", "code": "15033"}).status_code in (404, 405)  # gone
 
     h = {"X-Timeline-Desk": "1"}
-    started = client.post("/api/work/start", json={"issue": "5001", "code": "15033"}, headers=h).json()
-    assert started["branch"] == "5001-from-timeline" and started["action"] == "implement" and len(setup["launched"]) == 1
-    assert client.post("/api/work/start", json={"issue": "404", "code": "15033"}, headers=h).status_code == 404
-    assert client.post("/api/work/start", json={"issue": "5001", "code": "1"}, headers=h).status_code == 400
+    ws.worktree_for(setup["config"], "15033", "5001", "From Timeline")
 
     listed = client.get("/api/work/worktrees").json()["worktrees"]
     assert [w["branch"] for w in listed] == ["5001-from-timeline"]
