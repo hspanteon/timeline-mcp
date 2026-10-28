@@ -14,8 +14,12 @@ Examples:
 """
 import argparse
 import os
+import random
 import re
 import threading
+import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import requests
@@ -31,6 +35,7 @@ from starlette.staticfiles import StaticFiles
 # Importing panteon_client loads the .env next to it (see panteon_client.py).
 import panteon_client
 import release_check
+import task_events
 import work_session
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
@@ -39,9 +44,50 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOSTNAME = "timeline.localhost"
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", HOSTNAME]
 MAX_STATUS_IDS = 100
-# How often the planner is fetched and recorded (besides at startup). Only
-# real changes add a row to the database, so a short interval stays cheap.
-DEFAULT_SNAPSHOT_MINUTES = 30
+# Polling is tiered so it feels live without spikes. Every HEARTBEAT the `now`
+# planner period (1 request) and the watched tasks' timelines (1 each) are read;
+# the full planner check (3 periods) runs when the heartbeat sees `now` change, or
+# at least every DEFAULT_SNAPSHOT_MINUTES. Stage lookups (1 request per task) run
+# only when something changed, or every STAGE_REFRESH_MINUTES. Outside the active
+# hours (weekdays, TIMELINE_ACTIVE_HOURS "7-19"; "all" turns it off) there is one
+# full check per OFF_HOURS_MINUTES.
+DEFAULT_HEARTBEAT_MINUTES = 3
+DEFAULT_SNAPSHOT_MINUTES = 15
+STAGE_REFRESH_MINUTES = 60
+OFF_HOURS_MINUTES = 60
+DEFAULT_ACTIVE_HOURS = "7-19"
+JITTER = 0.1
+
+
+PLANNER_CACHE_SECONDS = 300
+
+
+class PlannerCache:
+    """The latest raw planner ({period: planner}) kept in memory, so opening or
+    refreshing a page reads it instead of calling Timeline again. The scheduler
+    keeps it current; the Refresh button forces a new fetch."""
+
+    def __init__(self, ttl: float = PLANNER_CACHE_SECONDS, clock: Callable[[], float] = time.monotonic):
+        self.ttl, self.clock = ttl, clock
+        self.lock = threading.Lock()
+        self.data: Optional[Dict[str, Any]] = None
+        self.at = 0.0
+
+    def get(self, fetch: Callable[[], Dict[str, Any]], force: bool = False) -> Dict[str, Any]:
+        with self.lock:
+            if force or self.data is None or self.clock() - self.at >= self.ttl:
+                self.data, self.at = fetch(), self.clock()
+            return self.data
+
+    def put(self, planners: Dict[str, Any]) -> None:
+        with self.lock:
+            self.data, self.at = planners, self.clock()
+
+    def update(self, period: str, planner: Any) -> None:
+        """Replaces one period (a heartbeat's fresh `now`) without making the rest look fresher."""
+        with self.lock:
+            if self.data is not None:
+                self.data = {**self.data, period: planner}
 
 
 class _FreshStaticFiles(StaticFiles):
@@ -54,6 +100,10 @@ class _FreshStaticFiles(StaticFiles):
 
 
 STORAGE_NAME = re.compile(r"[A-Za-z0-9_-]+\.(?:jpe?g|png|gif|webp)")
+IMAGE_TYPES = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+# Timeline names these files after a timestamp and never rewrites them, so a copy
+# is good forever: browsers keep it for a year and the server keeps one on disk.
+IMMUTABLE = {"Cache-Control": "private, max-age=31536000, immutable"}
 
 
 def _respond(call: Callable[[], Any]) -> JSONResponse:
@@ -85,6 +135,7 @@ def create_app(
     work_config: Callable[[], Dict[str, Any]] = work_session.load_config,
     work_runner: Any = None,
     work_launcher: Any = None,
+    planner_cache: Optional[PlannerCache] = None,
 ) -> Starlette:
     """
     Builds the app. `user_id` and `base_dir` work as in fetch_my_day;
@@ -96,6 +147,8 @@ def create_app(
     git_kwargs = {"runner": work_runner} if work_runner else {}
     start_kwargs = {**git_kwargs, **({"launcher": work_launcher} if work_launcher else {})}
     release = {"report": None, "lock": threading.Lock()}
+    planners = planner_cache or PlannerCache()
+    image_dir = Path(panteon_client.planner_db_path(base_dir)).parent / "images"
 
     def headers():
         return panteon_client.build_api_headers()
@@ -107,8 +160,9 @@ def create_app(
         return FileResponse(os.path.join(WEB_DIR, "index.html"), headers={"Cache-Control": "no-cache"})
 
     def api_planner(request: Request):
+        force = request.query_params.get("refresh") == "1"
         return _respond(lambda: panteon_client.planner_overview(
-            panteon_client.fetch_all_planners(headers()), resolved_user()
+            planners.get(lambda: panteon_client.fetch_all_planners(headers()), force), resolved_user()
         ))
 
     def api_changes(request: Request):
@@ -162,16 +216,26 @@ def create_app(
             name = request.path_params["name"]
             if not STORAGE_NAME.fullmatch(name):
                 return JSONResponse({"error": "Not found."}, status_code=404)
+            cached = image_dir / folder / name
+            if cached.is_file():
+                return Response(cached.read_bytes(), media_type=IMAGE_TYPES[name.rsplit(".", 1)[1].lower()], headers=IMMUTABLE)
+            url = f"{panteon_client.BASE_URL}/storage/{folder}/{name}"
             try:
-                upstream = requests.get(f"{panteon_client.BASE_URL}/storage/{folder}/{name}",
-                                        timeout=10, allow_redirects=False)
+                upstream = panteon_client.timed_request(
+                    "GET", url, lambda: requests.get(url, timeout=10, allow_redirects=False))
             except requests.RequestException:
                 return JSONResponse({"error": "Image unavailable."}, status_code=502)
             content_type = upstream.headers.get("content-type", "").split(";")[0]
             if upstream.status_code != 200 or not content_type.startswith("image/") or "svg" in content_type:
                 return JSONResponse({"error": "Not found."}, status_code=404)
-            return Response(upstream.content, media_type=content_type,
-                            headers={"Cache-Control": "private, max-age=86400"})
+            try:  # best effort: a failed write only means asking Timeline again next time
+                cached.parent.mkdir(parents=True, exist_ok=True)
+                temp = cached.with_name(f".{name}.{os.getpid()}.tmp")
+                temp.write_bytes(upstream.content)
+                temp.replace(cached)
+            except OSError:
+                pass
+            return Response(upstream.content, media_type=content_type, headers=IMMUTABLE)
         return proxy
 
     def api_release(request: Request):
@@ -254,8 +318,59 @@ def create_app(
             return work_session.remove_worktree(work_config(), path, bool(body.get("delete_branch")), **git_kwargs)
         return await run_in_threadpool(_respond, remove)
 
+    def api_events(request: Request):
+        params = request.query_params
+        split = lambda key: [v for v in params.get(key, "").replace(",", " ").split() if v]
+        return _respond(lambda: {
+            **task_events.list_events(base_dir, split("issues"), split("kinds"),
+                                      int(params.get("limit") or 200), params.get("before") or None),
+            "watchlist": task_events.list_watchlist(base_dir),
+        })
+
+    def api_events_sync(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        return _respond(lambda: task_events.sync_watchlist(headers(), base_dir))
+
+    async def api_watch(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        body = await json_body(request)
+
+        def watch():
+            issue = str(body.get("issue") or "").strip()
+            if not issue.isdigit():
+                raise ValueError("Issue ID must be a number.")
+            # Only the user's own open tasks can be watched.
+            task = task_events.find_my_open_task(issue, headers(), work_session.public_config(work_config())["projects"],
+                                                 resolved_user())
+            if not task:
+                raise LookupError(f"Task #{issue} isn't one of your open tasks.")
+            task_events.watch_task(issue, task["code"], task["title"], base_dir)
+            return {"sync": task_events.sync_watchlist(headers(), base_dir, [issue]),
+                    "watchlist": task_events.list_watchlist(base_dir)}
+        return await run_in_threadpool(_respond, watch)
+
+    def api_unwatch(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+
+        def unwatch():
+            if not task_events.unwatch_task(request.path_params["issue"], base_dir):
+                raise LookupError("That task isn't being watched.")
+            return {"watchlist": task_events.list_watchlist(base_dir)}
+        return _respond(unwatch)
+
     routes = [
         Route("/", index),
+        Route("/api/events", api_events),
+        Route("/api/events/sync", api_events_sync, methods=["POST"]),
+        Route("/api/watchlist", lambda request: _respond(lambda: {"watchlist": task_events.list_watchlist(base_dir)})),
+        Route("/api/watchlist", api_watch, methods=["POST"]),
+        Route("/api/watchlist/{issue}", api_unwatch, methods=["DELETE"]),
         Route("/api/planner", api_planner),
         Route("/api/changes", api_changes),
         Route("/api/snapshot", api_snapshot, methods=["POST"]),
@@ -280,20 +395,55 @@ def create_app(
     return Starlette(routes=routes, middleware=middleware)
 
 
+def parse_active_hours(text: Optional[str]) -> Optional[tuple]:
+    """"7-19" -> (7, 19); "all"/"" -> None (always active)."""
+    text = (text or "").strip().lower()
+    if text in ("", "all", "always"):
+        return None
+    match = re.fullmatch(r"(\d{1,2})\s*-\s*(\d{1,2})", text)
+    if not match or not (0 <= int(match[1]) < int(match[2]) <= 24):
+        raise ValueError(f"Active hours must look like 7-19 or 'all', not {text!r}.")
+    return int(match[1]), int(match[2])
+
+
+def is_active(moment: datetime, hours: Optional[tuple]) -> bool:
+    return hours is None or (moment.weekday() < 5 and hours[0] <= moment.hour < hours[1])
+
+
 def run_snapshot_scheduler(
-    take_snapshot: Callable[[], Any],
+    take: Callable[..., Any],
     stop: threading.Event,
-    interval_seconds: float = DEFAULT_SNAPSHOT_MINUTES * 60,
+    heartbeat_seconds: float = DEFAULT_HEARTBEAT_MINUTES * 60,
+    full_seconds: float = DEFAULT_SNAPSHOT_MINUTES * 60,
+    stage_seconds: float = STAGE_REFRESH_MINUTES * 60,
+    off_hours_seconds: float = OFF_HOURS_MINUTES * 60,
+    active_hours: Optional[tuple] = None,
+    clock: Callable[[], float] = time.monotonic,
+    now: Callable[[], datetime] = datetime.now,
+    jitter: float = JITTER,
 ) -> None:
-    """Records a snapshot at startup, then every `interval_seconds`, until
-    `stop` is set. A failed attempt (offline, expired token) is logged and the
-    loop carries on with the next interval."""
+    """Calls `take(full=…, stages=…)` at startup and then every heartbeat (hourly
+    outside the active hours) until `stop` is set; each call says whether a full
+    planner check and stage lookups are due. `take` may return {"full", "stages"}
+    for what it actually did (a heartbeat that saw a change upgrades itself).
+    A failed attempt (offline, expired token) is logged and the loop carries on.
+    Waits are jittered so the calls never land on a fixed beat."""
+    last_full = last_stages = None
     while True:
+        active = is_active(now(), active_hours)
+        t = clock()
+        full = not active or last_full is None or t - last_full >= full_seconds
+        stages = active and (last_stages is None or t - last_stages >= stage_seconds)
         try:
-            take_snapshot()
+            done = take(full=full, stages=stages) or {"full": full, "stages": stages}
+            if done.get("full"):
+                last_full = t
+            if done.get("stages"):
+                last_stages = t
         except Exception as exc:  # keep the scheduler alive whatever fails
-            print(f"Planner snapshot failed: {exc}", flush=True)
-        if stop.wait(interval_seconds):
+            print(f"Planner check failed: {exc}", flush=True)
+        wait = heartbeat_seconds if active else off_hours_seconds
+        if stop.wait(wait * (1 + random.uniform(-jitter, jitter))):
             return
 
 
@@ -304,25 +454,54 @@ def main(argv=None) -> int:
     parser.add_argument("--repo-dir", default=None, help="duell-admin checkout for the Release view; defaults to DUELL_ADMIN_DIR, then ../duell-admin.")
     parser.add_argument("--base-dir", default=None, help="Where database/timeline_task.db (the planner snapshots) lives; defaults to PANTEON_TIMELINE_DIR or the current directory.")
     parser.add_argument("--interval", type=float, default=float(os.getenv("TIMELINE_SNAPSHOT_MINUTES") or DEFAULT_SNAPSHOT_MINUTES),
-                        help=f"Minutes between planner checks (default {DEFAULT_SNAPSHOT_MINUTES}, or TIMELINE_SNAPSHOT_MINUTES).")
+                        help=f"Most minutes between full planner checks (default {DEFAULT_SNAPSHOT_MINUTES}, or TIMELINE_SNAPSHOT_MINUTES).")
+    parser.add_argument("--heartbeat", type=float, default=float(os.getenv("TIMELINE_HEARTBEAT_MINUTES") or DEFAULT_HEARTBEAT_MINUTES),
+                        help=f"Minutes between cheap change checks (default {DEFAULT_HEARTBEAT_MINUTES}, or TIMELINE_HEARTBEAT_MINUTES).")
+    parser.add_argument("--active-hours", default=os.getenv("TIMELINE_ACTIVE_HOURS") or DEFAULT_ACTIVE_HOURS,
+                        help="Weekday hours to poll at the heartbeat, e.g. 7-19, or 'all' (default 7-19, or TIMELINE_ACTIVE_HOURS).")
     args = parser.parse_args(argv)
 
     import uvicorn
 
     print(f"Timeline desk: http://{HOSTNAME}:{args.port}  (or http://127.0.0.1:{args.port})", flush=True)
-    def take_snapshot():
-        result = panteon_client.fetch_my_planner_changes(
-            panteon_client.build_api_headers(),
-            user_id=panteon_client.resolve_user_id(args.user_id),
-            base_dir=args.base_dir,
-            save=True, with_stages=True,
-        )
-        print(f"{result['snapshot']['taken_at']} planner checked: {len(result['snapshot']['tasks'])} tasks", flush=True)
+    last_now = {"fingerprint": None}
+
+    planner_cache = PlannerCache()
+
+    def take_snapshot(full: bool, stages: bool) -> Dict[str, bool]:
+        headers = panteon_client.build_api_headers()
+        user = panteon_client.resolve_user_id(args.user_id)
+        known = {}
+        if not full:  # heartbeat: one request decides whether the rest is worth making
+            known["now"] = panteon_client.get_priority_tasks(headers, "now")
+            planner_cache.update("now", known["now"])
+            if panteon_client.planner_fingerprint(known["now"], user) != last_now["fingerprint"]:
+                full = stages = True
+        if full:
+            planners = panteon_client.fetch_all_planners(headers, known)
+            result = panteon_client.fetch_my_planner_changes(
+                headers, user_id=user, base_dir=args.base_dir, save=True, with_stages=stages, planners=planners)
+            planner_cache.put(planners)
+            last_now["fingerprint"] = panteon_client.planner_fingerprint(planners["now"], user)
+            print(f"{result['snapshot']['taken_at']} planner checked: {len(result['snapshot']['tasks'])} tasks"
+                  + (" (with stages)" if stages else ""), flush=True)
+        try:
+            synced = task_events.sync_watchlist(headers, args.base_dir, refresh_meta=full)
+            if synced["new_events"] or synced["errors"]:
+                print(f"watchlist synced: {synced['tasks']} tasks, {synced['new_events']} new events"
+                      + (f", errors: {synced['errors']}" if synced["errors"] else ""), flush=True)
+        except Exception as exc:  # the planner check above already succeeded
+            print(f"Watchlist sync failed: {exc}", flush=True)
+        return {"full": full, "stages": stages}
 
     stop = threading.Event()
-    threading.Thread(target=run_snapshot_scheduler, args=(take_snapshot, stop, max(args.interval, 1) * 60), daemon=True).start()
+    threading.Thread(target=run_snapshot_scheduler, args=(take_snapshot, stop), daemon=True, kwargs={
+        "heartbeat_seconds": max(args.heartbeat, 1) * 60,
+        "full_seconds": max(args.interval, args.heartbeat, 1) * 60,
+        "active_hours": parse_active_hours(args.active_hours),
+    }).start()
     try:
-        uvicorn.run(create_app(args.user_id, args.base_dir, args.repo_dir), host="127.0.0.1", port=args.port, log_level="warning")
+        uvicorn.run(create_app(args.user_id, args.base_dir, args.repo_dir, planner_cache=planner_cache), host="127.0.0.1", port=args.port, log_level="warning")
     finally:
         stop.set()
     return 0

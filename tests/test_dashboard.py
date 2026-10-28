@@ -1,6 +1,6 @@
 """Dashboard data helpers and HTTP layer. No network: the client is monkeypatched."""
 import json
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 import requests
@@ -115,6 +115,40 @@ class TestPlannerHistory:
         assert [c["diff"]["removed"][0]["issue_number"] for c in pc.planner_history(135, str(tmp_path))["changes"]] == [1]
 
 
+class TestPlannerCache:
+    def test_serves_from_memory_until_expired_or_forced(self):
+        clock, calls = [0.0], []
+        cache = dashboard.PlannerCache(ttl=300, clock=lambda: clock[0])
+        fetch = lambda: calls.append(1) or {"now": len(calls)}
+        assert cache.get(fetch) == {"now": 1} and cache.get(fetch) == {"now": 1}
+        clock[0] = 299
+        assert cache.get(fetch) == {"now": 1}
+        clock[0] = 301
+        assert cache.get(fetch) == {"now": 2}
+        assert cache.get(fetch, force=True) == {"now": 3}
+
+    def test_update_swaps_one_period_without_refreshing_the_age(self):
+        clock = [0.0]
+        cache = dashboard.PlannerCache(ttl=300, clock=lambda: clock[0])
+        cache.put({"now": "a", "next": "b"})
+        clock[0] = 250
+        cache.update("now", "c")
+        assert cache.data == {"now": "c", "next": "b"}
+        clock[0] = 301
+        assert cache.get(lambda: {"fresh": True}) == {"fresh": True}
+
+
+class TestPlannerEndpointCaching:
+    def test_page_loads_do_not_call_timeline_again(self, client, monkeypatch):
+        calls, planners = [], _planners({"now": [_task(1, 1)]})
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period: calls.append(period) or planners[period])
+        for _ in range(3):
+            assert client.get("/api/planner").status_code == 200
+        assert len(calls) == 3                      # one fetch of the three periods, not three
+        client.get("/api/planner?refresh=1")
+        assert len(calls) == 6                      # Refresh forces a new one
+
+
 class TestDashboardHttp:
     def test_index_and_static(self, client):
         assert "Timeline desk" in client.get("/").text
@@ -185,6 +219,24 @@ class TestDashboardHttp:
         r = client.get("/api/attachment/image_1790233365.png")
         assert r.status_code == 200 and seen["url"] == f"{pc.BASE_URL}/storage/attachments/image_1790233365.png"
 
+    def test_images_are_fetched_once_then_served_from_disk(self, client, monkeypatch, tmp_path):
+        calls = []
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return type("R", (), {"status_code": 200, "content": b"PNGDATA", "headers": {"content-type": "image/png"}})()
+        monkeypatch.setattr(requests, "get", fake_get)
+        first = client.get("/api/attachment/image_1.png")
+        second = client.get("/api/attachment/image_1.png")
+        assert len(calls) == 1 and second.content == b"PNGDATA" and second.headers["content-type"] == "image/png"
+        assert "immutable" in second.headers["cache-control"] and "max-age=31536000" in first.headers["cache-control"]
+        assert (tmp_path / "database" / "images" / "attachments" / "image_1.png").read_bytes() == b"PNGDATA"
+
+    def test_failed_or_non_image_responses_are_not_stored(self, client, monkeypatch, tmp_path):
+        monkeypatch.setattr(requests, "get", lambda *a, **k: type("R", (), {
+            "status_code": 200, "content": b"<svg/>", "headers": {"content-type": "image/svg+xml"}})())
+        assert client.get("/api/photo/9.jpg").status_code == 404
+        assert not (tmp_path / "database" / "images").exists()
+
     @pytest.mark.parametrize("name", ["..%2Fsecret.jpg", "a.php", "x.jpg%00.png", "a b.jpg"])
     def test_photo_rejects_odd_names(self, client, monkeypatch, name):
         monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("must not fetch"))
@@ -214,19 +266,69 @@ class TestDashboardHttp:
 
 
 class TestSnapshotScheduler:
-    def test_checks_at_startup_then_every_interval_and_survives_failure(self):
+    WEEKDAY = datetime(2026, 10, 27, 10, 0)   # Tuesday 10:00
+    NIGHT = datetime(2026, 10, 27, 22, 0)
+    SATURDAY = datetime(2026, 10, 31, 10, 0)
+
+    def run(self, now, stops_after, **kw):
         import threading
-        calls = []
-        stop = threading.Event()
+        calls, stop, ticks = [], threading.Event(), [0.0]
 
-        def take():
-            calls.append(1)
-            if len(calls) == 3:
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == stops_after:
                 stop.set()
-            raise RuntimeError("offline")
+            raise RuntimeError("offline")  # errors are swallowed
 
-        dashboard.run_snapshot_scheduler(take, stop, interval_seconds=0)
-        assert len(calls) == 3  # errors swallowed, loop kept going until stopped
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         off_hours_seconds=0, clock=lambda: ticks[0], now=lambda: now, jitter=0, **kw)
+        return calls
+
+    def test_full_and_stages_at_startup_then_heartbeats_until_due(self):
+        calls = self.run(self.WEEKDAY, 6)
+        # a failed attempt doesn't count as done, so every call stays a full one while offline
+        assert len(calls) == 6 and all(full for full, _ in calls)
+
+    def test_heartbeat_only_between_full_checks(self):
+        import threading
+        stop, ticks, calls = threading.Event(), [0.0], []
+
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == 6:
+                stop.set()
+
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         clock=lambda: ticks[0], now=lambda: self.WEEKDAY, jitter=0)
+        assert calls == [(True, True), (False, False), (False, False), (False, False), (True, False), (False, False)]
+
+    def test_an_upgraded_heartbeat_resets_the_full_timer(self):
+        import threading
+        stop, ticks, calls = threading.Event(), [0.0], []
+
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == 5:
+                stop.set()
+            return {"full": True, "stages": True} if len(calls) == 2 else None
+
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         clock=lambda: ticks[0], now=lambda: self.WEEKDAY, jitter=0)
+        assert calls == [(True, True), (False, False), (False, False), (False, False), (False, False)]
+
+    def test_outside_active_hours_every_check_is_full_without_stages(self):
+        for moment in (self.NIGHT, self.SATURDAY):
+            calls = self.run(moment, 2, active_hours=(7, 19))
+            assert calls == [(True, False), (True, False)]
+
+    def test_parse_active_hours(self):
+        assert dashboard.parse_active_hours("7-19") == (7, 19)
+        assert dashboard.parse_active_hours("all") is None and dashboard.parse_active_hours("") is None
+        with pytest.raises(ValueError):
+            dashboard.parse_active_hours("19-7")
 
 
 # ---- project task list -----------------------------------------------------

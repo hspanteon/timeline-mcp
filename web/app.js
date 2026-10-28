@@ -6,7 +6,7 @@ const STAGE_SHORT = ["RSD", "Est", "Dev", "Test", "QA", "Live"];
 
 const view = document.getElementById("view");
 const meta = document.getElementById("meta");
-const cache = { planner: null, statuses: new Map(), boards: null, projects: null, projectTasks: new Map() };
+const cache = { watched: new Set(), planner: null, statuses: new Map(), boards: null, projects: null, projectTasks: new Map() };
 
 // ---- helpers --------------------------------------------------------------
 function h(tag, attrs, ...children) {
@@ -204,7 +204,7 @@ async function loadStatuses(ids) {
 
 // ---- board ----------------------------------------------------------------
 async function getPlanner(force) {
-  if (!cache.planner || force) cache.planner = await api("/api/planner");
+  if (!cache.planner || force) cache.planner = await api(force ? "/api/planner?refresh=1" : "/api/planner");
   const p = cache.planner;
   const now = p.periods.now.tasks.length;
   meta.textContent = `User ${p.user_id} · ${niceDate(p.today)} · ${now} task${now === 1 ? "" : "s"} now`;
@@ -257,10 +257,10 @@ const periodLabel = (p) => PERIOD_LABEL[p] || p || "—";
 
 // What happened, in the order people care about. Colour is kept for deadlines only.
 const CHANGE_KINDS = [
-  { key: "added", label: "New", short: "New", icon: "+" },
-  { key: "removed", label: "Left the planner", short: "Left", icon: "−" },
-  { key: "moved", label: "Moved", short: "Moved", icon: "⇄" },
-  { key: "changed", label: "Changed", short: "Changed", icon: "✎" },
+  { key: "added", label: "New", short: "New", icon: "M12 5v14M5 12h14" },
+  { key: "removed", label: "Left the planner", short: "Left", icon: "M5 12h14" },
+  { key: "moved", label: "Moved", short: "Moved", icon: "M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7" },
+  { key: "changed", label: "Changed", short: "Changed", icon: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" },
 ];
 
 const chip = (text, tone, title) => h("span", { class: `chip ${tone || ""}`, title: title || null }, text);
@@ -293,23 +293,20 @@ function spanText(from, to) {
 
 const RELEASE_LABEL = { "before qa": "Before QA", "in qa": "In QA", "qa blocked": "QA blocked", "qa approved": "QA approved", live: "Live" };
 
-// One "before → after" line; the old value is struck through, the new one bold.
-function deltaLine(name, before, after) {
-  return h("div", { class: "delta" },
-    h("span", { class: "field" }, name),
-    h("span", { class: "was" }, before || "—"),
-    h("span", { class: "arrow" }, "→"),
-    h("span", { class: "now" }, after || "—"));
-}
-
-function fieldChange([name, before, after]) {
-  const show = (v) => (name === "deadline" && v ? niceDate(v) : v);
-  return deltaLine(name, show(before), show(after));
+// One "field: before → after" row, as pills (same look as the Timeline tab).
+function pairRow(name, before, after) {
+  return h("div", { class: "tl-change" },
+    h("span", { class: "tl-field" }, name),
+    h("span", { class: "tl-pill was" }, before || "—"),
+    h("span", { class: "tl-arrow", "aria-hidden": "true" }, "→"),
+    h("span", { class: "tl-pill now" }, after || "—"));
 }
 
 let changeBoards = {};
 
-function changeItem(task, kind, at) {
+// `first` puts the detection time in the left column; later cards of the same
+// check leave it out. `fresh` marks entries found since the last visit.
+function changeCard(task, kind, at, first, fresh) {
   let facts;
   if (kind.key === "removed") {
     facts = [h("span", { class: "note" }, `was in ${periodLabel(task.period)} · ${task.stage_status || "no stage"}`)];
@@ -329,17 +326,22 @@ function changeItem(task, kind, at) {
     facts.push(h("span", { class: "note" },
       `on your planner for ${task.since_tracking_start ? "at least " : ""}${onPlanner}`));
   }
-  const details = kind.key === "changed" ? task.changes.map(fieldChange)
-    : kind.key === "moved" ? [deltaLine("period", periodLabel(task.from), periodLabel(task.to))] : [];
-  return h("li", { class: "item" },
-    h("div", { class: "item-head" },
-      h("span", { class: "kind" }, h("b", { "aria-hidden": "true" }, kind.icon), kind.short),
-      h("a", { href: `#/task/${task.issue_number}` }, h("span", { class: "issue" }, `#${task.issue_number}`)),
-      h("span", { class: "item-title" }, task.title || ""),
-      task.url ? h("a", { class: "ext", href: task.url, target: "_blank", rel: "noopener noreferrer", title: "Open in Timeline" }, "↗") : null),
-    details.length ? h("div", { class: "deltas" }, details) : null,
-    task.stages && kind.key !== "removed" ? h("div", { class: "stages" }, rail({ stages: task.stages }), railKey()) : null,
-    h("div", { class: "facts" }, facts));
+  const show = (name, v) => (name === "deadline" && v ? niceDate(v) : v);
+  const rows = kind.key === "changed" ? task.changes.map(([name, before, after]) => pairRow(name, show(name, before), show(name, after)))
+    : kind.key === "moved" ? [pairRow("period", periodLabel(task.from), periodLabel(task.to))] : [];
+  return h("li", { class: `tl-event ${kind.key}${fresh ? " fresh" : ""}`, style: taskStyle(task.issue_number) },
+    first ? h("time", { class: "tl-when", datetime: at, title: niceTime(at) }, h("b", {}, clock(at)), h("small", {}, ago(at))) : null,
+    h("span", { class: "tl-node", "aria-hidden": "true" }, svgIcon(kind.icon, 15)),
+    h("article", { class: "tl-card" },
+      h("header", {},
+        h("span", { class: `tl-kindtag ${kind.key}` }, kind.short),
+        h("a", { class: "tl-task", href: `#/task/${task.issue_number}`, style: taskStyle(task.issue_number), title: task.title || "" },
+          h("b", {}, `#${task.issue_number}`), task.title ? h("span", {}, task.title) : null),
+        task.url ? h("a", { class: "ext", href: task.url, target: "_blank", rel: "noopener noreferrer", title: "Open in Timeline" }, "↗") : null,
+        fresh ? h("span", { class: "tl-new" }, "since your last visit") : null),
+      rows.length ? h("div", { class: "tl-rows" }, rows) : null,
+      task.stages && kind.key !== "removed" ? h("div", { class: "stages" }, rail({ stages: task.stages }), railKey()) : null,
+      h("div", { class: "facts" }, facts)));
 }
 
 function ago(iso) {
@@ -388,64 +390,58 @@ async function showChanges(quiet = false, check = false) {
   }
   const [history, boards] = await Promise.all([api("/api/changes"), getBoards()]);
   changeBoards = boards || {};
-  const status = h("span", { class: "note", id: "snapshot-status" },
-    checkError || (history.last_checked ? `Last checked ${niceTime(history.last_checked)} (${ago(history.last_checked)})` : ""));
 
-  // Totals for the last 24 hours double as filters.
+  // Totals for the last 24 hours double as the counts on the filters.
   const dayAgo = Date.now() - 24 * 3600 * 1000;
   const recent = history.changes.filter((e) => new Date(e.taken_at).getTime() >= dayAgo);
   const total = (list, key) => list.reduce((n, e) => n + e.diff[key].length, 0);
-  const filters = h("div", { class: "filters", role: "group", "aria-label": "Filter changes" },
-    h("button", { type: "button", class: "filter", "aria-pressed": String(changesFilter === "all"),
-      onclick: () => { changesFilter = "all"; showChanges(true); } }, "All"),
-    CHANGE_KINDS.map((k) => h("button", { type: "button", class: `filter ${k.key}`,
-      "aria-pressed": String(changesFilter === k.key),
-      title: "Last 24 hours",
-      onclick: () => { changesFilter = changesFilter === k.key ? "all" : k.key; showChanges(true); } },
-      h("b", { "aria-hidden": "true" }, k.icon), `${k.label} `, h("span", { class: "count" }, total(recent, k.key)))));
+  const recentTotal = CHANGE_KINDS.reduce((n, k) => n + total(recent, k.key), 0);
 
-  const unseen = (e) => changesSeenAt && e.taken_at > changesSeenAt;
-  // One section per day (the main level); inside it, one row per detection time.
-  const days = new Map();
+  const tile = (value, label, sub) => h("div", { class: "tl-tile" }, h("b", {}, value), h("span", {}, label), sub ? h("small", {}, sub) : null);
+  const summary = h("section", { class: "tl-summary", "aria-label": "Summary" },
+    tile(recentTotal, "changes in 24 h"),
+    tile(history.tracking_since ? niceDate(history.tracking_since.slice(0, 10)) : "—", "tracking since",
+      history.tracking_since ? clock(history.tracking_since) : "press Refresh"),
+    tile(history.last_checked ? clock(history.last_checked) : "—", "last checked", history.last_checked ? ago(history.last_checked) : ""),
+    checkError ? h("div", { class: "tl-tile bad" }, h("b", {}, "!"), h("span", {}, checkError)) : null);
+
+  const pick = (key) => { changesFilter = key; showChanges(true); };
+  const filters = h("div", { class: "tl-kinds", role: "group", "aria-label": "Filter changes" },
+    h("button", { type: "button", class: "tl-kind", "aria-pressed": String(changesFilter === "all"), onclick: () => pick("all") }, "All"),
+    CHANGE_KINDS.map((k) => h("button", { type: "button", class: `tl-kind ${k.key}`, "aria-pressed": String(changesFilter === k.key),
+      title: "Counts are for the last 24 hours", onclick: () => pick(changesFilter === k.key ? "all" : k.key) },
+      svgIcon(k.icon, 14), k.label, h("span", { class: "tl-n" }, total(recent, k.key)))));
+
+  const unseen = (e) => Boolean(changesSeenAt) && e.taken_at > changesSeenAt;
+  // One section per day; inside it, one card per task, the time on the first card of each check.
+  const feed = h("ol", { class: "tl-feed" });
+  let day = null, any = false;
   for (const entry of history.changes) {
     const items = CHANGE_KINDS
       .filter((k) => changesFilter === "all" || changesFilter === k.key)
       .flatMap((k) => entry.diff[k.key].map((t) => ({ task: t, kind: k })));
     if (!items.length) continue;
+    any = true;
     const date = entry.taken_at.slice(0, 10);
-    if (!days.has(date)) days.set(date, []);
-    days.get(date).push({ entry, items });
-  }
-  // One continuous rail: a big marker per day, a dot per detection time.
-  const rail = (kind) => h("div", { class: "rail-col", "aria-hidden": "true" }, h("i", { class: `dot ${kind}` }));
-  const rows = [];
-  for (const [date, slots] of days) {
-    const count = slots.reduce((n, r) => n + r.items.length, 0);
-    rows.push(h("div", { class: "row day-row" },
-      h("div", { class: "when" }),
-      rail("day"),
-      h("h2", {}, niceDate(date), dayNote(date) ? h("span", { class: "today" }, dayNote(date)) : null,
-        h("small", {}, `${count} change${count === 1 ? "" : "s"}`))));
-    for (const { entry, items } of slots) {
-      rows.push(h("div", { class: "row slot" },
-        h("div", { class: "when" },
-          h("span", { class: "clock" }, clock(entry.taken_at)),
-          h("span", { class: "ago" }, ago(entry.taken_at))),
-        rail(unseen(entry) ? "unseen" : "time"),
-        h("ul", { class: "change" }, items.map(({ task, kind }) => changeItem(task, kind, entry.taken_at)))));
+    if (date !== day) {
+      day = date;
+      const count = history.changes.filter((e) => e.taken_at.startsWith(date))
+        .reduce((n, e) => n + CHANGE_KINDS.filter((k) => changesFilter === "all" || changesFilter === k.key)
+          .reduce((m, k) => m + e.diff[k.key].length, 0), 0);
+      feed.append(h("li", { class: "tl-day" }, h("h2", {}, niceDate(date), dayNote(date) ? h("em", {}, dayNote(date)) : null),
+        h("span", { class: "tl-count" }, `${count} change${count === 1 ? "" : "s"}`)));
     }
+    items.forEach(({ task, kind }, i) => feed.append(changeCard(task, kind, entry.taken_at, i === 0, unseen(entry))));
   }
-  const entries = rows.length ? h("div", { class: "timeline" }, rows) : null;
 
-  let intro;
+  let intro = null;
   if (!history.tracking_since) intro = "No snapshots yet. Press Refresh to start tracking.";
   else if (!history.changes.length) intro = `Tracking since ${niceTime(history.tracking_since)}. Nothing has changed yet; the planner is checked every few minutes.`;
-  else if (!entries) intro = "No changes of this kind. Pick another filter.";
-  put(view,
-    h("div", { class: "toolbar" }, status),
-    history.changes.length ? filters : null,
+  else if (!any) intro = "No changes of this kind. Pick another filter.";
+  put(view, h("div", { class: "tl-page" }, summary,
+    history.changes.length ? h("div", { class: "tl-controls" }, filters) : null,
     intro ? h("p", { class: "note" }, intro) : null,
-    entries);
+    any ? feed : null));
   if (history.changes.length) {
     try { localStorage.setItem("changesSeenAt", history.changes[0].taken_at); } catch { /* storage blocked */ }
   }
@@ -453,6 +449,286 @@ async function showChanges(quiet = false, check = false) {
   changesTimer = setTimeout(() => {
     if (location.hash === "#/changes") showChanges(true).catch(() => {});
   }, CHANGES_REFRESH_MS);
+}
+
+// ---- timeline (events of watched tasks) -------------------------------------
+const writeHeaders = { "X-Timeline-Desk": "1" };
+
+async function loadWatched() {
+  try {
+    const { watchlist } = await api("/api/watchlist");
+    cache.watched = new Set(watchlist.filter((w) => w.active).map((w) => String(w.issue_number)));
+  } catch { /* the button then offers Watch; the server decides */ }
+}
+
+// Watch / Unwatch toggle. Only your own open tasks can be watched (the server checks).
+function watchButton(issue) {
+  const id = String(issue);
+  const button = h("button", { type: "button", class: "watch" });
+  const draw = () => {
+    const on = cache.watched.has(id);
+    button.textContent = on ? "★" : "☆";
+    button.setAttribute("aria-pressed", String(on));
+    button.setAttribute("aria-label", `${on ? "Stop watching" : "Watch"} #${id}`);
+    button.title = on ? "Watching: its changes go to the Timeline. Click to stop." : "Add this task's changes to the Timeline";
+  };
+  draw();
+  button.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    button.disabled = true;
+    try {
+      if (cache.watched.has(id)) {
+        await api(`/api/watchlist/${id}`, { method: "DELETE", headers: writeHeaders });
+        cache.watched.delete(id);
+      } else {
+        await api("/api/watchlist", { method: "POST", headers: { ...writeHeaders, "Content-Type": "application/json" }, body: JSON.stringify({ issue: id }) });
+        cache.watched.add(id);
+      }
+    } catch (error) { toast(error.message, true); }
+    button.disabled = false;
+    draw();
+  });
+  return button;
+}
+
+// Event kinds: label, verb on the card, and the icon on the rail.
+const EVENT_KINDS = {
+  comment: { label: "Comments", verb: "commented", icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" },
+  status: { label: "Status", verb: "changed the status", icon: "M5 12h14M13 6l6 6-6 6" },
+  field: { label: "Fields", verb: "updated", icon: "M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" },
+  commit: { label: "Commits", verb: "committed", icon: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 12h6M15 12h6" },
+};
+// The last event types and task chosen on the Timeline page survive a reload (per browser).
+const FILTERS_KEY = "timeline-desk.timeline-filters";
+function loadFilters() {
+  const state = { issues: new Set(), kinds: new Set(["comment", "status", "field"]), q: "" };
+  try {
+    const saved = JSON.parse(localStorage.getItem(FILTERS_KEY) || "null");
+    if (saved && Array.isArray(saved.kinds)) state.kinds = new Set(saved.kinds.filter((k) => k in EVENT_KINDS));
+    if (saved && Array.isArray(saved.issues)) state.issues = new Set(saved.issues.map(String));
+  } catch (error) { /* storage blocked or unreadable: use the defaults */ }
+  return state;
+}
+function saveFilters() {
+  try {
+    localStorage.setItem(FILTERS_KEY, JSON.stringify({ kinds: [...eventsState.kinds], issues: [...eventsState.issues] }));
+  } catch (error) { /* storage blocked: the choice just won't be remembered */ }
+}
+const eventsState = loadFilters();
+let eventsToken = 0;
+
+function svgIcon(path, size = 16) {
+  return new DOMParser().parseFromString(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${path}"/></svg>`,
+    "image/svg+xml").documentElement;
+}
+
+// Each task gets its own hue, so a task is recognisable at a glance down the feed.
+const taskHue = (issue) => (Number(issue) * 137) % 360;
+const taskStyle = (issue) => `--hue: ${taskHue(issue)}`;
+
+function valueTone(text) {
+  if (/block|fail|reject/i.test(text)) return "bad";
+  if (/done|approved|live|complete|finish/i.test(text)) return "good";
+  if (/progress|testing|working/i.test(text)) return "warn";
+  return "";
+}
+
+function changePills(e) {
+  const dated = /deadline|date/i.test(e.field_name);
+  const show = (v) => (v ? (dated ? niceDate(v, false) : v) : "—");
+  const status = e.kind === "status";
+  return h("div", { class: "tl-change" },
+    status ? null : h("span", { class: "tl-field" }, e.field_name),
+    h("span", { class: `tl-pill was ${status ? valueTone(e.old_value || "") : ""}` }, show(e.old_value)),
+    h("span", { class: "tl-arrow", "aria-hidden": "true" }, "→"),
+    h("span", { class: `tl-pill now ${status ? valueTone(e.new_value || "") : ""}` }, show(e.new_value)));
+}
+
+function commentBody(e) {
+  const text = plainText(e.body);
+  if (!text) return h("p", { class: "note" }, "(no text)");
+  const box = h("div", { class: "tl-bubble clamped" }, richText(e.body));
+  const long = text.length > 320 || text.split("\n").length > 6;
+  if (!long) box.classList.remove("clamped");
+  const more = long ? h("button", { type: "button", class: "tl-more", "aria-expanded": "false",
+    onclick: () => {
+      const open = box.classList.toggle("clamped") === false;
+      more.textContent = open ? "Show less" : "Show more";
+      more.setAttribute("aria-expanded", String(open));
+    } }, "Show more") : null;
+  return h("div", {}, box, more);
+}
+
+function commitLine(e) {
+  const sha = e.url && (e.url.match(/\/commit\/([0-9a-f]{7,40})/i) || [])[1];
+  const message = plainText(e.body).replace(/^TL\s*#\d+\s*/i, "") || "Commit";
+  const safe = e.url && /^https:\/\//.test(e.url);
+  const code = sha ? h("code", { class: "tl-sha" }, sha.slice(0, 7)) : null;
+  return h("div", { class: "tl-commit" },
+    safe && code ? h("a", { href: e.url, target: "_blank", rel: "noopener noreferrer", title: "Open commit" }, code) : code,
+    h("span", { class: "tl-commit-msg" }, message));
+}
+
+function taskPill(e, tasks) {
+  const task = tasks[e.issue_number] || {};
+  return h("a", { class: "tl-task", href: `#/task/${e.issue_number}`, style: taskStyle(e.issue_number), title: task.title || "" },
+    h("b", {}, `#${e.issue_number}`), task.title ? h("span", {}, task.title) : null);
+}
+
+function eventCard(e, tasks) {
+  const kind = EVENT_KINDS[e.kind] || EVENT_KINDS.field;
+  const compact = e.kind === "commit" || e.kind === "field";
+  return h("li", { class: `tl-event ${e.kind}${compact ? " compact" : ""}`, style: taskStyle(e.issue_number) },
+    h("time", { class: "tl-when", datetime: e.occurred_at, title: niceTime(e.occurred_at) },
+      h("b", {}, e.occurred_at.slice(11, 16)), h("small", {}, ago(e.occurred_at))),
+    h("span", { class: "tl-node", "aria-hidden": "true" }, svgIcon(kind.icon, 15)),
+    h("article", { class: "tl-card" },
+      h("header", {},
+        avatar(e.employee, e.photo, e.employee),
+        h("span", { class: "tl-who" }, h("strong", {}, e.employee || "Someone"), ` ${kind.verb}`,
+          e.kind === "field" ? [" ", h("strong", {}, e.field_name)] : null),
+        taskPill(e, tasks)),
+      e.kind === "comment" ? commentBody(e) : e.kind === "commit" ? commitLine(e) : changePills(e)));
+}
+
+function eventMatches(e, tasks, q) {
+  if (!q) return true;
+  const hay = `${e.issue_number} ${(tasks[e.issue_number] || {}).title || ""} ${e.employee || ""} ${e.field_name} ${e.old_value || ""} ${e.new_value || ""} ${plainText(e.body)}`.toLowerCase();
+  return q.split(/\s+/).every((word) => hay.includes(word));
+}
+
+// Modal listing the watched tasks; "Stop watching" here pauses a task (its events stay).
+function openWatchlist(initial, onClose) {
+  const items = initial.slice();
+  const dialog = h("dialog", { class: "tl-dialog", "aria-label": "Watchlist" });
+  const list = h("ul", { class: "tl-watch-list" });
+  const close = () => dialog.close();
+  const draw = () => {
+    put(list, items.length ? items.map((w) => h("li", {},
+      h("span", { class: "tl-watch-task", style: taskStyle(w.issue_number) }, h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), h("span", {}, w.title || "")),
+      h("small", {}, `${w.events} events`),
+      h("button", { type: "button", class: "btn ghost small", onclick: async (ev) => {
+        ev.currentTarget.disabled = true;
+        try {
+          await api(`/api/watchlist/${w.issue_number}`, { method: "DELETE", headers: writeHeaders });
+          items.splice(items.indexOf(w), 1);
+          cache.watched.delete(String(w.issue_number));
+          eventsState.issues.delete(w.issue_number);
+          draw();
+        } catch (error) { ev.currentTarget.disabled = false; toast(error.message, true); }
+      } }, "Stop watching")))
+      : h("li", { class: "note" }, "No tasks are watched."));
+  };
+  draw();
+  put(dialog, h("header", {}, h("h2", {}, "Watchlist"), h("button", { type: "button", class: "tl-dialog-x", "aria-label": "Close", onclick: close }, "×")),
+    h("p", { class: "note" }, "Stopping a watch keeps the recorded events but no longer syncs the task."), list,
+    h("footer", {}, h("button", { type: "button", class: "btn", onclick: close }, "Done")));
+  dialog.addEventListener("click", (ev) => { if (ev.target === dialog) close(); });
+  dialog.addEventListener("close", () => { dialog.remove(); onClose(); });
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+async function showTimeline(force) {
+  const token = ++eventsToken;
+  loading(force ? "Syncing watched tasks…" : "Loading the timeline…");
+  if (force) {
+    try { await api("/api/events/sync", { method: "POST", headers: writeHeaders }); } catch (error) { toast(error.message, true); }
+  }
+  const query = (before) => {
+    const q = new URLSearchParams({ limit: "100", kinds: [...eventsState.kinds].join(",") });
+    if (eventsState.issues.size) q.set("issues", [...eventsState.issues].join(","));
+    if (before) q.set("before", before);
+    return api(`/api/events?${q}`);
+  };
+  const first = await query();
+  if (token !== eventsToken) return;
+  const active = first.watchlist.filter((w) => w.active);
+  cache.watched = new Set(active.map((w) => String(w.issue_number)));
+  // A remembered task that is no longer watched would leave the feed empty.
+  for (const issue of [...eventsState.issues]) if (!cache.watched.has(String(issue))) eventsState.issues.delete(issue);
+  const redraw = () => { saveFilters(); return showTimeline(false); };
+
+  // ---- summary tiles
+  const lastSync = active.map((w) => w.last_synced_at).filter(Boolean).sort().pop();
+  const totalEvents = active.reduce((n, w) => n + w.events, 0);
+  const tile = (value, label, sub) => h("div", { class: "tl-tile" }, h("b", {}, value), h("span", {}, label), sub ? h("small", {}, sub) : null);
+  const errors = active.filter((w) => w.last_error);
+  const summary = h("section", { class: "tl-summary", "aria-label": "Summary" },
+    tile(active.length, active.length === 1 ? "task watched" : "tasks watched"),
+    tile(totalEvents, "events recorded"),
+    tile(lastSync ? clock(lastSync) : "—", "last synced", lastSync ? ago(lastSync) : "press Refresh"),
+    errors.length ? h("div", { class: "tl-tile bad" }, h("b", {}, "!"), h("span", {}, errors.map((w) => `#${w.issue_number}: ${w.last_error}`).join(" · "))) : null);
+
+  // ---- filters
+  const kindFilters = h("div", { class: "tl-kinds", role: "group", "aria-label": "Event types" },
+    Object.entries(EVENT_KINDS).map(([key, k]) => h("button", { type: "button", class: `tl-kind ${key}`,
+      "aria-pressed": String(eventsState.kinds.has(key)),
+      title: key === "commit" ? "Commits linked to the task (hidden by default)" : null,
+      onclick: () => { if (eventsState.kinds.has(key)) eventsState.kinds.delete(key); else eventsState.kinds.add(key); redraw(); } },
+      svgIcon(k.icon, 14), k.label)));
+  const search = h("input", { type: "search", class: "tl-search", placeholder: "Search the loaded events…", "aria-label": "Search events", value: eventsState.q });
+  const chips = h("div", { class: "tl-chips", role: "group", "aria-label": "Filter by task" },
+    active.map((w) => h("span", { class: "tl-chip", style: taskStyle(w.issue_number) },
+      h("button", { type: "button", class: "tl-chip-main", "aria-pressed": String(eventsState.issues.has(w.issue_number)),
+        title: w.last_synced_at ? `Show only #${w.issue_number} (synced ${niceTime(w.last_synced_at)})` : `Show only #${w.issue_number}`,
+        onclick: () => {
+          const wasOn = eventsState.issues.has(w.issue_number);
+          eventsState.issues.clear();
+          if (!wasOn) eventsState.issues.add(w.issue_number);
+          redraw();
+        } },
+        h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), h("span", { class: "tl-chip-title" }, w.title || ""), h("small", {}, w.events)))));
+
+  // Watchlist dialog: the only place a task is removed from the watchlist.
+  const watchlistButton = h("button", { type: "button", class: "btn ghost", onclick: () => openWatchlist(active, redraw) }, "Watchlist");
+
+  // ---- feed
+  const loaded = [];
+  const tasks = {};
+  let cursor = null;
+  const feed = h("ol", { class: "tl-feed" });
+  const more = h("div", { class: "tl-footer" });
+  const empty = h("div", { class: "tl-empty" });
+  const render = () => {
+    const q = eventsState.q.trim().toLowerCase();
+    const rows = [];
+    let day = null, dayCount = 0, header = null;
+    const countFor = (date) => loaded.filter((e) => e.occurred_at.startsWith(date) && eventMatches(e, tasks, q)).length;
+    for (const e of loaded) {
+      if (!eventMatches(e, tasks, q)) continue;
+      const date = e.occurred_at.slice(0, 10);
+      if (date !== day) {
+        day = date;
+        rows.push(h("li", { class: "tl-day" }, h("h2", {}, niceDate(date), dayNote(date) ? h("em", {}, dayNote(date)) : null),
+          h("span", { class: "tl-count" }, `${countFor(date)} event${countFor(date) === 1 ? "" : "s"}`)));
+      }
+      rows.push(eventCard(e, tasks));
+    }
+    put(feed, rows);
+    put(empty, rows.length ? null : h("p", { class: "note" }, q ? "No loaded event matches your search." : "No events match these filters."));
+    put(more, cursor ? h("button", { type: "button", class: "btn ghost", onclick: async (ev) => {
+      ev.currentTarget.disabled = true;
+      try { add(await query(cursor)); } catch (error) { toast(error.message, true); }
+    } }, "Load older events") : (loaded.length ? h("p", { class: "note" }, "That's the whole history.") : null));
+  };
+  const add = (page) => { loaded.push(...page.events); Object.assign(tasks, page.tasks); cursor = page.next; render(); };
+  search.addEventListener("input", () => { eventsState.q = search.value; render(); });
+  add(first);
+
+  if (!active.length) {
+    put(view, h("div", { class: "tl-hero" },
+      h("div", { class: "tl-hero-star", "aria-hidden": "true" }, "★"),
+      h("h2", {}, "Nothing is being watched yet"),
+      h("p", {}, "Watch a task and every status change, comment, deadline edit and commit lands here, in time order, across all your tasks."),
+      h("a", { class: "btn", href: "#/task" }, "Pick tasks to watch")));
+    return;
+  }
+  put(view, h("div", { class: "tl-page" },
+    h("div", { class: "tl-head" }, summary, h("div", { class: "tl-controls" }, kindFilters, search, watchlistButton)),
+    chips, feed, empty, more));
 }
 
 // ---- release --------------------------------------------------------------
@@ -690,8 +966,18 @@ function hoursText(t) {
   return estimate > 0 ? `${fmt(spent)} / ${fmt(estimate)}h` : `${fmt(spent)}h`;
 }
 
+// The first few faces, then "+N" naming the rest, so a busy task can't spill into the next column.
+const MAX_FACES = 6;
+function people(subscribers) {
+  const shown = subscribers.slice(0, MAX_FACES), rest = subscribers.slice(MAX_FACES);
+  return h("span", { class: "people" },
+    shown.map((p) => avatar(p.name, p.photo, p.name)),
+    rest.length ? h("span", { class: "avatar more", title: rest.map((p) => p.name).join(", ") }, `+${rest.length}`) : null);
+}
+
 function taskRow(t, boards) {
   return h("a", { class: "trow", href: `#/task/${t.issue_number}` },
+    watchButton(t.issue_number),
     h("span", { class: "issue" }, `#${t.issue_number}`),
     h("div", { class: "ttitle" },
       h("span", { class: "tname" }, t.title),
@@ -700,7 +986,7 @@ function taskRow(t, boards) {
     h("span", { class: "stage" }, t.stage_status || "–"),
     h("span", { class: "tdue" }, t.deadline ? niceDate(t.deadline, false) : "–", flagBadge(t.deadline_flag)),
     h("span", { class: "thours" }, hoursText(t)),
-    h("span", { class: "people" }, t.subscribers.map((p) => avatar(p.name, p.photo, p.name))),
+    people(t.subscribers),
     h("span", { class: "tact" }, startButton(t.issue_number, t.code, boards, true, t.stage_status)));
 }
 
@@ -713,8 +999,9 @@ async function showTaskList(toolbar, refresh) {
   const project = projects.find((p) => p.id === listState.project) || projects[0];
   listState.project = project.id;
   const boards = await getBoards();
+  await loadWatched();
   const body = h("div", { class: "mytasks" });
-  put(view, toolbar, body);
+  put(view, body);
   const token = ++listToken;
 
   const draw = (data) => {
@@ -754,7 +1041,7 @@ async function showTaskList(toolbar, refresh) {
       summary.textContent = `${shown} of ${all.length} task${all.length === 1 ? "" : "s"}${late ? ` · ${late} overdue` : ""}`;
       put(listEl,
         shown ? h("div", { class: "trow thead", "aria-hidden": "true" },
-          h("span"), h("span", {}, "Task"), railKey(), h("span", {}, "Stage"), h("span", {}, "Due"), h("span", {}, "Hours"), h("span", {}, "People"), h("span")) : null,
+          h("span"), h("span"), h("span", {}, "Task"), railKey(), h("span", {}, "Stage"), h("span", {}, "Due"), h("span", {}, "Hours"), h("span", {}, "People"), h("span")) : null,
         groups.map((g) => {
           const id = `${data.tab}|${g.name}`;
           const details = h("details", { class: "tgroup", open: !listState.closed.has(id) },
@@ -769,12 +1056,15 @@ async function showTaskList(toolbar, refresh) {
     };
 
     put(body,
-      h("div", { class: "list-head" }, h("h2", {}, "My tasks"), projectPicker, summary),
+      h("div", { class: "list-head" },
+        h("div", { class: "list-title" }, h("h2", {}, "My tasks"), projectPicker, summary),
+        h("div", { class: "list-tools" },
+          h("div", { class: "filters" }, search, select("All tags", tagNames, "tag"), select("All stages", stageNames, "stage"),
+            h("label", { class: "check" }, overdue, " Overdue only")),
+          toolbar)),
       h("nav", { class: "subtabs", "aria-label": "Task tabs" }, data.tabs.map((t) => h("button", {
         type: "button", class: "subtab", "aria-current": t.name === data.tab ? "page" : null, onclick: () => load(t.name),
       }, t.name, h("span", { class: "count" }, t.count)))),
-      h("div", { class: "filters" }, search, select("All tags", tagNames, "tag"), select("All stages", stageNames, "stage"),
-        h("label", { class: "check" }, overdue, " Overdue only")),
       listEl);
     renderList();
   };
@@ -823,17 +1113,21 @@ async function showTask(issue, force) {
     .find((t) => String(t.issue_number) === String(task.issue_id));
   const link = planned && planned.url;
   const head = h("section", { class: "task-head" },
-    h("span", { class: "issue" }, `#${task.issue_id}`),
-    h("h2", {}, task.title || "(no title)"),
+    h("div", { class: "head-info" },
+    h("div", { class: "title-line" },
+      h("span", { class: "issue" }, `#${task.issue_id}`),
+      h("h2", {}, task.title || "(no title)")),
     h("div", { class: "facts" },
       status && !status.error ? h("span", {}, status.stage_status) : null,
       task.creator ? h("span", {}, `Created by ${task.creator}`) : null,
       task.created_date ? h("span", {}, niceDate(task.created_date, false)) : null,
       task.tags.length ? h("span", {}, `Tags: ${task.tags.join(", ")}`) : null,
       link ? h("a", { href: link, target: "_blank", rel: "noopener noreferrer" }, "Open in Timeline ↗") : null),
-    planned ? startButton(task.issue_id, planned.code, await getBoards(), false, (status && !status.error ? status.stage_status : planned.stage_status)) : null,
-    railKey(),
-    rail(status && !status.error ? status : null));
+    planned ? startButton(task.issue_id, planned.code, await getBoards(), false, (status && !status.error ? status.stage_status : planned.stage_status)) : null),
+    h("div", { class: "head-stages" },
+      toolbar,
+      railKey(),
+      rail(status && !status.error ? status : null)));
   const description = plainText(task.description);
   const copyIcon = () => new DOMParser().parseFromString(
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></svg>',
@@ -856,7 +1150,7 @@ async function showTask(issue, force) {
     plainText(c.description) ? richText(c.description) : h("p", { class: "note" }, "(no text)"),
     c.author && c.author === task.creator ? "task creator" : null, plainText(c.description), c.photo));
   put(view,
-    toolbar, head,
+    head,
     h("h3", { class: "task-section" }, "Description"),
     h("ol", { class: "comments" }, post(task.creator, task.created_date ? niceDate(task.created_date, false) : "",
       description ? richText(task.description) : h("p", { class: "note" }, "No description."), "task creator", description, photos.get(task.creator))),
@@ -874,6 +1168,7 @@ async function route(force) {
   }
   try {
     if (name === "changes") await showChanges(false, force);
+    else if (name === "timeline") await showTimeline(force);
     else if (name === "release") await showRelease(force);
     else if (name === "work") await showWork();
     else if (name === "task") await showTask(arg ? decodeURIComponent(arg) : "", force);

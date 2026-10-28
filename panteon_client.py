@@ -1,12 +1,16 @@
 import base64
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
+import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load the .env sitting next to this module, so credentials resolve regardless of
@@ -27,6 +31,73 @@ DEFAULT_COMPANY_ID = "16"
 # Reused across calls for connection pooling.
 _SESSION = requests.Session()
 
+# Spaces out the start of Timeline API calls (across all threads), so a burst such
+# as one planner check turns into a steady trickle instead of a spike.
+# PANTEON_MIN_REQUEST_GAP_MS overrides the gap; 0 turns it off.
+DEFAULT_REQUEST_GAP_MS = 200
+_pace_lock = threading.Lock()
+_next_slot = 0.0
+
+
+def _pace() -> None:
+    global _next_slot
+    raw = os.environ.get("PANTEON_MIN_REQUEST_GAP_MS")
+    gap = (float(raw) if raw not in (None, "") else DEFAULT_REQUEST_GAP_MS) / 1000
+    if gap <= 0:
+        return
+    with _pace_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_slot - now)
+        _next_slot = max(now, _next_slot) + gap
+    if wait:
+        time.sleep(wait)
+
+
+def request_log_dir() -> Path:
+    """Folder for the daily request logs: PANTEON_REQUEST_LOG_DIR, else `logs/` next to
+    this module, so the MCP server, CLI and dashboard all write to the same place."""
+    return Path(os.environ.get("PANTEON_REQUEST_LOG_DIR") or Path(__file__).resolve().parent / "logs")
+
+
+def log_request(method: str, url: str, status: Optional[int], started: float, error: str = "") -> None:
+    """
+    Appends one JSON line (time, process, method, path, status, duration in ms) to
+    `<log dir>/timeline-requests-YYYY-MM-DD.jsonl`, to count Timeline requests per
+    day. Only the URL path is logged (no query, headers or credentials). Never raises.
+    """
+    try:
+        now = datetime.now()
+        path = url.split("://", 1)[-1].partition("/")[2].partition("?")[0]
+        entry = {
+            "time": now.isoformat(timespec="milliseconds"),
+            "source": Path(sys.argv[0]).name or "python",
+            "pid": os.getpid(),
+            "method": method,
+            "path": "/" + path,
+            "status": status,
+            "ms": round((time.perf_counter() - started) * 1000),
+        }
+        if error:
+            entry["error"] = error
+        log_dir = request_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / f"timeline-requests-{now.date().isoformat()}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def timed_request(method: str, url: str, send: Callable[[], requests.Response]) -> requests.Response:
+    """Runs `send()` and logs the request's status and duration (see `log_request`)."""
+    started = time.perf_counter()
+    try:
+        response = send()
+    except Exception as exc:
+        log_request(method, url, None, started, error=type(exc).__name__)
+        raise
+    log_request(method, url, response.status_code, started)
+    return response
+
 # Markdown image: ![alt](src)  and  HTML image: <img src="...">
 # Shared by extract_images (src only) and absolutize_markdown_images (alt + src,
 # to rewrite in place) so the two never drift apart.
@@ -40,7 +111,8 @@ def _api_get(url: str, headers: Dict[str, str], *, context: str = "") -> request
     and uniform authentication-error handling. `context` is appended to the
     auth-error message (e.g. " when fetching task 5461").
     """
-    response = _SESSION.get(url, headers=headers, timeout=30)
+    _pace()
+    response = timed_request("GET", url, lambda: _SESSION.get(url, headers=headers, timeout=30))
     if response.status_code in (401, 403):
         raise PermissionError(
             f"Authentication failed (HTTP {response.status_code}){context}. "
@@ -952,6 +1024,41 @@ def _open_planner_db(base_dir: Optional[str], create: bool) -> Optional[sqlite3.
         _import_json_snapshots(conn, planner_snapshot_dir(base_dir))
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 2:
+        # Per-task event history (see task_events.py): the tasks being watched
+        # and every Timeline event fetched for them, keyed by Timeline's own id.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                issue_number TEXT PRIMARY KEY,
+                task_id INTEGER,
+                code TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                added_at TEXT NOT NULL,
+                last_synced_at TEXT,
+                last_error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                employee TEXT,
+                photo TEXT,
+                body TEXT,
+                url TEXT,
+                raw TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS task_events_time ON task_events (occurred_at, id);
+            CREATE INDEX IF NOT EXISTS task_events_issue ON task_events (issue_number, occurred_at);
+            """
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
     return conn
 
 
@@ -1249,9 +1356,28 @@ def fetch_my_planner_changes(
     }
 
 
-def fetch_all_planners(headers: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
-    """One request per planner period: {period: raw planner}. Blocking I/O."""
-    return {period: get_priority_tasks(headers, period) for period in PLANNER_PERIODS}
+def fetch_all_planners(
+    headers: Dict[str, str],
+    known: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """One request per planner period: {period: raw planner}. Periods already
+    fetched can be passed in `known` and are not requested again. Blocking I/O."""
+    known = known or {}
+    return {period: known[period] if period in known else get_priority_tasks(headers, period)
+            for period in PLANNER_PERIODS}
+
+
+def planner_fingerprint(planner: List[Dict[str, Any]], user_id: Any) -> str:
+    """A short hash of one user's tasks in one planner period (issue, order, stages,
+    status, deadline): equal fingerprints mean nothing visible there changed, so a
+    one-request check can decide whether the full set of calls is worth making."""
+    try:
+        tasks = extract_user_priority_tasks(planner, user_id)
+    except LookupError:
+        tasks = []
+    rows = [[t.get("issue_number"), t.get("stage_status"), t.get("task_status"), t.get("deadline"), bool(t.get("support"))]
+            for t in tasks]
+    return hashlib.sha1(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def fetch_my_day(
@@ -1392,7 +1518,9 @@ def fetch_project_tasks(
     body: Dict[str, Any] = {"subscribed_by": resolve_user_id(user_id), "tag_id": 0, "status": "open"}
     if tab:
         body["tab_name"] = tab
-    response = _SESSION.post(f"{BASE_URL}/api/project/{project_id}/tasks", headers=headers, json=body, timeout=30)
+    url = f"{BASE_URL}/api/project/{project_id}/tasks"
+    _pace()
+    response = timed_request("POST", url, lambda: _SESSION.post(url, headers=headers, json=body, timeout=30))
     if response.status_code in (401, 403):
         raise PermissionError(
             f"Authentication failed (HTTP {response.status_code}) when fetching project {project_id} tasks. "
