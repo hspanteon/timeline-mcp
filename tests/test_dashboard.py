@@ -151,7 +151,9 @@ class TestPlannerEndpointCaching:
 
 class TestDashboardHttp:
     def test_index_and_static(self, client):
-        assert "Timeline desk" in client.get("/").text
+        page = client.get("/").text
+        assert "<title>Timeline Desk · Panteon</title>" in page and "/static/favicon.svg" in page
+        assert client.get("/static/favicon.svg").headers["content-type"].startswith("image/svg")
         assert client.get("/static/app.js").status_code == 200
 
     def test_accepts_timeline_localhost(self, tmp_path):

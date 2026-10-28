@@ -1647,10 +1647,12 @@ async function showWorkflows() {
 async function route(force) {
   const [, rawName = "planner", arg] = (location.hash || "#/planner").split("/");
   const name = rawName === "board" ? "planner" : rawName; // old #/board links keep working
+  let label = "Planner";
   for (const tab of document.querySelectorAll(".tabs a")) {
-    if (tab.dataset.view === name) tab.setAttribute("aria-current", "page");
+    if (tab.dataset.view === name) { tab.setAttribute("aria-current", "page"); label = tab.textContent; }
     else tab.removeAttribute("aria-current");
   }
+  document.title = `${name === "task" && /^\d+$/.test(arg || "") ? `${label} #${arg}` : label} · Timeline Desk`;
   try {
     if (name === "changes") await showChanges(false, force);
     else if (name === "timeline") await showTimeline(force);
