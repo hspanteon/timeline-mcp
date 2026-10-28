@@ -361,9 +361,9 @@ def release_state(stages: Dict[str, Optional[int]]) -> str:
 def extract_task_status(raw_task: Dict[str, Any], issue_id: str) -> Dict[str, Any]:
     """
     Pulls the workflow status out of an API-1 (taskbyissue) response:
-    {"issue_id", "title", "task_status", "stage_status", "stages", "release_state",
-    "qa_approved"}. `stages` maps each TASK_STAGES label to its progress word.
-    `qa_approved` is true once QA is done (or the task is already live).
+    {"issue_id", "title", "project_id", "task_status", "stage_status", "stages",
+    "release_state", "qa_approved"}. `stages` maps each TASK_STAGES label to its
+    progress word. `qa_approved` is true once QA is done (or the task is already live).
     """
     data = raw_task.get("data") if isinstance(raw_task.get("data"), dict) else raw_task
     data = data or {}
@@ -372,6 +372,7 @@ def extract_task_status(raw_task: Dict[str, Any], issue_id: str) -> Dict[str, An
     return {
         "issue_id": str(issue_id),
         "title": data.get("title") or data.get("name") or "",
+        "project_id": data.get("project_id"),
         "task_status": data.get("task_status") or "",
         "stage_status": data.get("stage_status") or "",
         "stages": {

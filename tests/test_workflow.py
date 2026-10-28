@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime
 
 import pytest
@@ -43,14 +44,10 @@ def setup(tmp_path):
     }))
     launched = []
     base = tmp_path / "desk"
-    stopped = []
     base.mkdir()
     return {
         "tmp": tmp_path, "repo": repo, "config": ws.load_config(str(config_file)), "base": str(base),
         "launched": launched, "launcher": lambda args, env: launched.append(args),
-        # A desk run "is running" while its pid is alive: this test process is.
-        "headless": lambda args, env: (launched.append(args), os.getpid())[1],
-        "stopped": stopped, "stopper": lambda pid: stopped.append(pid) or True,
     }
 
 
@@ -64,15 +61,14 @@ def view(setup, issue="5001", **kwargs):
     return wf.workflow_view(issue, setup["config"], setup["base"], **kwargs)
 
 
-def run(setup, issue="5001", stages=None, mode="terminal", **kwargs):
-    """Runs the current step; in a terminal unless `mode` says desk (or None: the step's own runner)."""
-    return wf.run_step(issue, setup["config"], setup["base"], stages, launcher=setup["launcher"],
-                       headless=setup["headless"], now=NOW, mode=mode, **kwargs)
+def run(setup, issue="5001", stages=None, **kwargs):
+    """Runs the current step in a (recorded) terminal."""
+    return wf.run_step(issue, setup["config"], setup["base"], stages, launcher=setup["launcher"], now=NOW, **kwargs)
 
 
 def prompt_of(args):
-    """The prompt in a recorded launch: after -p for a desk run, right after the claude binary for a terminal."""
-    return args[args.index("-p") + 1] if "-p" in args else args[args.index("/opt/node/bin/claude") + 1]
+    """The prompt in a recorded launch: right after the claude binary."""
+    return args[args.index("/opt/node/bin/claude") + 1]
 
 
 def flag(args, name):
@@ -83,14 +79,14 @@ REAL_SESSION_ALIVE = ws.session_alive  # the autouse fixture below replaces it
 
 
 @pytest.fixture(autouse=True)
-def environment(monkeypatch):
+def environment(monkeypatch, tmp_path):
     """
     Recorded launches start no process, so every terminal session counts as
-    alive unless a test says otherwise; and the Agent SDK counts as not
-    installed unless a test asks for it (the `agent` fixture).
+    alive unless a test says otherwise, and Claude's session logs are looked
+    for in an empty folder.
     """
     monkeypatch.setattr(wf.work_session, "session_alive", lambda session_id: True)
-    monkeypatch.setattr(wf.agent_runner, "available", lambda: False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "no-claude-home"))
 
 
 def decide(setup, kind, issue="5001", **kwargs):
@@ -150,8 +146,8 @@ def test_whole_flow(setup):
     wf.start_workflow("5001", "15033", "intake", "New report", cfg, setup["base"], now=NOW)
     v = view(setup)
     assert v["workflow"]["step"] == "intake" and v["workflow"]["branch"] == "5001-new-report"
-    assert kinds(v) == ["run", "run_terminal", "skip", "reset", "stop"] and "timeline/5001/runs/<run>.result.json" in v["prompt_preview"]
-    assert v["actions"][0]["label"] == "Run here"
+    assert kinds(v) == ["run", "skip", "reset", "stop"] and "timeline/5001/runs/<run>.result.json" in v["prompt_preview"]
+    assert v["actions"][0]["label"] == "Run in terminal"
     assert v["status"] == {"code": "needs_you", "label": "Intake · ready", "short": "Intake · ready"}
 
     # Intake: run, the terminal opens with our session id, the result comes back, you approve it
@@ -300,7 +296,7 @@ def test_bad_result_file_and_stop_reopen(setup):
         fh.write("{not json")
     v = view(setup)
     assert v["runs"][0]["status"] == "bad_result" and "can't be read" in v["runs"][0]["result"]["error"]
-    decide(setup, "stop", note="Waiting for the customer")
+    decide(setup, "stop")  # no reason asked
     assert view(setup)["status"]["label"] == "Stopped at Intake" and kinds(view(setup)) == ["reopen", "reset"]
     decide(setup, "reopen")
     assert view(setup)["workflow"]["state"] == "active"
@@ -415,7 +411,7 @@ def test_blocked_side_run(setup):
     add_events(setup, (7, "status", "Development in progress", "Development blocked", "PM"))
     v = view(setup)
     assert v["blocked"] == "Development blocked" and "explain_blocker" in kinds(v)
-    side = run(setup, side="unblock", mode=None)  # a side run works on the page
+    side = run(setup, side="unblock")
     assert "blocker.md" in prompt_of(setup["launched"][-1]) and "Read only" in prompt_of(setup["launched"][-1])
     report(setup, side)
     decide(setup, "approve", run_id=side["run_id"])
@@ -477,7 +473,7 @@ def test_question_reply_side_run(setup):
     f1 = view(setup)["findings"][0]["id"]
     wf.classify_finding("5001", f1, "question", setup["base"], setup["config"], note="Asks about rounding", now=NOW)
     assert view(setup)["findings"][0]["can_reply"]
-    side = run(setup, side="qa_reply", finding_id=f1, mode=None)
+    side = run(setup, side="qa_reply", finding_id=f1)
     assert f"replies/F{f1}.md" in prompt_of(setup["launched"][-1]) and "Don't post anything" in prompt_of(setup["launched"][-1])
     report(setup, side)
     decide(setup, "approve", run_id=side["run_id"])
@@ -512,176 +508,6 @@ def test_prod_fix_after_close(setup):
     assert view(setup)["workflow"]["state"] == "done"
 
 
-# ---- phase 4: read-only steps run on the page ------------------------------------
-def test_desk_run_live_output_answer_and_stop(setup):
-    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
-    started = run(setup, mode=None)  # Intake's own runner: the desk
-    args = setup["launched"][-1]
-    assert started["mode"] == "desk" and args[0] == "bash" and "-p" in args and "--output-format" in args
-    assert args[args.index("--session-id") + 1] == started["session_id"]
-    tools = args[args.index("--allowedTools") + 1:]
-    assert "Write(timeline/5001/**)" in tools and "Read" in tools and not any(x.startswith("Bash(git push") for x in tools)
-    assert wf.SKILLS_DIR in args and not any("dangerously" in a for a in args)
-    v = view(setup)
-    assert v["runs"][0]["mode"] == "desk" and v["runs"][0]["status"] == "running" and kinds(v) == ["stop_run", "reset", "stop"]
-
-    # Live output comes from the run's stream file
-    stream = os.path.join(started["path"], "timeline", "5001", "runs", f"{started['run_id']}.stream.jsonl")
-    with open(stream, "w") as fh:
-        fh.write(json.dumps({"type": "system", "subtype": "init"}) + "\n")
-        fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading task.md"}]}}) + "\n")
-    t = wf.read_transcript("5001", started["run_id"], setup["base"])
-    assert t["live"] and [i["text"] for i in t["items"]] == ["Reading task.md"]
-
-    # It stops for an answer: answer on the page, it carries on in the background
-    report(setup, started, status="needs_input", questions=["Which tenant?"])
-    v = view(setup)
-    assert kinds(v) == ["answer", "resume", "reject", "reset", "stop"]
-    with pytest.raises(ValueError, match="answer first"):
-        wf.answer_run("5001", started["run_id"], " ", setup["config"], setup["base"], headless=setup["headless"])
-    wf.answer_run("5001", started["run_id"], "Tenant 42", setup["config"], setup["base"], headless=setup["headless"], now=NOW)
-    args = setup["launched"][-1]
-    assert args[args.index("--resume") + 1] == started["session_id"] and "append" in args
-    assert prompt_of(args).startswith("Tenant 42") and "result.json again" in prompt_of(args)
-    v = view(setup)
-    assert v["runs"][0]["status"] == "running" and "Which tenant?" in v["events"][0]["note"] and "Tenant 42" in v["events"][0]["note"]
-
-    wf.stop_run("5001", started["run_id"], setup["config"], setup["base"], stopper=setup["stopper"], now=NOW)
-    v = view(setup)
-    assert setup["stopped"] == [os.getpid()] and v["runs"][0]["status"] == "rejected" and v["events"][0]["kind"] == "stop_run"
-
-
-def test_desk_run_that_died_and_code_steps_stay_in_terminal(setup):
-    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    started = wf.run_step("5001", setup["config"], setup["base"], headless=lambda args, env: dead.pid, now=NOW)
-    v = view(setup)
-    assert v["runs"][0]["status"] == "no_result"  # gone without an exit file (e.g. the dashboard restarted)
-    decide(setup, "reject", run_id=started["run_id"], note="died")
-
-    (docs(setup) / "analysis.md").write_text("plan\n")
-    decide(setup, "skip", note="done")  # intake
-    decide(setup, "skip", note="no estimate")
-    with pytest.raises(ValueError, match="changes code"):
-        run(setup, mode="desk")
-    assert "run_terminal" not in kinds(view(setup))
-
-
-def test_desk_runs_are_capped(setup):
-    (docs(setup, "5002") / "analysis.md").write_text("plan\n")
-    for issue in ("5001", "5002", "5003"):
-        wf.start_workflow(issue, "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
-    run(setup, "5001", mode=None)
-    run(setup, "5002", mode=None)
-    with pytest.raises(ValueError, match="already working on the page"):
-        run(setup, "5003", mode=None)
-    run(setup, "5003")  # a terminal is always possible
-
-
-# ---- phase 5: runs inside the desk with approvals on the page ------------------------
-import time
-
-import agent_runner
-
-
-def wait_until(check, timeout=5.0):
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        if check():
-            return True
-        time.sleep(0.02)
-    raise AssertionError("timed out")
-
-
-async def fake_session(run):
-    """What a real session does here: say the plan, wait for the go-ahead, ask to edit, report back, stay open."""
-    run.emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Plan: change a.txt"}]}})
-    if await run.next_message() is None:
-        return
-    allowed, note = await run.ask("Edit", {"file_path": "a.txt", "old_string": "a", "new_string": "b"})
-    run.emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "edited" if allowed else f"denied: {note}"}]}})
-    with open(os.path.join(run.cwd, wf.result_file(run.issue, run.run_id)), "w") as fh:
-        json.dump({"status": "done", "summary": "edited" if allowed else "not edited"}, fh)
-    await run.next_message()
-
-
-@pytest.fixture
-def agent(monkeypatch):
-    monkeypatch.setattr(wf.agent_runner, "available", lambda: True)
-    monkeypatch.setattr(agent_runner, "POLL_SECONDS", 0.02)
-
-
-def test_agent_run_with_approvals_on_the_page(setup, agent):
-    (docs(setup) / "analysis.md").write_text("plan\n")
-    wf.start_workflow("5001", "15033", "develop", "x", setup["config"], setup["base"], now=NOW)
-    assert "run_agent" in kinds(view(setup))  # code steps can run here too, with every tool call approved
-    started = run(setup, mode="agent", agent_backend=fake_session)
-    v = view(setup)
-    assert v["runs"][0]["mode"] == "agent" and v["runs"][0]["live"] and kinds(v) == ["message", "stop_run", "reset", "stop"]
-    wait_until(lambda: any(i["text"] == "Plan: change a.txt" for i in wf.read_transcript("5001", started["run_id"], setup["base"])["items"]))
-
-    with pytest.raises(ValueError, match="message first"):
-        wf.message_run("5001", started["run_id"], " ", setup["config"], setup["base"])
-    wf.message_run("5001", started["run_id"], "Go ahead", setup["config"], setup["base"], now=NOW)
-    wait_until(lambda: view(setup)["runs"][0]["status"] == "approval")
-    v = view(setup)
-    assert v["status"]["code"] == "needs_you" and "approve" in v["status"]["short"]
-    request = v["permissions"][0]
-    assert request["status"] == "pending" and request["summary"] == "Edit: a.txt" and request["detail"]["new_string"] == "b"
-    with pytest.raises(ValueError, match="why"):
-        wf.decide_permission("5001", request["id"], False, setup["base"])
-    wf.decide_permission("5001", request["id"], True, setup["base"], now=NOW)
-    with pytest.raises(ValueError, match="isn't waiting"):
-        wf.decide_permission("5001", request["id"], True, setup["base"])
-    wait_until(lambda: view(setup)["runs"][0]["status"] == "review")
-    assert kinds(view(setup)) == ["approve", "reject", "message", "resume", "reset", "stop"]
-
-    decide(setup, "approve", run_id=started["run_id"])  # closes the session
-    wait_until(lambda: not agent_runner.running(started["run_id"]))
-    items = [(i["who"], i["text"]) for i in wf.read_transcript("5001", started["run_id"], setup["base"])["items"]]
-    assert ("you", "Go ahead") in items and ("desk", "You allowed: Edit: a.txt") in items and ("claude", "edited") in items
-    assert [e["kind"] for e in view(setup)["events"]][:3] == ["approve", "permission", "message"]
-
-
-def test_agent_run_stop_expires_requests_and_needs_the_sdk(setup, agent, monkeypatch):
-    (docs(setup) / "analysis.md").write_text("plan\n")
-    wf.start_workflow("5001", "15033", "develop", "x", setup["config"], setup["base"], now=NOW)
-    started = run(setup, mode="agent", agent_backend=fake_session)
-    wf.message_run("5001", started["run_id"], "Go ahead", setup["config"], setup["base"])
-    wait_until(lambda: view(setup)["runs"][0]["status"] == "approval")
-    wf.stop_run("5001", started["run_id"], setup["config"], setup["base"], now=NOW)
-    wait_until(lambda: not agent_runner.running(started["run_id"]))
-    v = view(setup)
-    assert v["runs"][0]["status"] == "rejected"
-    conn = pc._open_planner_db(setup["base"], create=False)
-    assert conn.execute("SELECT status FROM workflow_permissions").fetchone()[0] == "expired"
-
-    monkeypatch.setattr(wf.agent_runner, "available", lambda: False)
-    assert "run_agent" not in kinds(view(setup))
-    with pytest.raises(ValueError, match="can't"):
-        run(setup, mode="agent", agent_backend=fake_session)
-
-
-def test_agent_message_entry():
-    class TextBlock:
-        text = "hi"
-
-    class ToolUseBlock:
-        name, input = "Bash", {"command": "ls"}
-
-    class AssistantMessage:
-        content = [TextBlock(), ToolUseBlock()]
-
-    class ResultMessage:
-        subtype, session_id = "success", "s1"
-
-    assert agent_runner.message_entry(AssistantMessage()) == {"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "hi"}, {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}}
-    assert agent_runner.message_entry(ResultMessage())["type"] == "result"
-    assert agent_runner.tool_summary("Bash", {"command": "git status"}) == "Bash: git status"
-
-
 # ---- dashboard endpoints ------------------------------------------------
 @pytest.fixture
 def client(setup, monkeypatch):
@@ -692,9 +518,24 @@ def client(setup, monkeypatch):
         {"issue_id": i, "title": "From Timeline", "stages": stages.get(i, {})} if i != "404" else {"issue_id": i, "error": "not found"}
         for i in ids])
     app = dashboard.create_app(user_id=135, base_dir=setup["base"], work_config=lambda: setup["config"],
-                               work_launcher=setup["launcher"], work_headless=setup["headless"], work_stopper=setup["stopper"],
+                               work_launcher=setup["launcher"],
                                claude_home=str(setup["tmp"] / "claude-home"))
     return TestClient(app, base_url="http://127.0.0.1:8765")
+
+
+def test_view_finds_the_board_from_the_project(client, setup, monkeypatch):
+    # Opened by URL (no ?code=): Timeline's project id picks the board through the repo ids.
+    monkeypatch.setattr(pc, "get_task_statuses", lambda ids, headers: [
+        {"issue_id": i, "title": "T", "project_id": {"5001": 16, "5002": 99}.get(i), "stages": {}} for i in ids])
+    v = client.get("/api/workflow/5001").json()
+    assert v["code"] is None and not v["startable"] and "project id 16" in v["start_note"]  # no repo has an id yet
+    setup["config"]["repos"]["15033"]["id"] = 16
+    v = client.get("/api/workflow/5001").json()
+    assert v["code"] == "15033" and v["startable"] and v["repo"] == "duell-admin"
+    v = client.get("/api/workflow/5002").json()
+    assert not v["startable"] and "project id 99" in v["start_note"]
+    assert ws.board_for_project({"repos": {"1": {"id": 16}, "2": {"id": 16}}}, 16) is None  # ambiguous
+    assert ws.board_for_project(setup["config"], "16") == "15033"
 
 
 def test_workflow_endpoints(client, setup):
@@ -750,47 +591,6 @@ def test_finding_endpoints(client, setup):
     assert v["runs"][0]["status"] == "running" and f"F{fid}" in v["events"][0]["note"]
 
 
-def test_desk_endpoints(client, setup):
-    h = {"X-Timeline-Desk": "1"}
-    client.post("/api/workflow/5001/start", json={"code": "15033", "step": "intake"}, headers=h)
-    v = client.post("/api/workflow/5001/run", json={}, headers=h).json()
-    run_id = v["started"]["run_id"]
-    assert v["started"]["mode"] == "desk" and v["runs"][0]["mode"] == "desk"
-    assert client.post("/api/workflow/5001/stop-run", json={"run_id": run_id}).status_code == 403
-    v = client.post("/api/workflow/5001/stop-run", json={"run_id": run_id}, headers=h).json()
-    assert v["runs"][0]["status"] == "rejected" and setup["stopped"]
-    v = client.post("/api/workflow/5001/run", json={"mode": "terminal"}, headers=h).json()
-    assert v["started"]["mode"] == "terminal"
-    report(setup, {"path": v["workflow"]["worktree"], "run_id": v["started"]["run_id"]}, status="needs_input")
-    r = client.post("/api/workflow/5001/answer", json={"run_id": v["started"]["run_id"], "answer": "x"}, headers=h)
-    assert r.status_code == 400  # a terminal run is answered in its terminal (Continue in terminal)
-
-
-def test_agent_endpoints(setup, agent, monkeypatch):
-    monkeypatch.setenv("PANTEON_BEARER_TOKEN", "tok")
-    monkeypatch.setattr(dashboard.task_events, "sync_watchlist", lambda headers, base_dir, issues=None, **kw: {"tasks": 0})
-    monkeypatch.setattr(pc, "get_task_statuses", lambda ids, headers: [{"issue_id": i, "title": "T", "stages": {}} for i in ids])
-    app = dashboard.create_app(user_id=135, base_dir=setup["base"], work_config=lambda: setup["config"],
-                               work_launcher=setup["launcher"], work_agent_backend=fake_session)
-    client = TestClient(app, base_url="http://127.0.0.1:8765")
-    h = {"X-Timeline-Desk": "1"}
-    (docs(setup) / "analysis.md").write_text("plan\n")
-    client.post("/api/workflow/5001/start", json={"code": "15033", "step": "develop"}, headers=h)
-    v = client.post("/api/workflow/5001/run", json={"mode": "agent"}, headers=h).json()
-    run_id = v["started"]["run_id"]
-    assert v["agent_available"] and v["runs"][0]["mode"] == "agent"
-    assert client.post("/api/workflow/5001/message", json={"run_id": run_id, "text": "go"}).status_code == 403
-    client.post("/api/workflow/5001/message", json={"run_id": run_id, "text": "go"}, headers=h)
-    wait_until(lambda: client.get("/api/workflow/5001").json()["permissions"])
-    pid = client.get("/api/workflow/5001").json()["permissions"][0]["id"]
-    assert client.post(f"/api/workflow/5001/permissions/{pid}", json={"decision": "maybe"}, headers=h).status_code == 400
-    v = client.post(f"/api/workflow/5001/permissions/{pid}", json={"decision": "deny", "note": "Not that file"}, headers=h).json()
-    assert v["permissions"][0]["status"] == "denied"
-    wait_until(lambda: client.get("/api/workflow/5001").json()["runs"][0]["status"] == "review")
-    client.post("/api/workflow/5001/decide", json={"kind": "reject", "run_id": run_id, "note": "denied"}, headers=h)
-    wait_until(lambda: not agent_runner.running(run_id))
-
-
 # ---- fixes after the first real run (#6110) ----------------------------------------
 def test_terminal_run_closed_without_exit_file_ends(setup, monkeypatch):
     wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
@@ -817,10 +617,9 @@ def test_session_alive_reads_command_lines():
         proc.kill()
         proc.wait()
     assert REAL_SESSION_ALIVE(sid) is False
-    assert ws.stop_group(os.getpid()) is False  # never the dashboard's (here: pytest's) own process group
 
 
-def test_stop_workflow_ends_the_open_run(setup, agent):
+def test_stop_workflow_ends_the_open_run(setup):
     wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
     started = run(setup)
     decide(setup, "stop", note="no need")
@@ -829,36 +628,6 @@ def test_stop_workflow_ends_the_open_run(setup, agent):
     assert v["events"][0]["kind"] == "stop" and v["events"][0]["run_id"] == started["run_id"]
     decide(setup, "reopen")
     assert kinds(view(setup))[0] == "run"  # nothing left open
-
-    desk = run(setup, mode=None)
-    stopped = []
-    wf.decide("5001", "stop", setup["base"], setup["config"], note="later", now=NOW, stopper=lambda pid: stopped.append(pid) or True)
-    assert stopped == [os.getpid()] and view(setup)["runs"][0]["status"] == "rejected"
-
-    decide(setup, "reopen")
-    (docs(setup) / "analysis.md").write_text("plan\n")
-    inside = run(setup, mode="agent", agent_backend=fake_session)
-    decide(setup, "stop", note="enough")
-    wait_until(lambda: not agent_runner.running(inside["run_id"]))
-
-
-def test_desk_and_agent_runs_get_the_desk_mcp_server(setup, agent):
-    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
-    run(setup, mode=None)
-    args = setup["launched"][-1]
-    assert "timeline-desk" in json.loads(flag(args, "--mcp-config"))["mcpServers"]
-    tools = args[args.index("--allowedTools") + 1:]
-    assert "mcp__timeline-desk__get_task_conversation" in tools
-    assert any(t.startswith("Bash(") and t.endswith("fetch_task.py:*)") for t in tools)
-    seen = {}
-
-    async def capture(run_):
-        seen["servers"] = run_.mcp_servers
-    decide(setup, "stop", note="x")
-    decide(setup, "reopen")
-    inside = run(setup, mode="agent", agent_backend=capture)
-    wait_until(lambda: "servers" in seen)
-    assert list(seen["servers"]) == ["timeline-desk"]
 
 
 def test_reset_erases_workflow_and_task_docs(setup, monkeypatch):
@@ -888,7 +657,7 @@ def test_reset_erases_workflow_and_task_docs(setup, monkeypatch):
     assert not (setup["repo"] / "timeline" / "5001").exists() and os.path.islink(os.path.join(started["path"], "timeline"))
     assert (setup["repo"] / "timeline").is_dir()  # only the task's own folder goes
     conn = pc._open_planner_db(setup["base"], create=False)
-    for table in ("workflows", "workflow_runs", "workflow_events", "qa_findings", "workflow_permissions"):
+    for table in ("workflows", "workflow_runs", "workflow_events", "qa_findings"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table} WHERE issue_number = '5001'").fetchone()[0] == 0, table
     assert conn.execute("SELECT COUNT(*) FROM task_events WHERE issue_number = '5001'").fetchone()[0] == 1  # Timeline's history stays
     assert os.path.isdir(started["path"])  # the worktree stays
@@ -896,14 +665,6 @@ def test_reset_erases_workflow_and_task_docs(setup, monkeypatch):
     assert v["workflow"] is None and v["proposal"]["step"] == "intake" and v["startable"]
     with pytest.raises(LookupError):
         wf.reset_workflow("5001", "5001", setup["base"], setup["config"])
-
-
-def test_reset_stops_a_desk_run_first(setup):
-    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
-    run(setup, mode=None)
-    stopped = []
-    wf.reset_workflow("5001", "5001", setup["base"], setup["config"], stopper=lambda pid: stopped.append(pid) or True)
-    assert stopped == [os.getpid()] and view(setup)["workflow"] is None
 
 
 def test_reset_endpoint(client, setup):
@@ -915,3 +676,83 @@ def test_reset_endpoint(client, setup):
     v = client.post("/api/workflow/5001/reset", json={"confirm": "5001", "code": "15033"}, headers=h).json()
     assert v["workflow"] is None and v["removed"]["files"] == 1 and v["startable"]
     assert not (setup["repo"] / "timeline" / "5001").exists()
+
+
+# ---- what the terminal is doing ----------------------------------------------------
+def write_session(tmp_path, session_id, entries, age=0):
+    folder = tmp_path / "no-claude-home" / "projects" / "-some-worktree"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{session_id}.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    when = time.time() - age
+    os.utime(path, (when, when))
+
+
+def assistant(*blocks):
+    return {"type": "assistant", "message": {"content": list(blocks)}}
+
+
+def tool_use(name="Bash", **args):
+    return {"type": "tool_use", "id": "t1", "name": name, "input": args}
+
+
+def test_terminal_activity_follows_the_session_log(setup, tmp_path):
+    sid = "11111111-2222-3333-4444-555555555555"
+    r = {"session_id": sid}
+    assert wf.terminal_activity(r)["state"] == "starting"  # no log yet
+
+    prompt = {"type": "user", "message": {"content": "Panteon task #5001 …"}}
+    write_session(tmp_path, sid, [prompt])
+    assert wf.terminal_activity(r)["state"] == "working"
+
+    write_session(tmp_path, sid, [prompt, assistant(tool_use(command="git status"))], age=1)
+    a = wf.terminal_activity(r)
+    assert a["state"] == "tool" and a["detail"] == "Bash: git status" and a["idle"] <= 3
+
+    write_session(tmp_path, sid, [prompt, assistant(tool_use(command="git status"))], age=30)
+    a = wf.terminal_activity(r)
+    assert a["state"] == "waiting" and "approve it in the terminal" in a["detail"] and a["idle"] >= 30
+
+    write_session(tmp_path, sid, [prompt, assistant(tool_use("AskUserQuestion", question="Which tenant?"))], age=30)
+    assert wf.terminal_activity(r)["state"] == "question"
+
+    result = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+    write_session(tmp_path, sid, [prompt, assistant(tool_use(command="ls")), result], age=30)
+    assert wf.terminal_activity(r)["state"] == "working"  # got the tool's output, thinking
+
+    write_session(tmp_path, sid, [prompt, assistant({"type": "text", "text": "Plan: change a.txt. Go ahead?"})], age=1)
+    assert wf.terminal_activity(r)["state"] == "working"  # still writing, perhaps
+    write_session(tmp_path, sid, [prompt, assistant({"type": "text", "text": "Plan: change a.txt. Go ahead?"})], age=30)
+    assert wf.terminal_activity(r)["state"] == "reply"
+
+
+def test_open_run_shows_its_activity_and_asks_you(setup, tmp_path):
+    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
+    started = run(setup)
+    v = view(setup)
+    assert v["runs"][0]["activity"]["state"] == "starting" and v["status"]["code"] == "running"
+
+    prompt = {"type": "user", "message": {"content": "go"}}
+    write_session(tmp_path, started["session_id"], [prompt, assistant({"type": "text", "text": "Which tenant?"})], age=30)
+    v = view(setup)
+    assert v["runs"][0]["activity"]["state"] == "reply" and v["runs"][0]["status"] == "running"
+    assert v["status"]["code"] == "needs_you" and v["status"]["short"].endswith("asks you")
+    listed = wf.list_workflows(setup["base"])
+    assert listed[0]["status"]["code"] == "needs_you"
+
+    report(setup, started)  # Claude wrote its result and exited: the activity line goes away
+    open(os.path.join(started["path"], "timeline", "5001", "runs", f"{started['run_id']}.exit"), "w").write("0\n")
+    v = view(setup)
+    assert v["runs"][0]["status"] == "review" and v["runs"][0]["activity"] is None
+    decide(setup, "approve", run_id=started["run_id"])
+    assert view(setup)["runs"][0]["activity"] is None
+
+
+def test_no_background_run_modes_are_left(setup):
+    wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
+    assert not hasattr(wf, "answer_run") and not hasattr(wf, "message_run") and not hasattr(wf, "stop_run")
+    with pytest.raises(TypeError):
+        wf.run_step("5001", setup["config"], setup["base"], launcher=setup["launcher"], mode="agent")
+    started = run(setup)
+    assert "-p" not in setup["launched"][-1] and "gnome-terminal" == setup["launched"][-1][0]
+    assert "mode" not in started

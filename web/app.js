@@ -834,6 +834,49 @@ function toast(text, isError) {
   setTimeout(() => el.remove(), isError ? 9000 : 6000);
 }
 
+// The desk's own dialog, used everywhere instead of window.confirm / prompt.
+// confirmDialog resolves true or false; askDialog resolves the trimmed text,
+// or null when cancelled (a `required` message refuses an empty answer).
+// Esc, ×, Cancel and a click on the backdrop cancel; Ctrl+Enter sends.
+function modalDialog({ title, text, ok = "OK", danger = false, field = null }) {
+  return new Promise((resolve) => {
+    let result = field ? null : false;
+    const dialog = h("dialog", { class: "tl-dialog tl-modal", "aria-label": title });
+    const input = field ? h("textarea", { rows: "3", placeholder: field.placeholder || null, autofocus: true }) : null;
+    const problem = h("p", { class: "tl-modal-problem", role: "alert", hidden: true });
+    const cancel = () => dialog.close();
+    const form = h("form", { method: "dialog", onsubmit: (ev) => {
+      ev.preventDefault();
+      if (input) {
+        const value = input.value.trim();
+        if (!value && field.required) { problem.textContent = field.required; problem.hidden = false; input.focus(); return; }
+        result = value;
+      } else result = true;
+      dialog.close();
+    } },
+    h("header", {}, h("h2", {}, title), h("button", { type: "button", class: "tl-dialog-x", "aria-label": "Close", onclick: cancel }, "×")),
+    text ? h("p", { class: "tl-modal-text" }, text) : null,
+    input ? h("label", {}, field.label || "Your answer", input) : null,
+    problem,
+    h("footer", {},
+      h("button", { type: "button", class: "btn ghost", onclick: cancel, autofocus: !input && danger }, "Cancel"),
+      h("button", { type: "submit", class: `btn${danger ? " danger" : ""}`, autofocus: !input && !danger }, ok)));
+    if (input) input.addEventListener("keydown", (ev) => { if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) form.requestSubmit(); });
+    // Only a press that starts and ends on the backdrop cancels, so selecting
+    // text in the field and letting go outside doesn't lose what you typed.
+    let pressed = null;
+    dialog.addEventListener("pointerdown", (ev) => { pressed = ev.target; });
+    dialog.addEventListener("click", (ev) => { if (ev.target === dialog && pressed === dialog) cancel(); });
+    dialog.addEventListener("close", () => { dialog.remove(); resolve(result); });
+    dialog.append(form);
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+const confirmDialog = (options) => modalDialog(options);
+const askDialog = ({ label, placeholder, required, ...options }) => modalDialog({ ...options, field: { label, placeholder, required } });
+
 // The workflow badge on a board card, task row or worktree: where the task's
 // workflow stands (from /api/workflows), linking to the task page, which is
 // the only place a step is run or decided.
@@ -860,8 +903,11 @@ function sizeText(bytes) {
 }
 
 async function removeWorktree(item, withBranch, button) {
-  const what = withBranch ? `the worktree and branch ${item.branch}` : "the worktree (the branch stays)";
-  if (!window.confirm(`Remove ${what} for #${item.issue_id || item.branch}?`)) return;
+  const ok = await confirmDialog({
+    title: `Remove the worktree for #${item.issue_id || item.branch}?`,
+    text: withBranch ? `Its branch ${item.branch} is deleted too.` : `The branch ${item.branch} stays.`,
+    ok: withBranch ? "Remove worktree and branch" : "Remove worktree", danger: true });
+  if (!ok) return;
   button.disabled = true;
   try {
     const r = await api("/api/work/remove", {
@@ -1153,7 +1199,7 @@ const EVENT_LABEL = {
   skip: "Skipped", finish: "Finished", back_to_develop: "Back to Develop", qa_issues: "QA found issues",
   qa_passed: "QA approved", close: "Closed", stop: "Stopped", reopen: "Reopened",
   ack: "Marked Timeline changes as seen", finding: "Finding", finding_added: "Added finding", prod_fix: "Started a prod fix",
-  answer: "Answered", stop_run: "Stopped run", message: "Wrote to Claude", permission: "Tool call", reset: "Reset",
+  reset: "Reset",
 };
 
 function when(iso) {
@@ -1182,17 +1228,15 @@ async function loadWorkflow(el, issue, code) {
     return;
   }
   if (token !== flowState.token || !el.isConnected) return;
+  code = code || v.code || null;  // the desk finds the board itself when the page didn't know it
   renderWorkflow(el, v, code);
   if (cache.workflows) {  // keep the badges elsewhere in step
     if (v.workflow) cache.workflows.set(issue, { issue, code: v.workflow.code, step: v.workflow.step, status: v.status });
     else cache.workflows.delete(issue);
   }
-  // While Claude is working, look again now and then: every 3 s for a run on
-  // this page (live output), every 10 s for one in a terminal.
-  const running = v.runs.filter((r) => r.status === "running" || r.status === "approval" || (r.mode === "agent" && r.live && !r.decision));
-  if (running.length) {
-    const wait = running.some((r) => r.mode === "agent") ? 2000 : running.some((r) => r.mode === "desk") ? 3000 : 10000;
-    flowState.timer = setTimeout(() => { if (el.isConnected) loadWorkflow(el, issue, code); }, wait);
+  // While a terminal is open on a run, look again every 5 s: its status line follows Claude's session.
+  if (v.runs.some((r) => r.status === "running")) {
+    flowState.timer = setTimeout(() => { if (el.isConnected) loadWorkflow(el, issue, code); }, 5000);
   }
 }
 
@@ -1208,15 +1252,30 @@ function factList(rows) {
       h("dd", {}, Array.isArray(value) ? h("ul", {}, value.map((x) => h("li", {}, x))) : value)]));
 }
 
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return "";
+  if (seconds < 10) return "just now";
+  if (seconds < 90) return `${seconds} s ago`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min ago`;
+  return `${Math.round(seconds / 3600)} h ago`;
+}
+
+// What the run's terminal is doing right now, from Claude's session log (workflow.terminal_activity).
+function activityLine(run) {
+  const a = run.activity;
+  if (!a || run.decision || run.ended_at) return null;
+  return h("div", { class: `wf-activity ${a.state}`, role: "status" },
+    h("span", { class: "dot", "aria-hidden": "true" }),
+    h("strong", {}, a.label),
+    a.detail ? h("span", { class: "text" }, a.detail) : null,
+    a.idle !== null && a.idle !== undefined ? h("small", {}, `last activity ${ago(a.idle)}`) : null);
+}
+
 function resultBlock(run) {
   const r = run.result;
   if (!r) {
     return h("p", { class: "note" }, run.status === "running"
-      ? (run.mode === "agent"
-        ? "Claude is working inside the desk. Every edit and command it wants waits for you under Approvals; write to it in the box below."
-        : run.mode === "desk"
-        ? "Claude is working in the background on this page; its output shows under Conversation and updates every few seconds."
-        : `Claude is working in the terminal. It reports back in ${run.result_file}; this page checks every 10 seconds.`)
+      ? `Claude is working in the terminal. It reports back in ${run.result_file}; this page checks every 5 seconds.`
       : `No result in ${run.result_file}.${run.exit_code !== null && run.exit_code !== undefined ? ` Claude exited with code ${run.exit_code}.` : ""}`);
   }
   return h("div", { class: "wf-result" },
@@ -1241,7 +1300,7 @@ function conversation(issue, run) {
       put(box,
         t.truncated ? h("p", { class: "note" }, "Showing the latest part only.") : null,
         t.items.length ? t.items.map((i) => h("div", { class: `msg ${i.who}` },
-          h("span", { class: "who" }, { you: "You", claude: "Claude", desk: "Desk" }[i.who] || "Tool"),
+          h("span", { class: "who" }, { you: "You", claude: "Claude" }[i.who] || "Tool"),
           i.who === "claude" ? markdown(i.text) : h("div", { class: "text" }, i.text))) : h("p", { class: "note" }, "Nothing said yet."));
     } catch (error) {
       put(box, h("p", { class: "error" }, error.message));
@@ -1250,64 +1309,16 @@ function conversation(issue, run) {
   details.addEventListener("toggle", () => {
     if (details.open) { flowState.open.add(key); load(); } else flowState.open.delete(key);
   });
-  // A run working on this page shows its output without being asked.
-  if ((run.mode === "desk" || run.mode === "agent") && !run.decision && !flowState.open.has(`closed-${key}`)) flowState.open.add(key);
-  details.addEventListener("toggle", () => { if (!details.open) flowState.open.add(`closed-${key}`); });
   if (flowState.open.has(key)) { details.open = true; load(); }
   return details;
 }
 
-// Approvals (phase 5): tool calls a run inside the desk is waiting on.
-function permissionsBox(el, issue, code, v) {
-  if (!v.permissions.length) return null;
-  const decide = async (p, decision, button) => {
-    let note = "";
-    if (decision === "deny") {
-      note = window.prompt(`Deny "${p.summary}": why? (Claude reads this and does something else)`);
-      if (note === null) return;
-      if (!note.trim()) { toast("Say why you deny it.", true); return; }
-    }
-    button.disabled = true;
-    try { await flowPost(issue, `permissions/${p.id}`, { decision, note }); } catch (error) { toast(error.message, true); }
-    await loadWorkflow(el, issue, code);
-  };
-  const detail = (d) => {
-    if (d.command) return h("pre", { class: "md-code" }, d.command + (d.description ? `\n# ${d.description}` : ""));
-    if (d.old_string !== undefined || d.new_string !== undefined) {
-      return h("div", { class: "wf-diff" },
-        d.file_path ? h("p", { class: "note" }, d.file_path) : null,
-        h("pre", { class: "md-code old" }, d.old_string || ""), h("pre", { class: "md-code new" }, d.new_string || ""));
-    }
-    if (d.content !== undefined) return h("div", {}, d.file_path ? h("p", { class: "note" }, d.file_path) : null, h("pre", { class: "md-code new" }, d.content));
-    return h("pre", { class: "md-code" }, JSON.stringify(d, null, 2));
-  };
-  const pending = v.permissions.filter((p) => p.status === "pending");
-  const done = v.permissions.filter((p) => p.status !== "pending");
-  return h("div", { class: "wf-card wf-approvals" },
-    h("h4", {}, pending.length ? `Approvals (${pending.length} waiting)` : "Approvals"),
-    pending.map((p) => {
-      const allow = h("button", { type: "button", class: "btn" }, "Allow");
-      const deny = h("button", { type: "button", class: "btn ghost" }, "Deny");
-      allow.addEventListener("click", () => decide(p, "allow", allow));
-      deny.addEventListener("click", () => decide(p, "deny", deny));
-      return h("div", { class: "permission" }, h("strong", {}, p.summary), detail(p.detail), h("div", { class: "wf-actions" }, allow, deny));
-    }),
-    done.length ? h("details", { class: "wf-more" }, h("summary", {}, `Decided (${done.length})`),
-      h("ul", { class: "wf-log" }, done.map((p) => h("li", {}, h("small", {}, when(p.decided_at)),
-        h("strong", {}, p.status), ` ${p.summary}`, p.note ? h("div", { class: "text" }, p.note) : null)))) : null);
-}
-
-function messageBox(el, issue, code, run) {
-  const input = h("textarea", { rows: "2", placeholder: "Go ahead with step 2, but keep the old column name", "aria-label": "Message to Claude" });
-  const send = h("button", { type: "button", class: "btn" }, "Send");
-  send.addEventListener("click", async () => {
-    if (!input.value.trim()) { toast("Write a message first.", true); return; }
-    send.disabled = true;
-    try { await flowPost(issue, "message", { run_id: run.id, text: input.value }); input.value = ""; }
-    catch (error) { toast(error.message, true); }
-    await loadWorkflow(el, issue, code);
-  });
-  return h("div", { class: "wf-message" }, input, send);
+// The open run has its own card above; this lists the others, and counts only those.
+function previousRuns(issue, v, open) {
+  const others = v.runs.filter((r) => r !== open);
+  return h("details", { class: "wf-section", open: others.length && !open ? true : null },
+    h("summary", {}, `${open ? "Earlier runs" : "Runs"} (${others.length})`),
+    others.length ? others.map((r) => runCard(issue, r, false)) : h("p", { class: "note" }, open ? "No earlier runs." : "No runs yet."));
 }
 
 function runCard(issue, run, open) {
@@ -1315,9 +1326,9 @@ function runCard(issue, run, open) {
     h("div", { class: "wf-run-head" },
       h("strong", {}, `Run ${run.id} · ${run.step_title}`),
       h("span", { class: `pill ${run.status}` }, run.status_label),
-      h("span", { class: "note" }, run.mode === "desk" ? "on this page" : run.mode === "agent" ? "inside the desk, with approvals" : "in a terminal"),
       run.finding_id ? h("span", { class: "note" }, `F${run.finding_id}`) : null,
       h("small", {}, `${when(run.started_at)}${run.ended_at ? ` – ${when(run.ended_at)}` : ""}`)),
+    activityLine(run),
     resultBlock(run),
     run.note ? h("p", { class: "note" }, `Your note: ${run.note}`) : null,
     h("details", { class: "wf-more" }, h("summary", {}, "Prompt and session"),
@@ -1325,6 +1336,9 @@ function runCard(issue, run, open) {
       h("pre", { class: "md-code" }, run.prompt)),
     conversation(issue, run));
 }
+
+// Actions whose confirm button is red: they throw away a run or stop the flow.
+const DANGER_ACTIONS = new Set(["reject", "abandon", "stop"]);
 
 async function act(el, issue, code, action, v) {
   const open = v.runs.find((r) => !r.decision);
@@ -1334,45 +1348,25 @@ async function act(el, issue, code, action, v) {
     return;
   }
   let note = "";
-  if (action.kind === "answer") {
-    const answer = window.prompt(`Your answer for run ${open.id} (it carries on here on the page):`);
-    if (answer === null) return;
-    if (!answer.trim()) { toast("Write your answer first.", true); return; }
-    try { await flowPost(issue, "answer", { run_id: open.id, answer }); toast("Answer sent; the run carries on below."); }
-    catch (error) { toast(error.message, true); }
-    await loadWorkflow(el, issue, code);
-    return;
-  }
-  if (action.kind === "stop_run") {
-    if (!window.confirm(`Stop run ${open.id}? It's recorded as rejected.`)) return;
-    try { await flowPost(issue, "stop-run", { run_id: open.id }); } catch (error) { toast(error.message, true); }
-    await loadWorkflow(el, issue, code);
-    return;
-  }
   if (action.kind === "approve") {
     const step = v.steps.find((s) => s.key === v.workflow.step);
-    if (!window.confirm(`Approve run ${open.id} of ${step.title}?\n\nYou confirm: ${step.approve}`)) return;
+    if (!await confirmDialog({ title: `Approve run ${open.id} of ${step.title}?`, text: `You confirm: ${step.approve}`, ok: "Approve" })) return;
   } else if (action.needs_note) {
-    note = window.prompt(`${action.label}: why? (saved in the history)`);
+    note = await askDialog({ title: `${action.label}?`, text: action.help, label: "Why? (saved in the history)",
+      ok: action.label, danger: DANGER_ACTIONS.has(action.kind), required: "Add a reason, so the history says why." });
     if (note === null) return;
-    if (!note.trim()) { toast("Add a reason, so the history says why.", true); return; }
-  } else if (["run", "run_terminal", "run_agent", "resume", "ack"].includes(action.kind)) {
+  } else if (["run", "resume", "ack"].includes(action.kind)) {
     // no extra question: the step card above (or the Timeline box) is what this acts on
-  } else if (!window.confirm(`${action.label}?\n\n${action.help}`)) return;
+  } else if (!await confirmDialog({ title: `${action.label}?`, text: action.help, ok: action.label, danger: DANGER_ACTIONS.has(action.kind) })) return;
   try {
-    const runs = ["run", "run_terminal", "run_agent", "explain_blocker"].includes(action.kind);
+    const runs = ["run", "explain_blocker"].includes(action.kind);
     const path = runs ? "run" : action.kind === "resume" ? "resume" : "decide";
-    const body = action.kind === "run" ? {} : action.kind === "run_terminal" ? { mode: "terminal" }
-      : action.kind === "run_agent" ? { mode: "agent" }
+    const body = action.kind === "run" ? {}
       : action.kind === "explain_blocker" ? { side: "unblock" }
       : action.kind === "resume" ? { run_id: open.id }
       : { kind: action.kind, run_id: open ? open.id : null, note };
     const r = await flowPost(issue, path, body);
-    if (runs) {
-      const where = r.started.mode === "desk" ? "is working on this page"
-        : r.started.mode === "agent" ? "is working inside the desk; approve its tool calls here" : "opened in a terminal";
-      toast(`Claude ${where} for run ${r.started.run_id}.${r.note ? ` ${r.note}` : ""}`, Boolean(r.note));
-    }
+    if (runs) toast(`Claude opened in a terminal for run ${r.started.run_id}.${r.note ? ` ${r.note}` : ""}`, Boolean(r.note));
     else if (action.kind === "resume") toast("Claude reopened in a terminal.");
   } catch (error) {
     toast(error.message, true);
@@ -1419,8 +1413,7 @@ function resetForm(el, issue, code, v) {
 function actionBar(el, issue, code, v) {
   if (!v.actions.length) return null;
   return h("div", { class: "wf-actions" }, v.actions.map((a) => {
-    if (a.kind === "message") return null;  // the run card has its own message box
-    const primary = ["run", "approve", "close", "reopen", "answer"].includes(a.kind) || a.suggested;
+    const primary = ["run", "approve", "close", "reopen"].includes(a.kind) || a.suggested;
     const button = h("button", {
       type: "button",
       class: `btn${primary ? "" : " ghost"}${a.kind === "stop" ? " far" : ""}${a.suggested ? " suggested" : ""}`,
@@ -1446,9 +1439,7 @@ function stepCard(v) {
       ["Reads", step.reads],
       ["Writes", step.writes],
       ["Won't", step.wont],
-      ["Runs in", step.runner === "desk"
-        ? `This page, in the background, in ${v.workflow.worktree || "the task's worktree"}: read-only tools, writes only timeline/${v.issue}/ (or run it in a terminal instead)`
-        : `A terminal, in ${v.workflow.worktree || "the task's worktree"}, with Claude's normal permission prompts`],
+      ["Runs in", `A terminal, in ${v.workflow.worktree || "the task's worktree"}, with Claude's normal permission prompts`],
       ["You approve", step.approve],
     ]) : null,
     v.prompt_note ? h("p", { class: "note" }, v.prompt_note) : null,
@@ -1490,7 +1481,9 @@ function startForm(el, issue, code, v) {
   const button = h("button", { type: "button", class: "btn" }, "Start workflow");
   button.addEventListener("click", async () => {
     const step = v.steps.find((s) => s.key === select.value);
-    if (!window.confirm(`Start a workflow for #${issue} at ${step.title}?\n\nThe desk makes or reuses the task's worktree in ${v.repo}. Steps before ${step.title} are recorded as skipped.`)) return;
+    const first = v.steps.indexOf(step) === 0;
+    if (!await confirmDialog({ title: `Start a workflow for #${issue} at ${step.title}?`, ok: "Start workflow",
+      text: `The desk makes or reuses the task's worktree in ${v.repo}.${first ? "" : ` Steps before ${step.title} are recorded as skipped.`}` })) return;
     button.disabled = true;
     try {
       const r = await flowPost(issue, "start", { code: v.code, step: select.value });
@@ -1526,9 +1519,9 @@ function findingsBox(el, issue, code, v) {
       b.addEventListener("click", async () => {
         let note = "";
         if (["question", "not_bug", "wont_fix"].includes(target) || f.status === "fixed") {
-          note = window.prompt(`F${f.id} → ${FINDING_BUTTON[target]}: why? (saved in the history)`);
+          note = await askDialog({ title: `F${f.id} → ${FINDING_BUTTON[target]}`, label: "Why? (saved in the history)",
+            ok: `Mark as ${FINDING_BUTTON[target]}`, required: "Add a reason, so the history says why." });
           if (note === null) return;
-          if (!note.trim()) { toast("Add a reason, so the history says why.", true); return; }
         }
         b.disabled = true;
         await post(`findings/${f.id}`, { status: target, note });
@@ -1607,13 +1600,9 @@ function renderWorkflow(el, v, code) {
     stepCard(v),
     findingsBox(el, issue, code, v),
     open ? runCard(issue, open, true) : null,
-    open ? permissionsBox(el, issue, code, v) : null,
-    open && v.actions.some((a) => a.kind === "message") ? messageBox(el, issue, code, open) : null,
     actionBar(el, issue, code, v),
     resetForm(el, issue, code, v),
-    h("details", { class: "wf-section", open: v.runs.length && !open ? true : null },
-      h("summary", {}, `Runs (${v.runs.length})`),
-      v.runs.length ? v.runs.filter((r) => r !== open).map((r) => runCard(issue, r, false)) : h("p", { class: "note" }, "No runs yet.")),
+    previousRuns(issue, v, open),
     h("details", { class: "wf-section" }, h("summary", {}, `Decisions (${v.events.length})`),
       h("ol", { class: "wf-log" }, v.events.map((e) => h("li", {},
         h("small", {}, when(e.at)), h("strong", {}, EVENT_LABEL[e.kind] || e.kind),

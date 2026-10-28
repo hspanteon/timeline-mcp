@@ -18,7 +18,9 @@ still asks before every edit and command. The prompt holds only the issue ID
 and fixed text, and asks Claude to write timeline/<id>/runs/<run>.result.json
 whenever it stops; the terminal writes <run>.exit when Claude exits. A run's
 status comes from those two files (refresh_run) and its conversation from
-Claude Code's own session log (read_transcript). What can happen next comes
+Claude Code's own session log (read_transcript), and what its terminal is doing
+right now (working, running a tool, waiting for you) from the tail of that log
+(terminal_activity). Nothing runs in the background. What can happen next comes
 from `actions`, which both the page and every POST go through, so the rules
 live here and not in the page.
 """
@@ -29,12 +31,10 @@ import re
 import shutil
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-import agent_runner
 import panteon_client as pc
 import task_events
 import work_session
@@ -52,8 +52,6 @@ RESULT_STATUSES = ("done", "needs_input", "blocked", "failed")
 _lock = threading.Lock()
 
 Launcher = Callable[[List[str], Dict[str, str]], None]
-Headless = Callable[[List[str], Dict[str, str]], int]
-MAX_DESK_RUNS = 2
 
 # ---- the flow --------------------------------------------------------------
 # One entry per step, in order. `run` steps are done by Claude in a terminal;
@@ -138,28 +136,6 @@ SIDE: Dict[str, Dict[str, Any]] = {
                  "approve": "The draft reply is right (you post it yourself)."},
 }
 ALL_STEPS = {**STEPS, **SIDE}
-# Where a step runs by default (phase 4). Steps that only read code and write
-# task docs run on the page ("desk": in the background, live output, limited
-# tools); code-changing steps stay in a terminal, where you approve every edit.
-DESK_STEPS = {"intake", "estimate", "review", "release_qa", "release_prod", "release_hotfix", "unblock", "qa_reply"}
-for _step in ALL_STEPS.values():
-    _step["runner"] = "desk" if _step["key"] in DESK_STEPS else "terminal"
-
-
-def desk_tools(issue: str, repo: Dict[str, Any]) -> List[str]:
-    """
-    What a desk run may use without asking (in `claude -p` anything else is
-    refused): reading, read-only git, the timeline MCP's read tools, and writing
-    only the task's docs folder (by its path in the worktree and in the main
-    checkout, since the worktree's timeline/ is a link).
-    """
-    shared = os.path.realpath(docs_dir(repo, issue))
-    return ["Read", "Grep", "Glob",
-            "Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(git branch:*)",
-            "Bash(git merge-base:*)", "Bash(git rev-parse:*)",
-            f"mcp__{work_session.MCP_NAME}__get_task_conversation", f"mcp__{work_session.MCP_NAME}__get_task_statuses",
-            f"Bash({work_session.desk_python()} {os.path.join(HERE, 'fetch_task.py')}:*)",
-            f"Write(timeline/{issue}/**)", f"Edit(timeline/{issue}/**)", f"Write(/{shared}/**)", f"Edit(/{shared}/**)"]
 # Where a step goes once it's approved, finished or skipped.
 NEXT = {"intake": "estimate", "estimate": "develop", "develop": "review", "review": "release_qa",
         "release_qa": "qa", "qa_fix": "qa", "release_prod": "close", "prod_fix": "release_hotfix",
@@ -167,7 +143,6 @@ NEXT = {"intake": "estimate", "estimate": "develop", "develop": "review", "revie
 
 RUN_LABELS = {
     "running": "Running",
-    "approval": "Waiting for your approval",
     "review": "Waiting for your review",
     "needs_input": "Needs your answer",
     "blocked": "Blocked",
@@ -177,7 +152,7 @@ RUN_LABELS = {
     "approved": "Approved",
     "rejected": "Rejected",
 }
-OPEN_STATUSES = ("running", "approval", "review", "needs_input", "blocked", "failed", "bad_result", "no_result")
+OPEN_STATUSES = ("running", "review", "needs_input", "blocked", "failed", "bad_result", "no_result")
 
 
 # ---- prompts ---------------------------------------------------------------
@@ -365,10 +340,6 @@ def _launched_at(run: Dict[str, Any]) -> datetime:
         return datetime.fromisoformat(run["started_at"])
 
 
-def _stream_file(run: Dict[str, Any]) -> str:
-    return os.path.join(runs_dir(run["cwd"], run["issue_number"]), f"{run['id']}.stream.jsonl")
-
-
 def _result_path(run: Dict[str, Any]) -> str:
     return os.path.join(run["cwd"], result_file(run["issue_number"], run["id"]))
 
@@ -424,20 +395,12 @@ def refresh_run(conn, run: Dict[str, Any]) -> Dict[str, Any]:
         return run
     updates: Dict[str, Any] = {}
     exit_path = _exit_file(run)
-    if (run.get("mode") == "desk" and not run["ended_at"] and not os.path.exists(exit_path)
-            and run.get("pid") and not work_session.alive(run["pid"])):
-        updates.update(ended_at=_now(), exit_code=None)  # killed (e.g. the dashboard restarted) before it could say
     # A terminal run ends with its exit file, but closing the window kills the script before
     # it writes one: once no process carries the session id any more, the run has ended.
-    if ((run.get("mode") or "terminal") == "terminal" and not run["ended_at"] and not os.path.exists(exit_path)
+    if (not run["ended_at"] and not os.path.exists(exit_path)
             and (datetime.now() - _launched_at(run)).total_seconds() > TERMINAL_GRACE_SECONDS
             and work_session.session_alive(run["session_id"]) is False):
         updates.update(ended_at=_now(), exit_code=None)
-    if (run.get("mode") == "agent" and not run["ended_at"] and not os.path.exists(exit_path)
-            and not agent_runner.running(run["id"])):
-        updates.update(ended_at=_now(), exit_code=None)  # the dashboard restarted: its session is gone
-        conn.execute("UPDATE workflow_permissions SET status = 'expired', decided_at = ?, note = 'The run ended.' "
-                     "WHERE run_id = ? AND status = 'pending'", (_now(), run["id"]))
     if os.path.exists(exit_path):
         try:
             with open(exit_path, encoding="utf-8") as fh:
@@ -464,8 +427,6 @@ def refresh_run(conn, run: Dict[str, Any]) -> Dict[str, Any]:
 def run_status(run: Dict[str, Any]) -> str:
     if run["decision"]:
         return run["decision"]
-    if run.get("pending") and not run["ended_at"]:
-        return "approval"
     if run["result"]:
         status = json.loads(run["result"]).get("status")
         return "review" if status == "done" else status
@@ -483,8 +444,7 @@ def _public_run(run: Dict[str, Any]) -> Dict[str, Any]:
         "result_file": result_file(run["issue_number"], run["id"]),
         "decision": run["decision"], "decided_at": run["decided_at"], "note": run["note"],
         "status": status, "status_label": RUN_LABELS.get(status, status),
-        "mode": run.get("mode") or "terminal", "finding_id": run.get("finding_id"),
-        "pending": run.get("pending") or 0, "live": bool(run.get("live")),
+        "finding_id": run.get("finding_id"), "activity": run.get("activity"),
     }
 
 
@@ -492,10 +452,8 @@ def _runs(conn, issue: str) -> List[Dict[str, Any]]:
     rows = conn.execute("SELECT * FROM workflow_runs WHERE issue_number = ? ORDER BY id", (issue,)).fetchall()
     runs = [refresh_run(conn, dict(r)) for r in rows]
     for run in runs:
-        if run.get("mode") == "agent" and not run["decision"]:
-            run["pending"] = conn.execute("SELECT COUNT(*) FROM workflow_permissions WHERE run_id = ? AND status = 'pending'",
-                                          (run["id"],)).fetchone()[0]
-            run["live"] = agent_runner.running(run["id"])
+        if not run["decision"] and not run["ended_at"]:
+            run["activity"] = terminal_activity(run)
     return runs
 
 
@@ -567,9 +525,6 @@ def parse_transcript(lines: List[str]) -> List[Dict[str, Any]]:
             entry = json.loads(line)
         except ValueError:
             continue
-        if isinstance(entry, dict) and entry.get("type") == "desk" and entry.get("text"):
-            items.append({"who": "desk", "text": str(entry["text"])[:2000], "at": entry.get("timestamp")})
-            continue
         if not isinstance(entry, dict) or entry.get("type") not in ("user", "assistant") or entry.get("isMeta"):
             continue
         content = (entry.get("message") or {}).get("content")
@@ -603,8 +558,7 @@ def read_transcript(issue: str, run_id: int, base_dir: Optional[str] = None, hom
     if not row:
         raise LookupError("No such run.")
     row = dict(row)
-    stream = _stream_file(row)
-    path = stream if row.get("mode") in ("desk", "agent") and os.path.exists(stream) else transcript_path(row["session_id"], home)
+    path = transcript_path(row["session_id"], home)
     if not path:
         return {"run_id": row["id"], "session_id": row["session_id"], "found": False, "items": [], "truncated": False}
     size = os.path.getsize(path)
@@ -615,7 +569,79 @@ def read_transcript(issue: str, run_id: int, base_dir: Optional[str] = None, hom
         items = parse_transcript(fh.readlines())
     truncated = size > MAX_TRANSCRIPT_BYTES or len(items) > MAX_TRANSCRIPT_ITEMS
     return {"run_id": row["id"], "session_id": row["session_id"], "found": True,
-            "items": items[-MAX_TRANSCRIPT_ITEMS:], "truncated": truncated, "live": path == stream}
+            "items": items[-MAX_TRANSCRIPT_ITEMS:], "truncated": truncated}
+
+
+# ---- what the terminal is doing --------------------------------------------
+# An open run's terminal can't report back while Claude works, but Claude Code
+# logs every message and tool call of the session. The last entry says what it
+# is doing now; the log's age says for how long. Read-only, from the tail.
+ACTIVITY_TAIL_BYTES = 200_000
+ACTIVITY_SETTLE_SECONDS = 5
+ACTIVITY_NEEDS_YOU = ("reply", "question")
+
+
+def _tail_entries(path: str) -> List[Dict[str, Any]]:
+    try:
+        size = os.path.getsize(path)
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            if size > ACTIVITY_TAIL_BYTES:
+                fh.seek(size - ACTIVITY_TAIL_BYTES)
+                fh.readline()  # drop the partial line
+            lines = fh.readlines()
+    except OSError:
+        return []
+    entries = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") in ("user", "assistant") and not entry.get("isMeta"):
+            entries.append(entry)
+    return entries
+
+
+def _blocks(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def terminal_activity(run: Dict[str, Any], home: Optional[str] = None, now: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    What the run's terminal is doing: {state, label, detail, at, idle}. States:
+    starting (no session log yet), working (Claude is thinking or writing),
+    tool (running a tool), waiting (the same tool call for a while: still
+    running, or asking you to approve it in the terminal), question (asking you
+    something) and reply (finished its turn, waiting for your message).
+    """
+    path = transcript_path(run["session_id"], home)
+    if not path:
+        return {"state": "starting", "label": "Starting", "detail": "Waiting for Claude to open its session.",
+                "at": None, "idle": None}
+    seen = datetime.fromtimestamp(os.path.getmtime(path))
+    idle = max(0, int(((now or datetime.now()) - seen).total_seconds()))
+    base = {"at": seen.replace(microsecond=0).isoformat(), "idle": idle}
+    entries = _tail_entries(path)
+    last = entries[-1] if entries else None
+    blocks = _blocks(last) if last else []
+    tools = [b for b in blocks if b.get("type") == "tool_use"]
+    if last and last["type"] == "assistant" and tools:
+        tool = tools[-1]
+        line = _tool_line(str(tool.get("name") or ""), tool.get("input"))
+        if tool.get("name") == "AskUserQuestion":
+            return {**base, "state": "question", "label": "Asking you a question", "detail": "Answer it in the terminal."}
+        if idle >= ACTIVITY_SETTLE_SECONDS:
+            return {**base, "state": "waiting", "label": "Waiting on a tool call",
+                    "detail": f"{line}. Still running, or waiting for you to approve it in the terminal."}
+        return {**base, "state": "tool", "label": "Running a tool", "detail": line}
+    if last and last["type"] == "assistant" and any(b.get("type") == "text" and str(b.get("text") or "").strip() for b in blocks) \
+            and idle >= ACTIVITY_SETTLE_SECONDS:
+        return {**base, "state": "reply", "label": "Waiting for your message",
+                "detail": "Claude finished its turn. Reply in the terminal."}
+    return {**base, "state": "working", "label": "Working", "detail": "Claude is thinking or writing."}
 
 
 # ---- following Timeline (phase 2) ------------------------------------------
@@ -801,7 +827,7 @@ def _finish_block(step: Dict[str, Any], findings: Optional[List[Dict[str, Any]]]
 
 
 ACTION_TEXT = {
-    "run": ("Run in terminal", "Opens Claude in a terminal in the task's worktree with this step's prompt."),
+    "run": ("Run in terminal", "Opens Claude in a terminal in the task's worktree with this step's prompt. Its status shows here."),
     "approve": ("Approve result", "Accept this run's result and record your approval."),
     "reject": ("Reject", "Don't accept this run. The step stays where it is; you can run it again."),
     "resume": ("Continue in terminal", "Reopens this run's Claude session in a terminal, so you can answer or carry on."),
@@ -812,28 +838,20 @@ ACTION_TEXT = {
     "qa_issues": ("QA found issues", "QA reported problems: go to Fix QA findings."),
     "qa_passed": ("QA approved", "QA passed the task: go to Release to prod."),
     "close": ("Close workflow", "The task is done."),
-    "reset": ("Reset…", "Erase this task's workflow: its status, runs, decisions, findings and approvals, and every file "
+    "reset": ("Reset…", "Erase this task's workflow: its status, runs, decisions and findings, and every file "
               "in timeline/<id>/. The worktree and its branch stay. Can't be undone."),
     "stop": ("Stop workflow", "Stop this workflow and end its open run, if any (recorded as rejected). Its history stays; you can reopen it."),
     "reopen": ("Reopen workflow", "Carry on from the step it stopped at."),
     "ack": ("Mark Timeline changes as seen", "Clear the list of new Timeline changes for this task."),
-    "explain_blocker": ("Explain the blocker", "A read-only run: Claude explains what blocks the task and drafts a question. Doesn't move the flow."),
+    "explain_blocker": ("Explain the blocker", "A read-only run in a terminal: Claude explains what blocks the task and drafts a question. Doesn't move the flow."),
     "prod_fix": ("Start a prod fix", "The task has a live bug: reopen the workflow at Fix live bug."),
-    "run_terminal": ("Run in terminal instead", "Opens Claude in a terminal for this step instead of running it on the page."),
-    "stop_run": ("Stop run", "Stops the background run; it's recorded as rejected."),
-    "answer": ("Answer", "Sends your answer to the same session; the run carries on here on the page."),
-    "run_agent": ("Run here with approvals", "Runs Claude inside the desk: every edit and command it wants waits for your "
-                  "Allow or Deny on this page, and you can write to it here."),
-    "message": ("Write to Claude", "Sends a message to the running session."),
 }
-DESK_RUN_TEXT = ("Run here", "Runs Claude in the background on this page: it may read the code, run read-only git and "
-                 "the timeline MCP, and write only this task's docs. Output shows live below.")
-NEEDS_NOTE = {"reject", "abandon", "skip", "stop", "back_to_develop", "prod_fix", "answer", "message"}
+NEEDS_NOTE = {"reject", "abandon", "skip", "back_to_develop", "prod_fix"}
 
 
 def actions(wf: Optional[Dict[str, Any]], runs: List[Dict[str, Any]], has_analysis: bool,
             signals: Optional[List[Dict[str, Any]]] = None, blocked: Optional[str] = None,
-            findings: Optional[List[Dict[str, Any]]] = None, agent: bool = False) -> List[Dict[str, Any]]:
+            findings: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """
     What you can do now. Every POST is checked against this list. `signals`
     (unseen Timeline changes) add "Mark as seen" and mark the actions they
@@ -854,16 +872,14 @@ def actions(wf: Optional[Dict[str, Any]], runs: List[Dict[str, Any]], has_analys
         open_run = _open_run(runs)
         if open_run:
             status = run_status(open_run)
-            desk = open_run.get("mode") == "desk"
-            talk = ["message"] if open_run.get("mode") == "agent" and open_run.get("live") else []
-            if status in ("running", "approval"):
-                kinds = talk + ["stop_run"] if desk or talk else ["abandon"]
+            if status == "running":
+                kinds = ["abandon"]
             elif status == "review":
-                kinds = ["approve", "reject"] + talk + ["resume"]
+                kinds = ["approve", "reject", "resume"]
             else:
-                kinds = (["answer"] if desk else []) + talk + ["resume", "reject"]
+                kinds = ["resume", "reject"]
         elif step["run"]:
-            kinds = ["run"] + (["run_terminal"] if step["runner"] == "desk" else []) + (["run_agent"] if agent else [])
+            kinds = ["run"]
             # Finish counts only runs approved since this step was (re)entered.
             if step.get("repeat") and any(r["step"] == step["key"] and r["decision"] == "approved"
                                           and r["id"] > (wf.get("step_run_floor") or 0) for r in runs):
@@ -884,13 +900,9 @@ def actions(wf: Optional[Dict[str, Any]], runs: List[Dict[str, Any]], has_analys
     result = []
     for kind in kinds:
         label, help_text = ACTION_TEXT[kind]
-        if kind == "run" and STEPS[wf["step"]]["runner"] == "desk":
-            label, help_text = DESK_RUN_TEXT
-        if kind == "explain_blocker":
-            help_text += " Runs on this page."
         action = {"kind": kind, "label": label, "help": help_text, "needs_note": kind in NEEDS_NOTE,
                   "suggested": kind in suggested}
-        if kind in ("run", "run_terminal", "run_agent"):
+        if kind == "run":
             action["blocked"] = _gate(STEPS[wf["step"]], has_analysis, wf["issue_number"], findings)
         if kind == "finish":
             action["blocked"] = _finish_block(STEPS[wf["step"]], findings)
@@ -898,8 +910,8 @@ def actions(wf: Optional[Dict[str, Any]], runs: List[Dict[str, Any]], has_analys
     return result
 
 
-def _allowed(kind: str, wf, runs, has_analysis, signals=None, blocked=None, findings=None, agent=False) -> Dict[str, Any]:
-    action = next((a for a in actions(wf, runs, has_analysis, signals, blocked, findings, agent) if a["kind"] == kind), None)
+def _allowed(kind: str, wf, runs, has_analysis, signals=None, blocked=None, findings=None) -> Dict[str, Any]:
+    action = next((a for a in actions(wf, runs, has_analysis, signals, blocked, findings) if a["kind"] == kind), None)
     if not action:
         where = f"at {STEPS[wf['step']]['title']}" if wf else "without a workflow"
         raise ValueError(f"You can't {ACTION_TEXT.get(kind, (kind,))[0].lower()} {where} now.")
@@ -908,7 +920,7 @@ def _allowed(kind: str, wf, runs, has_analysis, signals=None, blocked=None, find
     return action
 
 
-SHORT = {"approval": "approve", "review": "review", "needs_input": "answer", "blocked": "blocked", "failed": "failed",
+SHORT = {"review": "review", "needs_input": "answer", "blocked": "blocked", "failed": "failed",
          "bad_result": "check", "no_result": "check"}
 
 
@@ -928,6 +940,10 @@ def workflow_status(wf: Optional[Dict[str, Any]], open_run: Optional[Dict[str, A
     if open_run:
         status = run_status(open_run)
         if status == "running":
+            act = open_run.get("activity") or {}
+            if act.get("state") in ACTIVITY_NEEDS_YOU:
+                return {"code": "needs_you", "label": f"{title} · {act['label'].lower()} in the terminal",
+                        "short": f"{title} · asks you"}
             return {"code": "running", "label": f"{title} · running", "short": f"{title} · running"}
         return {"code": "needs_you", "label": f"{title} · {RUN_LABELS[status].lower()}", "short": f"{title} · {SHORT[status]}"}
     loud = [s for s in signals or [] if s["level"] in ("warn", "action")]
@@ -964,7 +980,6 @@ def _context(conn, wf: Dict[str, Any], config: Optional[Dict[str, Any]], issue: 
     tl_events = _task_events(conn, issue)
     _sync_findings(conn, wf, (config or {}).get("me"))
     return {
-        "agent": agent_runner.available(),
         "findings": _findings(conn, issue),
         "runs": _runs(conn, issue),
         "has_analysis": bool(repo) and any(d["name"] == "analysis.md" for d in list_docs(repo, issue)),
@@ -975,7 +990,7 @@ def _context(conn, wf: Dict[str, Any], config: Optional[Dict[str, Any]], issue: 
 
 
 def _check(kind: str, wf: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
-    return _allowed(kind, wf, ctx["runs"], ctx["has_analysis"], ctx["signals"], ctx["blocked"], ctx["findings"], ctx["agent"])
+    return _allowed(kind, wf, ctx["runs"], ctx["has_analysis"], ctx["signals"], ctx["blocked"], ctx["findings"])
 
 
 # ---- the page's view -------------------------------------------------------
@@ -986,11 +1001,7 @@ def workflow_view(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = 
     conn = _connect(base_dir, create=False)
     try:
         wf = _workflow(conn, issue) if conn else None
-        ctx = _context(conn, wf, config, issue) if wf else {"runs": [], "signals": [], "blocked": None, "findings": [],
-                                                            "agent": False}
-        open_id = next((r["id"] for r in reversed(ctx["runs"]) if not r["decision"]), None)
-        permissions = [dict(r) for r in conn.execute(
-            "SELECT * FROM workflow_permissions WHERE run_id = ? ORDER BY id DESC LIMIT 30", (open_id,))] if open_id else []
+        ctx = _context(conn, wf, config, issue) if wf else {"runs": [], "signals": [], "blocked": None, "findings": []}
         runs = ctx["runs"]
         events = [dict(r) for r in conn.execute(
             "SELECT * FROM workflow_events WHERE issue_number = ? ORDER BY id", (issue,))] if wf else []
@@ -1014,7 +1025,7 @@ def workflow_view(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = 
         "runs": [_public_run(r) for r in reversed(runs)],
         "events": list(reversed(events)),
         "docs": docs,
-        "actions": actions(wf, runs, has_analysis, ctx["signals"], ctx["blocked"], ctx["findings"], ctx["agent"]),
+        "actions": actions(wf, runs, has_analysis, ctx["signals"], ctx["blocked"], ctx["findings"]),
         "status": workflow_status(wf, open_run, ctx["signals"]),
         "repo": repo["name"] if repo else None,
         "signals": ctx["signals"],
@@ -1023,9 +1034,6 @@ def workflow_view(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = 
         "me": config.get("me"),
         "side_steps": list(SIDE.values()),
         "findings": [_public_finding(f, wf, open_run) for f in ctx["findings"]],
-        "permissions": [{**{k: p[k] for k in ("id", "tool", "summary", "status", "requested_at", "decided_at", "note")},
-                         "detail": json.loads(p["input"] or "{}")} for p in permissions],
-        "agent_available": ctx["agent"],
         "reset_preview": _reset_preview(wf, ctx, repo, issue) if wf else None,
         "finding_statuses": FINDING_LABELS,
     }
@@ -1158,17 +1166,12 @@ def _finding(ctx: Dict[str, Any], finding_id: Any) -> Dict[str, Any]:
 def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
              stages: Optional[Dict[str, str]] = None, runner: Runner = _subprocess_runner,
              launcher: Launcher = work_session._popen_launcher, now: Optional[datetime] = None,
-             side: Optional[str] = None, finding_id: Any = None, mode: Optional[str] = None,
-             headless: Headless = work_session.popen_headless,
-             agent_backend: Optional[agent_runner.Backend] = None) -> Dict[str, Any]:
+             side: Optional[str] = None, finding_id: Any = None) -> Dict[str, Any]:
     """
     Runs the current step (or the side run `side`, see SIDE): a new run row,
     then Claude in a terminal with --session-id. Fix QA findings works on one
     finding (`finding_id`, default the oldest open bug); Draft a reply needs a
-    finding marked Question. `mode` is "desk" (in the background, read-only
-    tools, see desk_tools), "terminal", or "agent" (inside the desk, every tool
-    call waits for your approval on the page; needs the Agent SDK); by default
-    the step's own runner. Code-changing steps never run as "desk".
+    finding marked Question. Always a terminal: nothing runs in the background.
     """
     issue = _issue(issue)
     with _lock:
@@ -1194,8 +1197,7 @@ def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
                 step = SIDE[side]
             else:
                 step = STEPS[wf["step"]]
-                _check("run_agent" if mode == "agent" else
-                       "run_terminal" if mode == "terminal" and step["runner"] == "desk" else "run", wf, ctx)
+                _check("run", wf, ctx)
                 if step["key"] == "qa_fix" and ctx["findings"]:
                     finding = _finding(ctx, finding_id) if finding_id else _open_bugs(ctx["findings"])[0]
                     if finding["status"] != "bug":
@@ -1203,24 +1205,12 @@ def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
             blocked = [name for name, progress in (stages or {}).items() if progress == "blocked"]
             if step.get("checks_blocked") and blocked:
                 raise ValueError(f"Timeline shows {', '.join(blocked)} blocked. Sort that out in Timeline first.")
-            mode = mode or step["runner"]
-            if mode not in ("desk", "terminal", "agent"):
-                raise ValueError(f"Unknown run mode {mode!r}.")
-            if mode == "agent" and not ctx["agent"]:
-                raise ValueError("Runs with approvals on the page need the Claude Agent SDK: pip install claude-agent-sdk.")
-            if mode == "desk" and step["runner"] != "desk":
-                raise ValueError(f"{step['title']} changes code, so it runs in a terminal.")
-            if mode == "desk":
-                running = conn.execute("SELECT COUNT(*) FROM workflow_runs WHERE mode = 'desk' AND decision IS NULL "
-                                       "AND ended_at IS NULL AND result IS NULL").fetchone()[0]
-                if running >= MAX_DESK_RUNS:
-                    raise ValueError(f"{running} runs are already working on the page. Wait for one, or run this in a terminal.")
             tree = work_session.worktree_for(config, wf["code"], issue, wf["title"], runner)
             session = str(uuid.uuid4())
             cur = conn.execute(
-                "INSERT INTO workflow_runs (issue_number, step, session_id, cwd, prompt, started_at, finding_id, mode) "
-                "VALUES (?, ?, ?, ?, '', ?, ?, ?)",
-                (issue, step["key"], session, tree["path"], _now(now), finding["id"] if finding else None, mode))
+                "INSERT INTO workflow_runs (issue_number, step, session_id, cwd, prompt, started_at, finding_id) "
+                "VALUES (?, ?, ?, ?, '', ?, ?)",
+                (issue, step["key"], session, tree["path"], _now(now), finding["id"] if finding else None))
             run_id = cur.lastrowid
             prompt = build_prompt(step["key"], issue, repo, tree["branch"], run_id, finding)
             conn.execute("UPDATE workflow_runs SET prompt = ? WHERE id = ?", (prompt, run_id))
@@ -1229,24 +1219,9 @@ def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
             exit_path = os.path.join(runs_dir(tree["path"], issue), f"{run_id}.exit")
             env = work_session.launch_env(config)
             try:
-                if mode == "desk":
-                    stream = os.path.join(runs_dir(tree["path"], issue), f"{run_id}.stream.jsonl")
-                    args = ["-p", prompt, "--output-format", "stream-json", "--verbose", "--session-id", session,
-                            "--mcp-config", work_session.mcp_config(repo),
-                            "--add-dir", SKILLS_DIR, os.path.realpath(docs_dir(repo, issue)),
-                            "--allowedTools", *desk_tools(issue, repo)]
-                    pid = headless(work_session.headless_command(tree["path"], config["claude"], args, stream, exit_path), env)
-                    conn.execute("UPDATE workflow_runs SET pid = ? WHERE id = ?", (pid, run_id))
-                elif mode == "agent":
-                    agent_runner.start(agent_runner.AgentRun(
-                        run_id, issue, base_dir, tree["path"], prompt, session,
-                        os.path.join(runs_dir(tree["path"], issue), f"{run_id}.stream.jsonl"), exit_path,
-                        claude=config["claude"], add_dirs=[SKILLS_DIR, os.path.realpath(docs_dir(repo, issue))],
-                        mcp_servers={work_session.MCP_NAME: work_session.mcp_server(repo)}), agent_backend)
-                else:
-                    launcher(work_session.terminal_command(config, tree["path"], f"#{issue} · {step['title']} · run {run_id}",
-                                                           [prompt, "--session-id", session, "--mcp-config",
-                                                            work_session.mcp_config(repo)], exit_path), env)
+                launcher(work_session.terminal_command(config, tree["path"], f"#{issue} · {step['title']} · run {run_id}",
+                                                       [prompt, "--session-id", session, "--mcp-config",
+                                                        work_session.mcp_config(repo)], exit_path), env)
             except Exception as exc:
                 conn.rollback()
                 raise work_session.WorkSessionError(f"Couldn't start Claude: {exc}")
@@ -1257,8 +1232,7 @@ def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
             conn.commit()
         finally:
             conn.close()
-    return {"run_id": run_id, "session_id": session, "path": tree["path"], "branch": tree["branch"], "note": tree.get("note"),
-            "mode": mode}
+    return {"run_id": run_id, "session_id": session, "path": tree["path"], "branch": tree["branch"], "note": tree.get("note")}
 
 
 def resume_run(issue: Any, run_id: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
@@ -1282,8 +1256,8 @@ def resume_run(issue: Any, run_id: Any, config: Dict[str, Any], base_dir: Option
             for path in (_exit_file(run), _result_path(run)):
                 if os.path.exists(path):
                     os.remove(path)
-            conn.execute("UPDATE workflow_runs SET ended_at = NULL, exit_code = NULL, result = NULL, result_at = NULL, "
-                         "mode = 'terminal', pid = NULL WHERE id = ?", (run["id"],))
+            conn.execute("UPDATE workflow_runs SET ended_at = NULL, exit_code = NULL, result = NULL, result_at = NULL "
+                         "WHERE id = ?", (run["id"],))
             try:
                 launcher(work_session.terminal_command(config, run["cwd"], f"#{issue} · {ALL_STEPS[run['step']]['title']} · run {run['id']}",
                                                        [resume_prompt(issue, run["id"]), "--resume", run["session_id"]]
@@ -1299,138 +1273,6 @@ def resume_run(issue: Any, run_id: Any, config: Dict[str, Any], base_dir: Option
                 asked = " · ".join(previous.get("questions") or [])
                 note = f"Previous result: {previous.get('status')} · {previous.get('summary', '')}" + (f" · Asked: {asked}" if asked else "")
             _event(conn, issue, run["step"], "resume", note[:2000], run["id"], now)
-            conn.commit()
-        finally:
-            conn.close()
-    return {"run_id": run["id"]}
-
-
-def answer_run(issue: Any, run_id: Any, answer: str, config: Dict[str, Any], base_dir: Optional[str] = None,
-               headless: Headless = work_session.popen_headless, now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Sends your answer to a desk run that stopped for one; it carries on in the background (`claude -p --resume`)."""
-    issue = _issue(issue)
-    answer = str(answer or "").strip()[:4000]
-    if not answer:
-        raise ValueError("Write your answer first.")
-    with _lock:
-        conn = _connect(base_dir)
-        try:
-            wf = _workflow(conn, issue)
-            if not wf:
-                raise LookupError(f"#{issue} has no workflow.")
-            ctx = _context(conn, wf, config, issue)
-            _check("answer", wf, ctx)
-            run = _open_run(ctx["runs"])
-            if str(run["id"]) != str(run_id):
-                raise ValueError(f"Only the open run ({run['id']}) can be answered.")
-            repo = ctx["repo"]
-            if not repo or not os.path.isdir(run["cwd"]):
-                raise ValueError(f"{run['cwd']} is gone. Reject this run and run the step again.")
-            previous = json.loads(run["result"]) if run["result"] else None
-            for path in (_exit_file(run), _result_path(run)):
-                if os.path.exists(path):
-                    os.remove(path)
-            # Your own words, so they may go into the prompt; the report contract is repeated.
-            message = f"{answer}\n\n{resume_prompt(issue, run['id'])}"
-            args = ["-p", message, "--resume", run["session_id"], "--output-format", "stream-json", "--verbose",
-                    "--mcp-config", work_session.mcp_config(repo),
-                    "--add-dir", SKILLS_DIR, os.path.realpath(docs_dir(repo, issue)), "--allowedTools", *desk_tools(issue, repo)]
-            try:
-                pid = headless(work_session.headless_command(run["cwd"], config["claude"], args, _stream_file(run),
-                                                             _exit_file(run), append=True), work_session.launch_env(config))
-            except Exception as exc:
-                raise work_session.WorkSessionError(f"Couldn't start Claude: {exc}")
-            conn.execute("UPDATE workflow_runs SET ended_at = NULL, exit_code = NULL, result = NULL, result_at = NULL, pid = ? "
-                         "WHERE id = ?", (pid, run["id"]))
-            asked = " · ".join((previous or {}).get("questions") or [])
-            _event(conn, issue, run["step"], "answer", (f"Asked: {asked} · " if asked else "") + f"Answer: {answer}"[:2000],
-                   run["id"], now)
-            conn.commit()
-        finally:
-            conn.close()
-    return {"run_id": run["id"]}
-
-
-def message_run(issue: Any, run_id: Any, text: str, config: Dict[str, Any], base_dir: Optional[str] = None,
-                now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Your message to a run working inside the desk (phase 5), e.g. the go-ahead it asked for."""
-    issue = _issue(issue)
-    text = str(text or "").strip()[:4000]
-    if not text:
-        raise ValueError("Write a message first.")
-    conn = _connect(base_dir)
-    try:
-        wf = _workflow(conn, issue)
-        if not wf:
-            raise LookupError(f"#{issue} has no workflow.")
-        ctx = _context(conn, wf, config, issue)
-        _check("message", wf, ctx)
-        run = _open_run(ctx["runs"])
-        if str(run["id"]) != str(run_id):
-            raise ValueError(f"Only the open run ({run['id']}) takes messages.")
-        if run["result"]:  # it carries on: the next result replaces this one
-            for path in (_result_path(run),):
-                if os.path.exists(path):
-                    os.remove(path)
-            conn.execute("UPDATE workflow_runs SET result = NULL, result_at = NULL WHERE id = ?", (run["id"],))
-        agent_runner.send(run["id"], text)
-        _event(conn, issue, run["step"], "message", text[:2000], run["id"], now)
-        conn.commit()
-    finally:
-        conn.close()
-    return {"run_id": run["id"]}
-
-
-def decide_permission(issue: Any, permission_id: Any, allow: bool, base_dir: Optional[str] = None,
-                      note: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Allow or deny one tool call a run inside the desk is waiting on."""
-    issue = _issue(issue)
-    note = str(note or "").strip()[:2000]
-    conn = _connect(base_dir)
-    try:
-        row = conn.execute("SELECT p.*, r.decision AS run_decision, r.step AS run_step FROM workflow_permissions p "
-                           "JOIN workflow_runs r ON r.id = p.run_id WHERE p.id = ? AND p.issue_number = ?",
-                           (int(permission_id), issue)).fetchone()
-        if not row:
-            raise LookupError(f"No such approval request on #{issue}.")
-        if row["status"] != "pending" or row["run_decision"]:
-            raise ValueError("That request isn't waiting any more. Reload the page.")
-        if not allow and not note:
-            raise ValueError("Say why you deny it, so Claude can do something else.")
-        status = "allowed" if allow else "denied"
-        conn.execute("UPDATE workflow_permissions SET status = ?, decided_at = ?, note = ? WHERE id = ? AND status = 'pending'",
-                     (status, _now(now), note or None, row["id"]))
-        _event(conn, issue, row["run_step"], "permission", f"{status.title()}: {row['summary']}" + (f" · {note}" if note else ""),
-               row["run_id"], now)
-        conn.commit()
-    finally:
-        conn.close()
-    return {"permission": row["id"], "status": status}
-
-
-def stop_run(issue: Any, run_id: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
-             note: str = "", now: Optional[datetime] = None, stopper: Callable[[Optional[int]], bool] = work_session.stop_group) -> Dict[str, Any]:
-    """Ends a desk run that is still working and records it as rejected."""
-    issue = _issue(issue)
-    with _lock:
-        conn = _connect(base_dir)
-        try:
-            wf = _workflow(conn, issue)
-            if not wf:
-                raise LookupError(f"#{issue} has no workflow.")
-            ctx = _context(conn, wf, config, issue)
-            _check("stop_run", wf, ctx)
-            run = _open_run(ctx["runs"])
-            if str(run["id"]) != str(run_id):
-                raise ValueError(f"Only the open run ({run['id']}) can be stopped.")
-            if run.get("mode") == "agent":
-                agent_runner.stop(run["id"])
-            else:
-                stopper(run.get("pid"))
-            note = str(note or "").strip()[:2000] or "Stopped from the page."
-            conn.execute("UPDATE workflow_runs SET decision = 'rejected', decided_at = ?, note = ?, ended_at = COALESCE(ended_at, ?) "
-                         "WHERE id = ?", (_now(now), note, _now(now), run["id"]))
-            _event(conn, issue, run["step"], "stop_run", note, run["id"], now)
             conn.commit()
         finally:
             conn.close()
@@ -1495,13 +1337,8 @@ def add_finding(issue: Any, label: str, base_dir: Optional[str] = None, config: 
     return {"finding": cur.lastrowid}
 
 
-def _end_run(conn, run: Dict[str, Any], note: str, now: Optional[datetime],
-             stopper: Callable[[Optional[int]], bool]) -> None:
-    """Ends an open run (its process or session too) and records it as rejected."""
-    if run.get("mode") == "agent":
-        agent_runner.stop(run["id"])
-    elif run.get("mode") == "desk":
-        stopper(run.get("pid"))
+def _end_run(conn, run: Dict[str, Any], note: str, now: Optional[datetime]) -> None:
+    """Records an open run as rejected. Its terminal stays open until you close it."""
     conn.execute("UPDATE workflow_runs SET decision = 'rejected', decided_at = ?, note = ?, ended_at = COALESCE(ended_at, ?) "
                  "WHERE id = ?", (_now(now), note, _now(now), run["id"]))
 
@@ -1542,15 +1379,14 @@ def _reset_preview(wf: Dict[str, Any], ctx: Dict[str, Any], repo: Optional[Dict[
     }
 
 
-def reset_workflow(issue: Any, confirm: Any, base_dir: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
-                   stopper: Callable[[Optional[int]], bool] = work_session.stop_group) -> Dict[str, Any]:
+def reset_workflow(issue: Any, confirm: Any, base_dir: Optional[str] = None,
+                   config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Erases the task's workflow so it can start from nothing: the workflows row
-    and every run, decision, QA finding and approval request, plus every file
+    and every run, decision and QA finding, plus every file
     in timeline/<id>/ (task.md, analysis.md, progress.md, release notes, run
-    files, …). `confirm` must be the issue number. A run still working on the
-    page is stopped first; a terminal run that is still open refuses (its
-    Claude would keep writing into the folder). The worktree, its branch and
+    files, …). `confirm` must be the issue number. A run whose terminal is still
+    open refuses (its Claude would keep writing into the folder). The worktree, its branch and
     the copied Timeline history (task_events, watchlist) stay.
     """
     issue = _issue(issue)
@@ -1565,36 +1401,24 @@ def reset_workflow(issue: Any, confirm: Any, base_dir: Optional[str] = None, con
             ctx = _context(conn, wf, config, issue)
             _check("reset", wf, ctx)
             open_run = _open_run(ctx["runs"])
-            if open_run and (open_run.get("mode") or "terminal") == "terminal" and run_status(open_run) == "running":
+            if open_run and run_status(open_run) == "running":
                 raise ValueError(f"Run {open_run['id']} is still open in a terminal. Close that terminal (or Abandon the run) first.")
-            if open_run and open_run.get("mode") == "agent":
-                agent_runner.stop(open_run["id"])
-            elif open_run and open_run.get("mode") == "desk":
-                stopper(open_run.get("pid"))
             folders = _docs_folders(wf, ctx["repo"], issue)
             removed = {"runs": len(ctx["runs"]), "findings": len(ctx["findings"]),
                        "files": sum(len(_files_in(f)) for f in folders), "folders": folders}
-            run_ids = [r["id"] for r in ctx["runs"]]
-            if run_ids:
-                conn.execute(f"DELETE FROM workflow_permissions WHERE run_id IN ({','.join('?' * len(run_ids))})", run_ids)
-            for table in ("workflow_permissions", "workflow_runs", "workflow_events", "qa_findings"):
+            for table in ("workflow_runs", "workflow_events", "qa_findings"):
                 conn.execute(f"DELETE FROM {table} WHERE issue_number = ?", (issue,))
             conn.execute("DELETE FROM workflows WHERE issue_number = ?", (issue,))
             conn.commit()
         finally:
             conn.close()
-    if open_run and open_run.get("mode") == "agent":  # its last write (the exit file) must land before the folder goes
-        deadline = time.monotonic() + 10
-        while agent_runner.running(open_run["id"]) and time.monotonic() < deadline:
-            time.sleep(0.1)
     for folder in folders:
         shutil.rmtree(folder)  # doesn't follow links inside the folder
     return removed
 
 
 def decide(issue: Any, kind: str, base_dir: Optional[str] = None, config: Optional[Dict[str, Any]] = None,
-           run_id: Any = None, note: str = "", now: Optional[datetime] = None,
-           stopper: Callable[[Optional[int]], bool] = work_session.stop_group) -> Dict[str, Any]:
+           run_id: Any = None, note: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
     """Applies one of your decisions (see actions) and records it."""
     issue = _issue(issue)
     note = str(note or "").strip()[:2000]
@@ -1615,8 +1439,6 @@ def decide(issue: Any, kind: str, base_dir: Optional[str] = None, config: Option
                 if not open_run or str(open_run["id"]) != str(run_id):
                     raise ValueError("That run isn't the one waiting for a decision. Reload the page.")
                 event_run = open_run["id"]
-                if open_run.get("mode") == "agent":
-                    agent_runner.stop(open_run["id"])  # the decision closes its session
                 decision = "approved" if kind == "approve" else "rejected"
                 conn.execute("UPDATE workflow_runs SET decision = ?, decided_at = ?, note = ? WHERE id = ?",
                              (decision, _now(now), note or None, open_run["id"]))
@@ -1641,7 +1463,7 @@ def decide(issue: Any, kind: str, base_dir: Optional[str] = None, config: Option
             elif kind == "stop":
                 if open_run:  # a stopped workflow keeps no run going
                     event_run = open_run["id"]
-                    _end_run(conn, open_run, f"Workflow stopped: {note}", now, stopper)
+                    _end_run(conn, open_run, f"Workflow stopped: {note}" if note else "Workflow stopped.", now)
                 _set_workflow(conn, issue, now, state="stopped")
             elif kind == "reopen":
                 _set_workflow(conn, issue, now, state="active")

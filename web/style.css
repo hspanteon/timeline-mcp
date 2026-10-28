@@ -568,7 +568,16 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 0.85; 
 .tl-dialog h2 { margin: 0; font-size: 18px; }
 .tl-dialog-x { border: 0; background: transparent; color: var(--muted); font-size: 22px; line-height: 1; cursor: pointer; }
 .tl-dialog-x:hover { color: var(--ink); }
-.tl-dialog footer { display: flex; justify-content: flex-end; margin-top: 16px; }
+.tl-dialog footer { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+/* confirmDialog / askDialog: the form fills the dialog, so a click on the dialog itself is the backdrop */
+.tl-modal { padding: 0; }
+.tl-modal form { padding: 20px 22px; }
+.tl-modal header { gap: 12px; align-items: flex-start; }
+.tl-modal h2 { line-height: 1.35; overflow-wrap: anywhere; }
+.tl-modal-text { margin: 10px 0 0; color: var(--muted); line-height: 1.5; white-space: pre-line; }
+.tl-modal label { display: block; margin-top: 14px; font-size: 13px; font-weight: 600; }
+.tl-modal textarea { display: block; margin-top: 6px; font-family: var(--font); }
+.tl-modal-problem { margin: 8px 0 0; color: var(--blocked); font-size: 13px; }
 .tl-watch-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .tl-watch-list li { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
 .tl-watch-task { --hue: 210; display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; }
@@ -703,17 +712,19 @@ a:hover > .tl-sha { border-color: #c4a5ff; }
   border: 1px solid var(--line); border-radius: var(--radius); font: inherit; }
 .card.pr .head .pill { text-decoration: none; }
 
-/* ---- approvals on the page (phase 5) ----------------------------------------- */
-.wf-approvals { border-color: var(--accent); }
-.permission { padding: 8px 0; border-top: 1px solid var(--line); }
-.permission pre { max-height: 280px; overflow: auto; white-space: pre-wrap; margin: 6px 0; }
-.wf-diff pre.old { border-left: 3px solid var(--blocked); }
-.wf-diff pre.new, .permission pre.new { border-left: 3px solid var(--done); }
-.wf-message { display: flex; gap: 8px; align-items: flex-end; margin: 0 0 12px; }
-.wf-message textarea { flex: 1; min-height: 44px; padding: 6px 10px; background: var(--bg); color: var(--ink);
-  border: 1px solid var(--line); border-radius: var(--radius); font: inherit; resize: vertical; }
-.msg.desk .who { color: var(--progress); }
-.pill.approval { color: var(--accent-ink); border-color: var(--accent); }
+/* ---- what a run's terminal is doing ------------------------------------------ */
+.wf-activity { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin: 8px 0; padding: 8px 12px;
+  border: 1px solid var(--line); border-left: 3px solid var(--progress); border-radius: var(--radius); }
+.wf-activity .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--progress); align-self: center; }
+.wf-activity.working .dot, .wf-activity.tool .dot { animation: wf-pulse 1.4s ease-in-out infinite; }
+.wf-activity .text { color: var(--muted); }
+.wf-activity small { margin-left: auto; color: var(--muted); }
+.wf-activity.waiting, .wf-activity.reply, .wf-activity.question { border-left-color: var(--accent); }
+.wf-activity.waiting .dot, .wf-activity.reply .dot, .wf-activity.question .dot { background: var(--accent); }
+.wf-activity.starting { border-left-color: var(--line); }
+.wf-activity.starting .dot { background: var(--muted); }
+@keyframes wf-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) { .wf-activity .dot { animation: none !important; } }
 
 /* ---- reset ------------------------------------------------------------------- */
 .wf-reset { border-color: var(--blocked); }

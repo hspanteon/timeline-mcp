@@ -799,6 +799,8 @@ class TestTaskStatuses:
         assert status["stage_status"] == "Going live pending"
         assert status["stages"]["QA"] == "done" and status["stages"]["Live"] == "not started"
         assert status["release_state"] == "qa approved" and status["qa_approved"] is True
+        assert status["project_id"] is None
+        assert pc.extract_task_status({"data": {"project_id": 16}}, "1")["project_id"] == 16
 
     def test_unknown_stage_code(self):
         status = pc.extract_task_status({"data": {"stage_qa": "x"}}, "1")

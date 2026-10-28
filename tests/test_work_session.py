@@ -55,6 +55,10 @@ def test_slug_and_prompt():
     assert ws.branch_name("6034", "BUG: Cannot delete Course") == "6034-cannot-delete-course"
     assert ws.slugify("Søk på ordre") == "sk-pa-ordre"  # ascii only
     assert ws.slugify("!!!") == "task"
+    long = "Serial number does not get saved if order has packing slip generated and customer is invoiced later"
+    assert ws.branch_name("6117", long) == "6117-" + long.lower().replace(" ", "-")  # the whole title, never cut short
+    huge = ws.branch_name("6117", "word " * 100)
+    assert len(huge) <= ws.MAX_BRANCH and huge.endswith("-word")  # only past the file-name limit, at a word break
 
 
 def test_load_config_defaults(tmp_path):
@@ -72,16 +76,22 @@ def test_load_config_defaults(tmp_path):
 def test_worktree_created_then_reused(setup):
     cfg = setup["config"]
     result = ws.worktree_for(cfg, "15033", "5001", "New report")
-    path = os.path.join(cfg["repos"]["15033"]["worktrees"], "5001-new-report")
+    path = os.path.join(cfg["repos"]["15033"]["worktrees"], "duell-admin-5001")  # the folder is named by the ID only
     assert result == {"path": path, "branch": "5001-new-report", "created": True, "repo": "duell-admin"}
     assert os.path.isfile(os.path.join(path, "a.txt"))
     again = ws.worktree_for(cfg, "15033", "5001", "Renamed")
     assert again["created"] is False and again["path"] == path
+    # Found by its folder too, even after the branch is renamed.
+    git(path, "branch", "-m", "renamed-by-hand")
+    assert ws.worktree_for(cfg, "15033", "5001", "x")["path"] == path
+    listed = ws.list_worktrees(cfg)
+    assert [(w["issue_id"], w["branch"]) for w in listed] == [("5001", "renamed-by-hand")]
 
 
 def test_worktree_reuses_remote_branch(setup):
     result = ws.worktree_for(setup["config"], "15033", "6034", "Whatever")
     assert result["branch"] == "6034-existing" and result["created"] is True
+    assert result["path"].endswith(os.sep + "duell-admin-6034")
     assert os.path.isfile(os.path.join(result["path"], "b.txt"))
     assert git(result["path"], "rev-parse", "--abbrev-ref", "@{u}").strip() == "origin/6034-existing"
 
@@ -104,7 +114,7 @@ def test_list_and_remove(setup):
     cfg = setup["config"]
     clean = ws.worktree_for(cfg, "15033", "5001", "Clean one")["path"]
     work = ws.worktree_for(cfg, "15033", "5002", "Work one")["path"]
-    (setup["repo"].parent / "duell-admin-worktrees" / "5002-work-one" / "c.txt").write_text("c\n")
+    (setup["repo"].parent / "duell-admin-worktrees" / "duell-admin-5002" / "c.txt").write_text("c\n")
 
     items = {i["issue_id"]: i for i in ws.list_worktrees(cfg)}
     assert set(items) == {"5001", "5002"}  # the main checkout isn't listed

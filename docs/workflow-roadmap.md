@@ -34,7 +34,7 @@ Decisions the user made (do not re-ask):
 | How many approval points? | **As many as possible** (list in §3.6). |
 | Who sees the status? | **Only the user.** Local SQLite database, as for the rest of the desk. No server, no sharing. |
 | QA findings skill? | **No new skill.** QA findings are `timeline-progress` work in the `qa-fix` phase ("same working, in correction form"). |
-| Read-only steps on the page? | Planned for phase 4 (run headless in the dashboard with live output). |
+| Read-only steps on the page? | Tried in phase 4, **removed 2026-10-28**: every step runs in a terminal (§10.9). |
 
 Ground rules that every phase must keep:
 
@@ -59,7 +59,7 @@ Ground rules that every phase must keep:
 | 2 | Follow Timeline: auto-watch, signals, suggestions, "Needs you" board | **Built** 2026-10-28 (§4, as built §10) |
 | 3 | QA findings checklist, per-finding fixes, release integration, prod fixes | **Built** 2026-10-28 (§5, as built §10) |
 | 4 | Read-only steps run inside the dashboard with live output | **Built** 2026-10-28 (§6, as built §10) |
-| 5 | (Optional) In-dashboard approvals for every tool call (Agent SDK) | **Built**; SDK installed and smoke-tested 2026-10-28 (§7, as built §10) |
+| 5 | (Optional) In-dashboard approvals for every tool call (Agent SDK) | **Built, then removed 2026-10-28 (§10.9)**; SDK installed and smoke-tested 2026-10-28 (§7, as built §10) |
 
 Phases 2–5 were built in one go on 2026-10-28 ("implement all phases, fix and
 optimise later"). Their designs below are the plan; §10 says what was actually
@@ -493,6 +493,7 @@ Approve / Deny on the page. Only if the user wants to leave the terminal entirel
 | 2026-10-27 | Decisions: code steps in terminal (option 1), max approvals, me-only local DB. |
 | 2026-10-27 | Phase 1 built: `workflow.py`, schema v3, task workflow panel, badges; old Start launcher removed. 252 tests; sandbox click-through; real Claude run not yet tried. |
 | 2026-10-28 | Phases 2–5 built (§10). 269 tests; sandbox click-through of every phase; real Claude runs and the real Agent SDK not tried yet. |
+| 2026-10-28 | Phases 4 and 5 removed: terminal only, plus a live status of what the terminal is doing (§10.9). |
 | next | Phase 1 corrections (§3.9) and the unverified items in §10.6. |
 
 
@@ -554,7 +555,7 @@ also opens a new QA window (`qa_event_floor`) when coming into `qa` from outside
   isn't at the matching release step. Task docs have a Copy button (release notes,
   estimates, reply drafts).
 
-### 10.4 Phase 4 — read-only steps on the page
+### 10.4 Phase 4 — read-only steps on the page (removed, see §10.9)
 
 - `runner` per step: `desk` for intake, estimate, review, release_qa, release_prod,
   release_hotfix and both side runs; `terminal` for develop, qa_fix, prod_fix (never desk).
@@ -573,7 +574,7 @@ also opens a new QA window (`qa_event_floor`) when coming into `qa` from outside
 - At most `MAX_DESK_RUNS` (2) desk runs at once; a desk run whose process is gone
   without an exit file shows "Ended without a result".
 
-### 10.5 Phase 5 — approvals on the page (Agent SDK)
+### 10.5 Phase 5 — approvals on the page (Agent SDK) (removed, see §10.9)
 
 - `agent_runner.py`: a run in a thread of the dashboard with its own asyncio loop.
   `sdk_backend` is the only SDK code: `ClaudeSDKClient` with `can_use_tool`,
@@ -625,7 +626,7 @@ was closed, and the session had no timeline MCP tools.
   session id on its command line (`work_session.session_alive`, a `/proc` scan; `None`
   where `/proc` doesn't exist, which leaves the run alone), after a 60 s grace from the
   last launch (`runs/<run>.launched`, touched by run and resume).
-- **Stop workflow ends the open run** (rejected, note "Workflow stopped: <reason>"),
+- **Stop workflow ends the open run** (rejected, note "Workflow stopped." or "Workflow stopped: <reason>"; stop asks for no reason),
   stopping a desk process or an approvals session. `stop_group` never signals the
   dashboard's own process group.
 - **Every run brings its own timeline MCP server.** Cause: `~/.claude.json` has
@@ -652,3 +653,28 @@ folder(s). Kept: the worktree and its branch (Work tab), and the copied Timeline
 (`task_events`, `watchlist`). Afterwards the task page shows "Start a workflow" again.
 `POST /api/workflow/{issue}/reset {confirm}` (guarded). Nothing records the reset itself,
 because nothing of the workflow is left.
+
+### 10.9 Terminal only (2026-10-28)
+
+Three ways to run a step ("Run here", "Run in terminal instead", "Run here with approvals")
+behaved differently and two of them were invisible background processes. Decision: **every
+run is an interactive Claude Code session in a terminal; nothing runs in the background.**
+
+- Removed: `agent_runner.py`, `desk_tools`, `DESK_STEPS` / step `runner`, `run_step`'s
+  `mode`, `headless` and `agent_backend`, `answer_run`, `message_run`, `decide_permission`,
+  `stop_run`, the endpoints `answer`, `stop-run`, `message`, `permissions/{id}`,
+  `work_session.headless_command` / `popen_headless` / `stop_group` / `alive`, the page's
+  Approvals card and message box, the actions `run_terminal`, `run_agent`, `answer`,
+  `stop_run`, `message`. The Agent SDK is no longer used. Schema stays at version 7
+  (`workflow_runs.mode` / `pid` and `workflow_permissions` are unused; old rows are read as
+  terminal runs, and an old open run ends by the usual "no process has its session id" rule).
+- Added: `terminal_activity(run)` reads the tail of the run's Claude session log and says what
+  the terminal is doing: **starting**, **working**, **running a tool** (with the tool call),
+  **waiting on a tool call** (same call for 5 s+: still running or asking you to approve it),
+  **asking a question** (`AskUserQuestion`) and **waiting for your message** (Claude ended its
+  turn with text). Each carries the log's age ("last activity 40 s ago"). The run card shows
+  it as a status line; `question` and `reply` turn the workflow badge to "asks you" and put
+  the task in the needs-you group; the page re-reads every 5 s while a run is open.
+- Limits: the log can't tell a permission prompt from a long-running command, so "waiting on
+  a tool call" says both; it also lags a few seconds behind the terminal. Nothing is sent to
+  the terminal from the page.

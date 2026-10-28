@@ -18,7 +18,6 @@ import os
 import re
 import filecmp
 import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -85,6 +84,14 @@ def load_config(path: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def board_for_project(config: Dict[str, Any], project_id: Any) -> Optional[str]:
+    """The board whose repo has this Timeline project id; None when no board or several boards have it."""
+    if project_id in (None, ""):
+        return None
+    codes = [code for code, repo in config["repos"].items() if str(repo.get("id")) == str(project_id)]
+    return codes[0] if len(codes) == 1 else None
+
+
 def public_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """What the page needs: which boards have a repo."""
     return {
@@ -95,16 +102,31 @@ def public_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---- naming ----------------------------------------------------------------
-def slugify(title: str, limit: int = 40) -> str:
+# Git keeps a branch as a file under .git/refs/heads, and a file name can't pass
+# 255 bytes; only a title that long is shortened (at a word break).
+MAX_BRANCH = 240
+
+
+def slugify(title: str, limit: Optional[int] = None) -> str:
+    """The whole task title as a slug; only cut (at a word break) when `limit` is given."""
     text = unicodedata.normalize("NFKD", title or "").encode("ascii", "ignore").decode()
     text = re.sub(r"\[[^\]]*\]", " ", text)  # drop [PRI2] [BO] style tags
     text = re.sub(r"^\s*(bug|crm|sa|qa|prod)\s*:\s*", "", text, flags=re.I)
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-    return slug[:limit].rstrip("-") or "task"
+    if limit is not None and len(slug) > limit:
+        cut = slug[:limit + 1]
+        slug = cut.rsplit("-", 1)[0] if "-" in cut else slug[:limit]
+    return slug or "task"
 
 
 def branch_name(issue_id: str, title: str) -> str:
-    return f"{issue_id}-{slugify(title)}"
+    """`<issue>-<full-title-slug>`, the team's branch format."""
+    return f"{issue_id}-{slugify(title, MAX_BRANCH - len(str(issue_id)) - 1)}"
+
+
+def worktree_dir(repo: Dict[str, Any], issue_id: str) -> str:
+    """A task's worktree folder: the repo name with the issue ID after it, e.g. duell-admin-5145."""
+    return os.path.join(repo["worktrees"], f"{repo['name']}-{issue_id}")
 
 
 # ---- git helpers -----------------------------------------------------------
@@ -151,9 +173,11 @@ def _inside(path: str, folder: str) -> bool:
 
 
 def find_worktree(git: "_Git", issue_id: str) -> Optional[Dict[str, Any]]:
-    """The worktree already on a `<issue>-…` branch, if any."""
+    """The worktree already on a `<issue>-…` branch or in the task's folder, if any."""
+    folder = os.path.realpath(worktree_dir(git.repo, issue_id))
     for wt in git.worktrees():
-        if wt.get("branch", "").startswith(f"{issue_id}-") or wt.get("branch") == issue_id:
+        if (wt.get("branch", "").startswith(f"{issue_id}-") or wt.get("branch") == issue_id
+                or os.path.realpath(wt["path"]) == folder):
             return {"path": wt["path"], "branch": wt["branch"], "created": False}
     return None
 
@@ -231,7 +255,9 @@ def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Ru
     """
     Returns {path, branch, created} for the task, reusing what exists:
     a worktree already on a `<issue>-…` branch, else a local or remote
-    `<issue>-…` branch, else a new branch from origin/<base>. Either way the
+    `<issue>-…` branch, else a new `<issue>-<full title>` branch from
+    origin/<base>. A new worktree goes to `<repo name>-<issue>` in the repo's
+    worktrees folder (worktree_dir), whatever the branch is called. Either way the
     worktree's timeline/ is linked to the main checkout's (link_timeline);
     `note` is added when that link couldn't be made.
     """
@@ -253,7 +279,7 @@ def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Ru
     else:
         branch, start = branch_name(issue_id, title), f"origin/{repo['base']}"
     git.run("check-ref-format", "--branch", branch)
-    path = os.path.join(repo["worktrees"], branch)
+    path = worktree_dir(repo, issue_id)
     if os.path.exists(path):
         raise WorkSessionError(f"{path} already exists but isn't a worktree of {repo['name']}. Move it away first.")
     os.makedirs(repo["worktrees"], exist_ok=True)
@@ -286,43 +312,6 @@ def terminal_command(config: Dict[str, Any], path: str, title: str, claude_args:
               'echo; echo "Claude exited. This shell is in the task worktree."; exec bash')
     return [config["terminal"], f"--title={title}", f"--working-directory={path}", "--",
             "bash", "-c", script, "bash", path, exit_file or "", config["claude"], *claude_args]
-
-
-def headless_command(path: str, claude: str, claude_args: Sequence[str], stream_file: str, exit_file: str,
-                     append: bool = False) -> List[str]:
-    """
-    Claude in the background (no terminal) for the dashboard's read-only runs:
-    its stream-json output goes to `stream_file` (appended when continuing a
-    run), stderr next to it, and its exit code to `exit_file`.
-    """
-    script = ('cd "$1" || exit 1; out="$2"; exit_file="$3"; mode="$4"; shift 4; mkdir -p "$(dirname "$out")"; '
-              'if [ "$mode" = append ]; then "$@" >> "$out" 2>> "$out.err"; else "$@" > "$out" 2> "$out.err"; fi; '
-              'echo "$?" > "$exit_file"')
-    return ["bash", "-c", script, "bash", path, stream_file, exit_file, "append" if append else "new", claude, *claude_args]
-
-
-def popen_headless(args: List[str], env: Dict[str, str]) -> int:
-    """Starts a background run in its own process group; returns its pid (the group id)."""
-    try:
-        proc = subprocess.Popen(args, env=env, start_new_session=True,
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except FileNotFoundError:
-        raise WorkSessionError(f"`{args[0]}` is not installed.")
-    threading.Thread(target=proc.wait, daemon=True).start()  # reap it when it ends
-    return proc.pid
-
-
-def stop_group(pid: Optional[int]) -> bool:
-    """Ends a background run (its whole process group). False when it had already ended."""
-    if not pid:
-        return False
-    try:
-        if os.getpgid(int(pid)) == os.getpgid(0):
-            return False  # never the dashboard's own group
-        os.killpg(int(pid), signal.SIGTERM)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
 
 
 def session_alive(session_id: str) -> Optional[bool]:
@@ -361,18 +350,6 @@ def mcp_server(repo: Dict[str, Any]) -> Dict[str, Any]:
 def mcp_config(repo: Dict[str, Any]) -> str:
     """mcp_server as the JSON string `claude --mcp-config` takes."""
     return json.dumps({"mcpServers": {MCP_NAME: mcp_server(repo)}})
-
-
-def alive(pid: Optional[int]) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
 
 
 def launch_env(config: Dict[str, Any]) -> Dict[str, str]:
@@ -430,7 +407,7 @@ def list_worktrees(config: Dict[str, Any], runner: Runner = _subprocess_runner) 
                 unpushed = int(out.strip() or 0)
                 code_rc, _ = git.run("merge-base", "--is-ancestor", "HEAD", f"origin/{repo['base']}", cwd=path, ok_codes=(0, 1))
                 merged = code_rc == 0
-            m = re.match(r"(\d+)-", branch or "")
+            m = re.match(r"(\d+)-", branch or "") or re.fullmatch(rf"{re.escape(repo['name'])}-(\d+)", os.path.basename(path))
             items.append({
                 "repo": repo["name"], "code": code, "path": path, "branch": branch,
                 "issue_id": m.group(1) if m else None,

@@ -136,9 +136,6 @@ def create_app(
     work_config: Callable[[], Dict[str, Any]] = work_session.load_config,
     work_runner: Any = None,
     work_launcher: Any = None,
-    work_headless: Any = None,
-    work_stopper: Any = None,
-    work_agent_backend: Any = None,
     planner_cache: Optional[PlannerCache] = None,
     claude_home: Optional[str] = None,
 ) -> Starlette:
@@ -149,14 +146,10 @@ def create_app(
     `work_launcher` are swappable for tests; the work config is re-read on
     every request, so edits to timeline-desk.json need no restart.
     `claude_home` is where Claude Code keeps its session logs (default
-    ~/.claude), read for a run's conversation. `work_headless` and
-    `work_stopper` replace starting and stopping background (desk) runs in tests,
-    `work_agent_backend` the Agent SDK session of runs with approvals on the page.
+    ~/.claude), read for a run's conversation.
     """
     git_kwargs = {"runner": work_runner} if work_runner else {}
-    start_kwargs = {**git_kwargs, **({"launcher": work_launcher} if work_launcher else {}),
-                    **({"headless": work_headless} if work_headless else {}),
-                    **({"agent_backend": work_agent_backend} if work_agent_backend else {})}
+    start_kwargs = {**git_kwargs, **({"launcher": work_launcher} if work_launcher else {})}
     release = {"report": None, "lock": threading.Lock()}
     planners = planner_cache or PlannerCache()
     image_dir = Path(panteon_client.planner_db_path(base_dir)).parent / "images"
@@ -310,13 +303,24 @@ def create_app(
     def view_of(issue: str, code: Optional[str] = None) -> Dict[str, Any]:
         config = work_config()
         current = workflow.workflow_view(issue, config, base_dir, code=code)
-        if current["workflow"] or not current.get("code"):
+        if current["workflow"]:
             return current
-        # No workflow yet: Timeline's stages pick the suggested first step.
+        # No workflow yet: one taskbyissue call gives Timeline's stages (they pick the
+        # suggested first step) and, when the page didn't know it, the task's board
+        # (its project id, matched against the repo ids in timeline-desk.json).
         try:
-            return workflow.workflow_view(issue, config, base_dir, code=code, stages=stages_of(issue).get("stages"))
+            row = stages_of(issue)
         except (LookupError, PermissionError, requests.RequestException) as exc:
             return workflow.workflow_view(issue, config, base_dir, code=code, timeline_error=str(exc))
+        board = code or work_session.board_for_project(config, row.get("project_id"))
+        if not board:
+            pid = row.get("project_id")
+            if pid:
+                current["start_note"] = (f"No single repo in timeline-desk.json has Timeline project id {pid}, so the desk "
+                                         f"can't tell this task's board. Give its repo \"id\": {pid}, or open the task "
+                                         "from your planner or task list.")
+            return current
+        return workflow.workflow_view(issue, config, base_dir, code=board, stages=row.get("stages"))
 
     def api_workflow(request: Request):
         return _respond(lambda: view_of(request.path_params["issue"], request.query_params.get("code") or None))
@@ -353,7 +357,7 @@ def create_app(
         def run():
             stages = stages_of(workflow._issue(issue)).get("stages")
             result = workflow.run_step(issue, work_config(), base_dir, stages, side=body.get("side") or None,
-                                       finding_id=body.get("finding_id"), mode=body.get("mode") or None, **start_kwargs)
+                                       finding_id=body.get("finding_id"), **start_kwargs)
             return {**view_of(issue), "note": result.get("note"), "started": result}
         return await run_in_threadpool(_respond, run)
 
@@ -379,63 +383,9 @@ def create_app(
 
         def decide():
             workflow.decide(issue, str(body.get("kind") or ""), base_dir, work_config(),
-                            run_id=body.get("run_id"), note=str(body.get("note") or ""),
-                            **({"stopper": work_stopper} if work_stopper else {}))
+                            run_id=body.get("run_id"), note=str(body.get("note") or ""))
             return view_of(issue)
         return await run_in_threadpool(_respond, decide)
-
-    async def api_workflow_answer(request: Request):
-        denied = guarded(request)
-        if denied:
-            return denied
-        body = await json_body(request)
-        issue = request.path_params["issue"]
-
-        def answer():
-            workflow.answer_run(issue, body.get("run_id"), str(body.get("answer") or ""), work_config(), base_dir,
-                                **({"headless": work_headless} if work_headless else {}))
-            return view_of(issue)
-        return await run_in_threadpool(_respond, answer)
-
-    async def api_workflow_stop_run(request: Request):
-        denied = guarded(request)
-        if denied:
-            return denied
-        body = await json_body(request)
-        issue = request.path_params["issue"]
-
-        def stop():
-            workflow.stop_run(issue, body.get("run_id"), work_config(), base_dir, note=str(body.get("note") or ""),
-                              **({"stopper": work_stopper} if work_stopper else {}))
-            return view_of(issue)
-        return await run_in_threadpool(_respond, stop)
-
-    async def api_workflow_message(request: Request):
-        denied = guarded(request)
-        if denied:
-            return denied
-        body = await json_body(request)
-        issue = request.path_params["issue"]
-
-        def message():
-            workflow.message_run(issue, body.get("run_id"), str(body.get("text") or ""), work_config(), base_dir)
-            return view_of(issue)
-        return await run_in_threadpool(_respond, message)
-
-    async def api_workflow_permission(request: Request):
-        denied = guarded(request)
-        if denied:
-            return denied
-        body = await json_body(request)
-        issue = request.path_params["issue"]
-
-        def decide_permission():
-            if body.get("decision") not in ("allow", "deny"):
-                raise ValueError("Decide allow or deny.")
-            workflow.decide_permission(issue, request.path_params["permission"], body["decision"] == "allow", base_dir,
-                                       note=str(body.get("note") or ""))
-            return view_of(issue)
-        return await run_in_threadpool(_respond, decide_permission)
 
     async def api_workflow_reset(request: Request):
         denied = guarded(request)
@@ -445,8 +395,7 @@ def create_app(
         issue = request.path_params["issue"]
 
         def reset():
-            removed = workflow.reset_workflow(issue, body.get("confirm"), base_dir, work_config(),
-                                              **({"stopper": work_stopper} if work_stopper else {}))
+            removed = workflow.reset_workflow(issue, body.get("confirm"), base_dir, work_config())
             return {**view_of(issue, body.get("code") or None), "removed": removed}
         return await run_in_threadpool(_respond, reset)
 
@@ -576,11 +525,7 @@ def create_app(
         Route("/api/workflow/{issue}/run", api_workflow_run, methods=["POST"]),
         Route("/api/workflow/{issue}/resume", api_workflow_resume, methods=["POST"]),
         Route("/api/workflow/{issue}/decide", api_workflow_decide, methods=["POST"]),
-        Route("/api/workflow/{issue}/answer", api_workflow_answer, methods=["POST"]),
-        Route("/api/workflow/{issue}/stop-run", api_workflow_stop_run, methods=["POST"]),
         Route("/api/workflow/{issue}/reset", api_workflow_reset, methods=["POST"]),
-        Route("/api/workflow/{issue}/message", api_workflow_message, methods=["POST"]),
-        Route("/api/workflow/{issue}/permissions/{permission:int}", api_workflow_permission, methods=["POST"]),
         Route("/api/workflow/{issue}/findings", api_finding_add, methods=["POST"]),
         Route("/api/workflow/{issue}/findings/{finding:int}", api_finding_classify, methods=["POST"]),
         Route("/api/workflow/{issue}/doc/{name}", api_workflow_doc),
