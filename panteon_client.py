@@ -305,6 +305,7 @@ def extract_task_meta(raw_task: Dict[str, Any]) -> Dict[str, Any]:
     tags = [t.get("name") for t in (data.get("task_tags") or []) if isinstance(t, dict) and t.get("name")]
     return {
         "issue_number": data.get("issue_number"),
+        "project_id": data.get("project_id"),
         "title": data.get("title") or data.get("name") or "",
         "description": (data.get("description") or "").strip(),
         "creator": creator.get("name") if isinstance(creator, dict) else "",
@@ -550,6 +551,26 @@ def absolutize_markdown_images(description: str) -> str:
         return f"![{alt}]({_resolve_url(src)})"
 
     return _MD_IMAGE_RE.sub(_repl, description or "")
+
+
+def parse_commits(timeline_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The commits linked to a task (timeline items with a `task_commit`), oldest first:
+    {"id", "author", "created_at", "message", "url"}."""
+    commits: List[Dict[str, Any]] = []
+    for item in timeline_items:
+        commit = item.get("task_commit") if isinstance(item, dict) else None
+        if not isinstance(commit, dict) and not (isinstance(item, dict) and item.get("field_name") == "Commit Added"):
+            continue
+        commit = commit if isinstance(commit, dict) else {}
+        employee = item.get("employee") if isinstance(item.get("employee"), dict) else {}
+        commits.append({
+            "id": item.get("id"),
+            "author": employee.get("name") or item.get("employee_name") or "Unknown",
+            "created_at": item.get("created_at") or "",
+            "message": (commit.get("description") or "").strip(),
+            "url": commit.get("commit_url") or None,
+        })
+    return commits
 
 
 def parse_conversation_comments(timeline_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1189,6 +1210,43 @@ def _open_planner_db(base_dir: Optional[str], create: bool) -> Optional[sqlite3.
         )
         conn.execute("PRAGMA user_version = 7")
         conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 8:
+        # The Jira board (see jira_board.py): the cards you added and the column
+        # each is in, plus a log of every change, which a Jira bot reads and
+        # marks delivered.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS jira_cards (
+                issue_number TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jira_events (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                title TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS jira_events_pending ON jira_events (delivered_at, id);
+            """
+        )
+        conn.execute("PRAGMA user_version = 8")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 9:
+        # The board's list code, so a card can link to its page in Timeline.
+        conn.execute("ALTER TABLE jira_cards ADD COLUMN code TEXT")
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 10:
+        # Whether the card is one of Timeline's support tasks, so it stays highlighted.
+        conn.execute("ALTER TABLE jira_cards ADD COLUMN support INTEGER NOT NULL DEFAULT 0")
+        conn.execute("PRAGMA user_version = 10")
+        conn.commit()
     return conn
 
 
@@ -1635,18 +1693,23 @@ def fetch_project_tasks(
     code: Optional[Any] = None,
     tab: Optional[str] = None,
     today: Optional[date] = None,
+    support: bool = False,
 ) -> Dict[str, Any]:
     """
     The user's open tasks in one project, as Timeline lists them: tabs (with
     counts) and, for the active tab, its groups of tasks. `project_id` is the
     API id (not the list code in task URLs); `code` is that list code, used for
-    task URLs. Without `tab` Timeline answers with its first tab. Read-only,
-    although the endpoint itself is a POST.
+    task URLs. Without `tab` Timeline answers with its first tab. With `support`
+    the project's Support tab is asked for instead (Timeline's own request for
+    it carries `support: true` and `tab_name: "Support"`; `tab` is ignored).
+    Read-only, although the endpoint itself is a POST.
     {"project_id", "tab", "tabs": [{"name", "count"}], "groups": [{"name", "tasks"}]}
     """
     project_id = int(project_id)
     body: Dict[str, Any] = {"subscribed_by": resolve_user_id(user_id), "tag_id": 0, "status": "open"}
-    if tab:
+    if support:
+        body.update({"support": True, "tab_name": "Support", "deadline_from": "", "deadline_to": ""})
+    elif tab:
         body["tab_name"] = tab
     url = f"{BASE_URL}/api/project/{project_id}/tasks"
     _pace()
@@ -1770,7 +1833,7 @@ def fetch_task_data(
     Runs the full read pipeline for a single task — resolve the issue id, call the
     two Panteon APIs, and parse the results — and returns the parsed pieces:
 
-        {"issue_id", "task_id", "task_meta", "comments"}
+        {"issue_id", "task_id", "task_meta", "comments", "commits"}
 
     This is the shared orchestration used by both the MCP tool and the CLI. It is
     synchronous and performs blocking network I/O, so async callers should offload
@@ -1783,12 +1846,14 @@ def fetch_task_data(
 
     timeline_items = get_task_timeline(task_id, headers)
     comments = parse_conversation_comments(timeline_items)
+    commits = parse_commits(timeline_items)
 
     return {
         "issue_id": issue_id,
         "task_id": task_id,
         "task_meta": task_meta,
         "comments": comments,
+        "commits": commits,
     }
 
 

@@ -6,7 +6,8 @@ const STAGE_SHORT = ["RSD", "Est", "Dev", "Test", "QA", "Live"];
 
 const view = document.getElementById("view");
 const meta = document.getElementById("meta");
-const cache = { watched: new Set(), planner: null, statuses: new Map(), boards: null, projects: null, projectTasks: new Map(), workflows: null };
+const timelineUrls = new Map(); // issue number -> its Timeline URL, learned from every API response
+const cache = { supportIds: null, jiraMine: null, jiraSupport: null, watched: new Set(), planner: null, statuses: new Map(), boards: null, projects: null, projectTasks: new Map(), workflows: null };
 
 // ---- helpers --------------------------------------------------------------
 function h(tag, attrs, ...children) {
@@ -35,7 +36,28 @@ async function api(path, options) {
   let body;
   try { body = await response.json(); } catch { body = {}; }
   if (!response.ok) throw new Error(body.error || `Request failed (HTTP ${response.status}).`);
+  rememberUrls(body);
   return body;
+}
+
+function rememberUrls(data, depth = 0) {
+  if (!data || typeof data !== "object" || depth > 8) return;
+  if (Array.isArray(data)) { for (const item of data) rememberUrls(item, depth + 1); return; }
+  const m = typeof data.url === "string" && /^https:\/\/.+\/edit\/(\d+)$/.exec(data.url);
+  if (m) timelineUrls.set(m[1], data.url);
+  for (const value of Object.values(data)) rememberUrls(value, depth + 1);
+}
+
+// The "open in Timeline" button that sits next to a task title. A span, not a link or button, so it can
+// live inside the cards and rows that are links or buttons themselves.
+function openInTimeline(issue, url) {
+  const href = url || timelineUrls.get(String(issue));
+  if (!href) return null;
+  const open = (e) => { e.preventDefault(); e.stopPropagation(); window.open(href, "_blank", "noopener,noreferrer"); };
+  return h("span", {
+    class: "open-tl", role: "link", tabindex: "0", title: "Open in Timeline", "aria-label": `Open #${issue} in Timeline`,
+    onclick: open, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") open(e); },
+  }, "↗");
 }
 
 function niceDate(iso, withWeekday = true) {
@@ -228,7 +250,7 @@ function taskCard(task, boards) {
       h("span", { class: "issue" }, `#${task.issue_number}`),
       flagBadge(task.deadline_flag),
       task.support ? h("span", { class: "badge support" }, "support") : null),
-    h("p", { class: "title" }, task.title),
+    h("p", { class: "title" }, task.title, " ", openInTimeline(task.issue_number, task.url)),
     rail(cache.statuses.get(String(task.issue_number))),
     h("div", { class: "foot" },
       h("span", { class: "stage" }, task.stage_status || "No stage"),
@@ -576,10 +598,32 @@ function commitLine(e) {
     h("span", { class: "tl-commit-msg" }, message));
 }
 
+// The issue numbers of your support tasks, so the Timeline page can tag them. Loaded once; if the
+// request fails the tags are simply missing and the next visit tries again.
+async function loadSupportIds() {
+  if (cache.supportIds) return cache.supportIds;
+  const ids = new Set();
+  try {
+    for (const project of await getProjects()) {
+      const data = await getProjectTasks(project, SUPPORT_TAB);
+      for (const group of data.groups) for (const t of group.tasks) ids.add(String(t.issue_number));
+    }
+    cache.supportIds = ids;
+  } catch { /* the tag is a nicety */ }
+  return ids;
+}
+
+function supportTag(issue) {
+  return cache.supportIds && cache.supportIds.has(String(issue)) ? h("span", { class: "badge support" }, "support") : null;
+}
+
 function taskPill(e, tasks) {
   const task = tasks[e.issue_number] || {};
-  return h("a", { class: "tl-task", href: `#/task/${e.issue_number}`, style: taskStyle(e.issue_number), title: task.title || "" },
-    h("b", {}, `#${e.issue_number}`), task.title ? h("span", {}, task.title) : null);
+  // The task link, the Timeline button and the support tag are siblings, so hovering one doesn't light up the others.
+  return h("span", { class: "tl-taskline" },
+    h("a", { class: "tl-task", href: `#/task/${e.issue_number}`, style: taskStyle(e.issue_number), title: task.title || "" },
+      h("b", {}, `#${e.issue_number}`), task.title ? h("span", {}, task.title) : null),
+    openInTimeline(e.issue_number, task.url), supportTag(e.issue_number));
 }
 
 function eventCard(e, tasks) {
@@ -607,12 +651,12 @@ function eventMatches(e, tasks, q) {
 // Modal listing the watched tasks; "Stop watching" here pauses a task (its events stay).
 function openWatchlist(initial, onClose) {
   const items = initial.slice();
-  const dialog = h("dialog", { class: "tl-dialog", "aria-label": "Watchlist" });
+  const dialog = h("dialog", { class: "tl-dialog tl-watch-dialog", "aria-label": "Watchlist" });
   const list = h("ul", { class: "tl-watch-list" });
   const close = () => dialog.close();
   const draw = () => {
     put(list, items.length ? items.map((w) => h("li", {},
-      h("span", { class: "tl-watch-task", style: taskStyle(w.issue_number) }, h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), h("span", {}, w.title || "")),
+      h("span", { class: "tl-watch-task", style: taskStyle(w.issue_number) }, h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), h("span", { class: "tl-watch-title" }, w.title || ""), openInTimeline(w.issue_number, w.url), supportTag(w.issue_number)),
       h("small", {}, `${w.events} events`),
       h("button", { type: "button", class: "btn ghost small", onclick: async (ev) => {
         ev.currentTarget.disabled = true;
@@ -648,7 +692,7 @@ async function showTimeline(force) {
     if (before) q.set("before", before);
     return api(`/api/events?${q}`);
   };
-  const first = await query();
+  const [first] = await Promise.all([query(), loadSupportIds()]);
   if (token !== eventsToken) return;
   const active = first.watchlist.filter((w) => w.active);
   cache.watched = new Set(active.map((w) => String(w.issue_number)));
@@ -661,8 +705,16 @@ async function showTimeline(force) {
   const totalEvents = active.reduce((n, w) => n + w.events, 0);
   const tile = (value, label, sub) => h("div", { class: "tl-tile" }, h("b", {}, value), h("span", {}, label), sub ? h("small", {}, sub) : null);
   const errors = active.filter((w) => w.last_error);
+  // Hovering (or focusing) the count lists every watched task.
+  const watchedTile = tile(active.length, active.length === 1 ? "task watched" : "tasks watched");
+  if (active.length) {
+    watchedTile.classList.add("has-hover");
+    watchedTile.tabIndex = 0;
+    watchedTile.append(h("ul", { class: "tl-hover-list", "aria-label": "Watched tasks" }, active.map((w) => h("li", {},
+      h("strong", {}, `#${w.issue_number}`), " ", w.title || "", " ", openInTimeline(w.issue_number, w.url), supportTag(w.issue_number)))));
+  }
   const summary = h("section", { class: "tl-summary", "aria-label": "Summary" },
-    tile(active.length, active.length === 1 ? "task watched" : "tasks watched"),
+    watchedTile,
     tile(totalEvents, "events recorded"),
     tile(lastSync ? clock(lastSync) : "—", "last synced", lastSync ? ago(lastSync) : "press Refresh"),
     errors.length ? h("div", { class: "tl-tile bad" }, h("b", {}, "!"), h("span", {}, errors.map((w) => `#${w.issue_number}: ${w.last_error}`).join(" · "))) : null);
@@ -678,14 +730,14 @@ async function showTimeline(force) {
   const chips = h("div", { class: "tl-chips", role: "group", "aria-label": "Filter by task" },
     active.map((w) => h("span", { class: "tl-chip", style: taskStyle(w.issue_number) },
       h("button", { type: "button", class: "tl-chip-main", "aria-pressed": String(eventsState.issues.has(w.issue_number)),
-        title: w.last_synced_at ? `Show only #${w.issue_number} (synced ${niceTime(w.last_synced_at)})` : `Show only #${w.issue_number}`,
+        title: `Show only #${w.issue_number}${w.title ? ` · ${w.title}` : ""}${w.last_synced_at ? ` (synced ${niceTime(w.last_synced_at)})` : ""}`,
         onclick: () => {
           const wasOn = eventsState.issues.has(w.issue_number);
           eventsState.issues.clear();
           if (!wasOn) eventsState.issues.add(w.issue_number);
           redraw();
         } },
-        h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), h("span", { class: "tl-chip-title" }, w.title || ""), h("small", {}, w.events)))));
+        h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), supportTag(w.issue_number), h("small", {}, w.events)))));
 
   // Watchlist dialog: the only place a task is removed from the watchlist.
   const watchlistButton = h("button", { type: "button", class: "btn ghost", onclick: () => openWatchlist(active, redraw) }, "Watchlist");
@@ -970,10 +1022,14 @@ async function getProjects() {
   return cache.projects;
 }
 
+// Timeline's Support list isn't one of the project's tabs: it is asked for with its own flag.
+const SUPPORT_TAB = "Support";
+
 async function getProjectTasks(project, tab, refresh) {
   const key = `${project.id}|${tab || ""}`;
   if (refresh || !cache.projectTasks.has(key)) {
-    cache.projectTasks.set(key, await api(`/api/project/${project.id}/tasks${tab ? `?tab=${encodeURIComponent(tab)}` : ""}`));
+    const query = tab === SUPPORT_TAB ? "?support=1" : tab ? `?tab=${encodeURIComponent(tab)}` : "";
+    cache.projectTasks.set(key, await api(`/api/project/${project.id}/tasks${query}`));
   }
   return cache.projectTasks.get(key);
 }
@@ -1000,12 +1056,12 @@ function people(subscribers) {
     rest.length ? h("span", { class: "avatar more", title: rest.map((p) => p.name).join(", ") }, `+${rest.length}`) : null);
 }
 
-function taskRow(t, boards) {
-  return h("a", { class: "trow", href: `#/task/${t.issue_number}` },
+function taskRow(t, boards, support = false) {
+  return h("a", { class: `trow${support ? " support" : ""}`, href: `#/task/${t.issue_number}` },
     watchButton(t.issue_number),
     h("span", { class: "issue" }, `#${t.issue_number}`),
     h("div", { class: "ttitle" },
-      h("span", { class: "tname" }, t.title),
+      h("span", { class: "tname" }, t.title, openInTimeline(t.issue_number, t.url), support ? h("span", { class: "badge support" }, "support") : null),
       t.tags.length ? h("span", { class: "tags" }, t.tags.map(tagChip)) : null),
     rail(t),
     h("span", { class: "stage" }, t.stage_status || "–"),
@@ -1029,7 +1085,12 @@ async function showTaskList(toolbar, refresh) {
   put(view, body);
   const token = ++listToken;
 
-  const draw = (data) => {
+  const draw = (data, baseTabs, support) => {
+    const supportIds = new Set(support ? support.groups.flatMap((g) => g.tasks.map((t) => t.issue_number)) : []);
+    const tabs = [...baseTabs];
+    if (support && !tabs.some((t) => t.name === SUPPORT_TAB)) {
+      tabs.push({ name: SUPPORT_TAB, count: support.tabs.find((t) => t.name === SUPPORT_TAB)?.count ?? supportIds.size });
+    }
     const all = data.groups.flatMap((g) => g.tasks);
     const tagNames = [...new Set(all.flatMap((t) => t.tags.map((x) => x.name)))].sort();
     const stageNames = [...new Set(all.map((t) => t.stage_status).filter(Boolean))].sort();
@@ -1071,7 +1132,7 @@ async function showTaskList(toolbar, refresh) {
           const id = `${data.tab}|${g.name}`;
           const details = h("details", { class: "tgroup", open: !listState.closed.has(id) },
             h("summary", {}, h("span", { class: "gname" }, g.name), h("span", { class: "count" }, g.tasks.length)),
-            g.tasks.map((t) => taskRow(t, boards)));
+            g.tasks.map((t) => taskRow(t, boards, supportIds.has(t.issue_number))));
           details.addEventListener("toggle", () => {
             if (details.open) listState.closed.delete(id); else listState.closed.add(id);
           });
@@ -1082,13 +1143,15 @@ async function showTaskList(toolbar, refresh) {
 
     put(body,
       h("div", { class: "list-head" },
-        h("div", { class: "list-title" }, h("h2", {}, "My tasks"), projectPicker, summary),
+        h("div", { class: "list-title" }, h("h2", {}, "My tasks"),
+          sourceIcons(["live"]),
+          projectPicker, summary),
         h("div", { class: "list-tools" },
           h("div", { class: "filters" }, search, select("All tags", tagNames, "tag"), select("All stages", stageNames, "stage"),
             h("label", { class: "check" }, overdue, " Overdue only")),
           toolbar)),
-      h("nav", { class: "subtabs", "aria-label": "Task tabs" }, data.tabs.map((t) => h("button", {
-        type: "button", class: "subtab", "aria-current": t.name === data.tab ? "page" : null, onclick: () => load(t.name),
+      h("nav", { class: "subtabs", "aria-label": "Task tabs" }, tabs.map((t) => h("button", {
+        type: "button", class: `subtab${t.name === SUPPORT_TAB ? " support" : ""}`, "aria-current": t.name === data.tab ? "page" : null, onclick: () => load(t.name),
       }, t.name, h("span", { class: "count" }, t.count)))),
       listEl);
     renderList();
@@ -1096,16 +1159,19 @@ async function showTaskList(toolbar, refresh) {
 
   const load = async (tab, force) => {
     put(body, h("p", { class: "note" }, "Loading your tasks…"));
-    let data;
+    let data, base, support;
     try {
       data = await getProjectTasks(project, tab, force);
+      // The project's own tabs, and the support list (its count, and which tasks to highlight).
+      base = tab === SUPPORT_TAB ? await getProjectTasks(project, null, force) : data;
+      support = tab === SUPPORT_TAB ? data : await getProjectTasks(project, SUPPORT_TAB, force).catch(() => null);
     } catch (error) {
       if (token === listToken) put(body, h("p", { class: "error", role: "alert" }, error.message));
       return;
     }
     if (token !== listToken) return;
     listState.tab = data.tab;
-    draw(data);
+    draw(data, base.tabs, support);
   };
   await load(listState.tab, refresh);
 }
@@ -1141,7 +1207,7 @@ async function showTask(issue, force) {
     h("div", { class: "head-info" },
     h("div", { class: "title-line" },
       h("span", { class: "issue" }, `#${task.issue_id}`),
-      h("h2", {}, task.title || "(no title)")),
+      h("h2", {}, task.title || "(no title)"), openInTimeline(task.issue_id, link || task.url)),
     h("div", { class: "facts" },
       status && !status.error ? h("span", {}, status.stage_status) : null,
       task.creator ? h("span", {}, `Created by ${task.creator}`) : null,
@@ -1173,6 +1239,12 @@ async function showTask(issue, force) {
   const comments = task.comments.map((c) => post(c.author, c.created_at,
     plainText(c.description) ? richText(c.description) : h("p", { class: "note" }, "(no text)"),
     c.author && c.author === task.creator ? "task creator" : null, plainText(c.description), c.photo));
+  const commits = task.commits || [];
+  // Commits sit between the comments, by time (Timeline's `dd.mm.yyyy HH:MM`); on a tie the comment comes first.
+  const stamp = (text) => { const m = /^(\d+)\.(\d+)\.(\d+)\s+(\d+):(\d+)/.exec(text || ""); return m ? Date.UTC(+m[3], +m[2] - 1, +m[1], +m[4], +m[5]) : 0; };
+  const conversation = [...comments.map((el, i) => ({ el, at: stamp(task.comments[i].created_at), order: 0 })),
+    ...commits.map((c) => ({ el: commitEntry(c, photos.get(c.author)), at: stamp(c.created_at), order: 1 }))]
+    .sort((x, y) => x.at - y.at || x.order - y.order).map((x) => x.el);
   const listed = [...cache.projectTasks.values()].flatMap((d) => d.groups.flatMap((g) => g.tasks))
     .find((t) => String(t.issue_number) === String(task.issue_id));
   const flow = h("section", { class: "wf", "aria-label": "Workflow" }, h("p", { class: "note" }, "Loading the workflow…"));
@@ -1183,8 +1255,33 @@ async function showTask(issue, force) {
     h("ol", { class: "comments" }, post(task.creator, task.created_date ? niceDate(task.created_date, false) : "",
       description ? richText(task.description) : h("p", { class: "note" }, "No description."), "task creator", description, photos.get(task.creator))),
     h("h3", { class: "task-section" }, `Conversation (${task.comments.length})`),
-    comments.length ? h("ol", { class: "comments" }, comments) : h("p", { class: "note" }, "No comments yet."));
+    comments.length || commits.length ? h("ol", { class: "comments" }, conversation) : h("p", { class: "note" }, "No comments yet."),
+    h("h3", { class: "task-section" }, `Commits (${commits.length})`),
+    commits.length ? h("ul", { class: "commit-list" }, commits.map(commitRow)) : h("p", { class: "note" }, "No commits linked to this task."));
   await loadWorkflow(flow, String(task.issue_id), (planned && planned.code) || (listed && listed.code) || null);
+}
+
+function commitEntry(c, photo) {
+  const sha = c.url && (c.url.match(/\/commit\/([0-9a-f]{7,40})/i) || [])[1];
+  const code = sha ? h("code", { class: "tl-sha" }, sha.slice(0, 7)) : null;
+  const safe = c.url && /^https:\/\//.test(c.url);
+  return h("li", { class: "post commit-entry" },
+    avatar(c.author, photo),
+    h("div", { class: "commit-body" },
+      h("div", { class: "commit-title" }, "Commit Added", safe && code ? h("a", { href: c.url, target: "_blank", rel: "noopener noreferrer", title: "Open commit" }, code) : code),
+      h("p", {}, plainText(c.message) || "(no message)"),
+      h("small", {}, [c.created_at, c.author && `by ${c.author}`].filter(Boolean).join(" "))));
+}
+
+function commitRow(c) {
+  const sha = c.url && (c.url.match(/\/commit\/([0-9a-f]{7,40})/i) || [])[1];
+  const code = sha ? h("code", { class: "tl-sha" }, sha.slice(0, 7)) : null;
+  const safe = c.url && /^https:\/\//.test(c.url);
+  return h("li", { class: "commit-row" },
+    safe && code ? h("a", { href: c.url, target: "_blank", rel: "noopener noreferrer", title: "Open commit" }, code) : code,
+    h("span", { class: "commit-msg" }, plainText(c.message) || "(no message)"),
+    h("small", { class: "note" }, [c.author, c.created_at].filter(Boolean).join(" · ")),
+    safe ? h("a", { class: "ext", href: c.url, target: "_blank", rel: "noopener noreferrer", title: "Open commit" }, "↗") : null);
 }
 
 // ---- task workflow ---------------------------------------------------------
@@ -1218,8 +1315,8 @@ function flowPost(issue, path, body) {
 }
 
 async function loadWorkflow(el, issue, code) {
-  const token = ++flowState.token;
-  clearTimeout(flowState.timer);
+  const token = el._wfToken = (el._wfToken || 0) + 1;  // per panel: the Workflows tab shows several at once
+  clearTimeout(el._wfTimer);
   let v;
   try {
     v = await api(`/api/workflow/${encodeURIComponent(issue)}${code ? `?code=${encodeURIComponent(code)}` : ""}`);
@@ -1227,7 +1324,7 @@ async function loadWorkflow(el, issue, code) {
     put(el, h("p", { class: "error", role: "alert" }, `Workflow: ${error.message}`));
     return;
   }
-  if (token !== flowState.token || !el.isConnected) return;
+  if (token !== el._wfToken || !el.isConnected) return;
   code = code || v.code || null;  // the desk finds the board itself when the page didn't know it
   renderWorkflow(el, v, code);
   if (cache.workflows) {  // keep the badges elsewhere in step
@@ -1236,7 +1333,7 @@ async function loadWorkflow(el, issue, code) {
   }
   // While a terminal is open on a run, look again every 5 s: its status line follows Claude's session.
   if (v.runs.some((r) => r.status === "running")) {
-    flowState.timer = setTimeout(() => { if (el.isConnected) loadWorkflow(el, issue, code); }, 5000);
+    el._wfTimer = setTimeout(() => { if (el.isConnected) loadWorkflow(el, issue, code); }, 5000);
   }
 }
 
@@ -1252,7 +1349,7 @@ function factList(rows) {
       h("dd", {}, Array.isArray(value) ? h("ul", {}, value.map((x) => h("li", {}, x))) : value)]));
 }
 
-function ago(seconds) {
+function agoSeconds(seconds) {
   if (seconds === null || seconds === undefined) return "";
   if (seconds < 10) return "just now";
   if (seconds < 90) return `${seconds} s ago`;
@@ -1268,7 +1365,7 @@ function activityLine(run) {
     h("span", { class: "dot", "aria-hidden": "true" }),
     h("strong", {}, a.label),
     a.detail ? h("span", { class: "text" }, a.detail) : null,
-    a.idle !== null && a.idle !== undefined ? h("small", {}, `last activity ${ago(a.idle)}`) : null);
+    a.idle !== null && a.idle !== undefined ? h("small", {}, `last activity ${agoSeconds(a.idle)}`) : null);
 }
 
 function resultBlock(run) {
@@ -1343,7 +1440,7 @@ const DANGER_ACTIONS = new Set(["reject", "abandon", "stop"]);
 async function act(el, issue, code, action, v) {
   const open = v.runs.find((r) => !r.decision);
   if (action.kind === "reset") {  // opens the form below the buttons
-    flowState.resetting = !flowState.resetting;
+    flowState.resetting = flowState.resetting === issue ? false : issue;
     renderWorkflow(el, v, code);
     return;
   }
@@ -1376,7 +1473,7 @@ async function act(el, issue, code, action, v) {
 
 // Reset: erase the task's workflow and its timeline/<id>/ folder, after you type the task number.
 function resetForm(el, issue, code, v) {
-  if (!flowState.resetting || !v.actions.some((a) => a.kind === "reset") || !v.reset_preview) return null;
+  if (flowState.resetting !== issue || !v.actions.some((a) => a.kind === "reset") || !v.reset_preview) return null;
   const p = v.reset_preview;
   const files = p.folders.flatMap((f) => f.files.map((name) => `${f.path}/${name}`));
   const typed = h("input", { type: "text", inputmode: "numeric", placeholder: issue, "aria-label": `Type ${issue} to confirm`, maxlength: "8" });
@@ -1622,25 +1719,502 @@ const FLOW_GROUPS = [
   { key: "done", label: "Done", codes: ["done"] },
 ];
 
-async function showWorkflows() {
+let flowListTimer = null;
+
+async function showWorkflows(arg) {
+  clearTimeout(flowListTimer);
   loading("Loading workflows…");
-  const { workflows } = await api("/api/workflows");
+  let { workflows } = await api("/api/workflows");
   cache.workflows = new Map(workflows.map((w) => [String(w.issue), w]));
   if (!workflows.length) {
     put(view, h("p", { class: "note" }, "No workflows yet. Open a task (from the planner or the Task tab) and start one."));
     return;
   }
-  const row = (w) => h("a", { class: "wf-row", href: `#/task/${w.issue}` },
-    h("span", { class: "issue" }, `#${w.issue}`),
-    h("span", { class: "ttitle" }, h("span", { class: "tname" }, w.title || "(no title)"),
-      w.newest_signal ? h("small", { class: "note" }, w.newest_signal.text) : null),
-    h("span", { class: `pill ${w.status.code}` }, w.status.label.length > 60 ? w.status.short : w.status.label),
-    h("small", { class: "note" }, `since ${when(w.step_since || w.updated_at)}`));
-  put(view, ...FLOW_GROUPS.map((g) => {
+  // The same facts as a planner card (stage rail, stage, deadline, flag, support), where the task is on the planner.
+  const [p, boards] = await Promise.all([getPlanner().catch(() => null), getBoards().catch(() => ({}))]);
+  const planned = new Map();
+  if (p) for (const period of Object.values(p.periods)) for (const t of period.tasks) if (!planned.has(String(t.issue_number))) planned.set(String(t.issue_number), { ...t, period: period.label });
+  await loadStatuses(workflows.map((w) => w.issue)).catch(() => null);
+
+  const order = (list) => FLOW_GROUPS.flatMap((g) => list.filter((w) => g.codes.includes(w.status.code)));
+  let selected = String(arg || "");
+  if (!workflows.some((w) => String(w.issue) === selected)) selected = String(order(workflows)[0].issue);
+
+  const list = h("nav", { class: "wfl-list", "aria-label": "Workflows" });
+  const detail = h("div", { class: "wfd" });
+
+  const facts = (w) => {
+    const t = planned.get(String(w.issue));
+    return h("span", { class: "wf-meta" },
+      flagBadge(t && t.deadline_flag),
+      t && t.support ? h("span", { class: "badge support" }, "support") : null,
+      t ? chip(t.period, "muted") : null,
+      chip((t && t.stage_status) || "Not on planner", "muted"),
+      t ? deadlineChip(t) : null,
+      w.code && boards && boards[String(w.code)] ? chip(boards[String(w.code)], "muted") : null);
+  };
+
+  const item = (w) => {
+    const id = String(w.issue);
+    const t = planned.get(id);
+    const a = h("a", { class: "wfl", href: `#/workflows/${id}`, "aria-current": id === selected ? "true" : null },
+      h("span", { class: "wfl-top" }, h("span", { class: "issue" }, `#${id}`),
+        h("span", { class: `pill ${w.status.code}` }, w.status.label.length > 40 ? w.status.short : w.status.label)),
+      h("span", { class: "wfl-title" }, w.title || (t && t.title) || "(no title)", " ", openInTimeline(id, w.url)),
+      h("small", { class: "note" }, `${w.step_title} · since ${when(w.step_since || w.updated_at)}`),
+      w.newest_signal ? h("small", { class: "wfl-signal" }, w.newest_signal.text) : null,
+      rail(cache.statuses.get(id)));
+    a.addEventListener("click", (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+      e.preventDefault();
+      selected = id;
+      history.replaceState(null, "", `#/workflows/${id}`);  // no hashchange: only the right side reloads
+      drawList();
+      drawDetail();
+    });
+    return a;
+  };
+
+  const drawList = () => put(list, ...FLOW_GROUPS.map((g) => {
     const items = workflows.filter((w) => g.codes.includes(w.status.code));
     if (!items.length) return null;
-    return h("section", { class: "wf-group" }, h("h3", { class: "task-section" }, `${g.label} (${items.length})`), items.map(row));
+    return h("section", { class: "wfl-group" }, h("h3", {}, `${g.label} (${items.length})`), items.map(item));
   }));
+
+  const drawDetail = () => {
+    const w = workflows.find((x) => String(x.issue) === selected);
+    const panel = h("section", { class: "wf", "aria-label": `Workflow #${selected}` }, h("p", { class: "note" }, "Loading the workflow…"));
+    put(detail,
+      h("header", { class: "wfd-head" },
+        h("div", { class: "wfd-title" },
+          h("span", { class: "issue" }, `#${selected}`),
+          h("h2", {}, w.title || "(no title)"),
+          openInTimeline(selected, w.url),
+          h("a", { class: "btn ghost", href: `#/task/${selected}` }, "Open task page")),
+        facts(w),
+        rail(cache.statuses.get(selected))),
+      panel);
+    loadWorkflow(panel, selected, w.code || null);
+  };
+
+  drawList();
+  put(view, h("div", { class: "wfl-layout" }, list, detail));
+  drawDetail();
+
+  // Keep the list's statuses current (the open panel refreshes itself).
+  const refreshList = async () => {
+    if (!list.isConnected) return;
+    try {
+      workflows = (await api("/api/workflows")).workflows;
+      cache.workflows = new Map(workflows.map((x) => [String(x.issue), x]));
+      if (workflows.some((x) => String(x.issue) === selected)) drawList();
+    } catch { /* next time */ }
+    flowListTimer = setTimeout(refreshList, 15000);
+  };
+  flowListTimer = setTimeout(refreshList, 15000);
+}
+
+// ---- jira board (cards are stored in SQLite; you add them from your assigned tasks) ----
+async function postJson(path, body) {
+  return api(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Timeline-Desk": "1" }, body: JSON.stringify(body) });
+}
+
+async function showJira() {
+  loading("Loading the board…");
+  const data = await api("/api/jira/board");
+  const cards = data.cards;
+  let query = "";
+  let dragging = null;
+  const error = h("p", { class: "error", role: "alert", hidden: true });
+  const fail = (e) => { error.textContent = e.message; error.hidden = false; };
+  const board = h("div", { class: "jira-board", style: `--cols:${data.statuses.length}` });
+
+  // The picker: all your assigned tasks that are not on the board yet.
+  const picker = h("dialog", { class: "jira-picker" });
+  const openPicker = async (status) => {
+    const list = h("ul", { class: "jira-pick-list" });
+    const note = h("p", { class: "note" }, "Loading your tasks…");
+    const selected = new Set();  // stays selected while you filter
+    let mine = [];
+    let support = [];
+    let loaded = false;
+    const addButton = h("button", { type: "button", class: "btn", disabled: true }, "Add");
+    const refreshAdd = () => {
+      addButton.disabled = !selected.size;
+      addButton.textContent = selected.size ? `Add ${selected.size} to ${status}` : "Add";
+    };
+    const drawList = (q) => {
+      const onBoard = new Set(cards.map((c) => c.issue_number));
+      const keep = (t) => !onBoard.has(t.issue_number) && (!q || `${t.issue_number} ${t.title}`.toLowerCase().includes(q));
+      const supportIds = new Set(support.map((t) => t.issue_number));
+      const groups = [
+        { name: "My tasks", tasks: mine.filter((t) => !supportIds.has(t.issue_number) && keep(t)), support: false },
+        { name: "Support tasks", tasks: support.filter(keep), support: true },
+      ];
+      const row = (t, isSupport) => {
+        const on = selected.has(t.issue_number);
+        return h("li", {}, h("button", {
+          type: "button", class: `jira-pick${on ? " selected" : ""}${isSupport ? " support" : ""}`, "aria-pressed": on ? "true" : "false",
+          onclick: (e) => {
+            if (selected.delete(t.issue_number)) { e.currentTarget.classList.remove("selected"); e.currentTarget.setAttribute("aria-pressed", "false"); }
+            else { selected.add(t.issue_number); e.currentTarget.classList.add("selected"); e.currentTarget.setAttribute("aria-pressed", "true"); }
+            refreshAdd();
+          },
+        }, h("span", { class: "issue" }, `#${t.issue_number}`), " ", t.title, " ", openInTimeline(t.issue_number, t.url),
+        isSupport ? h("span", { class: "badge support" }, "support") : null));
+      };
+      put(list, groups.filter((g) => g.tasks.length).flatMap((g) => [
+        h("li", { class: `jira-pick-section${g.support ? " support" : ""}` }, g.name, h("span", { class: "pill" }, String(g.tasks.length))),
+        ...g.tasks.map((t) => row(t, g.support)),
+      ]));
+      if (loaded) note.textContent = groups.some((g) => g.tasks.length) ? "" : "No tasks to add.";
+    };
+    addButton.addEventListener("click", async () => {
+      addButton.disabled = true;
+      try {
+        const { cards: added } = await postJson("/api/jira/cards", { issues: [...selected], status });
+        cards.push(...added);
+        picker.close();
+        draw();
+      } catch (err) {
+        note.textContent = err.message;
+        refreshAdd();
+      }
+    });
+    const search = h("input", { type: "search", placeholder: "Filter tasks…", "aria-label": "Filter tasks", oninput: () => drawList(search.value.trim().toLowerCase()) });
+    put(picker,
+      h("div", { class: "jira-pick-head" }, h("h2", {}, `Add to ${status}`),
+        h("button", { type: "button", class: "btn ghost small", onclick: () => picker.close() }, "Close")),
+      search, note, list,
+      h("div", { class: "jira-pick-foot" }, h("span", { class: "note" }, "Click tasks to select several."), addButton));
+    picker.showModal();
+    search.focus();
+    try {
+      if (!cache.jiraMine || !cache.jiraSupport) {
+        [cache.jiraMine, cache.jiraSupport] = (await Promise.all([api("/api/jira/my-tasks"), api("/api/jira/support-tasks")])).map((r) => r.tasks);
+      }
+      mine = cache.jiraMine;
+      support = cache.jiraSupport;
+      loaded = true;
+      drawList("");
+    } catch (e) {
+      note.textContent = e.message;
+    }
+  };
+  picker.addEventListener("click", (e) => { if (e.target === picker) picker.close(); });  // the backdrop
+
+  const card = (c) => h("div", {
+    class: `card jira-card${c.support ? " support" : " task"}`,
+    title: c.title,
+    "data-issue": c.issue_number,
+    onmouseenter: () => hover(c.issue_number, true),
+    onmouseleave: () => hover(c.issue_number, false),
+    draggable: "true",
+    ondragstart: (e) => {
+      dragging = c;
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", c.issue_number);  // Firefox needs data to start a drag
+      e.currentTarget.classList.add("dragging");
+    },
+    ondragend: (e) => {
+      dragging = null;
+      e.currentTarget.classList.remove("dragging");
+      for (const el of view.querySelectorAll(".drop")) el.classList.remove("drop");
+    },
+  },
+    h("div", { class: "head" },
+      h("a", { class: "issue", href: `#/task/${c.issue_number}`, draggable: "false" }, `#${c.issue_number}`),
+      c.url ? h("a", { class: "ext", href: c.url, target: "_blank", rel: "noopener noreferrer", draggable: "false", title: "Open in Timeline" }, "↗") : null),
+    );
+
+  const column = (status) => {
+    const items = cards.filter((c) => c.status === status && (!query || `${c.issue_number} ${c.title}`.toLowerCase().includes(query)));
+    return h("section", {
+      class: "jira-col",
+      onmouseenter: () => hoverSection(status, true),
+      onmouseleave: () => hoverSection(status, false),
+      ondragover: (e) => { if (dragging) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; e.currentTarget.classList.add("drop"); } },
+      ondragleave: (e) => { if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove("drop"); },
+      ondrop: async (e) => {
+        e.preventDefault();
+        const moved = dragging;
+        if (moved && moved.task) {  // from the task list: put it on the board
+          error.hidden = true;
+          try {
+            const { cards: added } = await postJson("/api/jira/cards", { issues: [moved.task.issue_number], status });
+            cards.push(...added);
+            draw();
+          } catch (err) {
+            fail(err);
+          }
+          return;
+        }
+        if (!moved || moved.status === status) return;
+        const before = moved.status;
+        moved.status = status;  // shown at once, undone if the server refuses
+        error.hidden = true;
+        draw();
+        try {
+          await postJson(`/api/jira/cards/${moved.issue_number}/move`, { status });
+        } catch (err) {
+          moved.status = before;
+          fail(err);
+          draw();
+        }
+      },
+    },
+      h("h2", {}, h("span", { class: "jira-col-name" }, status), h("span", { class: "pill" }, String(items.length)),
+        h("button", { type: "button", class: "jira-add", title: `Add a task to ${status}`, "aria-label": `Add a task to ${status}`,
+          onclick: () => openPicker(status) }, "+")),
+      items.map(card));
+  };
+
+  async function removeCard(c) {
+    error.hidden = true;
+    try {
+      await api(`/api/jira/cards/${c.issue_number}`, { method: "DELETE", headers: { "X-Timeline-Desk": "1" } });
+      cards.splice(cards.indexOf(c), 1);
+      draw();
+    } catch (err) {
+      fail(err);
+    }
+  }
+
+  // Left: the tasks on the board (name + ID + status). Hovering a card or a row highlights its twin.
+  const taskList = h("ul", { class: "jira-tasks" });
+  const taskNote = h("p", { class: "note", hidden: true });
+  const hover = (issue, on) => {
+    for (const el of view.querySelectorAll(`[data-issue="${issue}"]`)) el.classList.toggle("hl", on);
+    const row = taskList.querySelector(`[data-issue="${issue}"]`);
+    if (on && row) scrollIntoList(row);
+  };
+  const hoverSection = (status, on) => {
+    let first = null;
+    for (const el of taskList.children) {
+      const hit = on && el.dataset.status === status;
+      el.classList.toggle("hl-sec", hit);
+      if (hit && !first) first = el;
+    }
+    if (first) scrollIntoList(first);
+  };
+  // Scrolls only the list (never the page) so the row is visible.
+  const scrollIntoList = (row) => {
+    const side = taskList.parentElement;
+    const r = row.getBoundingClientRect(), s = side.getBoundingClientRect();
+    if (r.top < s.top + 30) side.scrollTop -= s.top + 30 - r.top;
+    else if (r.bottom > s.bottom) side.scrollTop += r.bottom - s.bottom + 4;
+  };
+  function drawTasks() {
+    const rank = (c) => data.statuses.indexOf(c.status);
+    const shown = cards.filter((c) => !query || `${c.issue_number} ${c.title}`.toLowerCase().includes(query))
+      .sort((a, b) => rank(a) - rank(b));  // by column; the order they were added within one
+    taskNote.textContent = "No tasks on the board.";
+    taskNote.hidden = shown.length > 0;
+    put(taskList, shown.map((c) => h("li", {
+      class: `jira-task${c.support ? " support" : ""}`,
+      "data-issue": c.issue_number,
+      "data-status": c.status,
+      onmouseenter: () => hover(c.issue_number, true),
+      onmouseleave: () => hover(c.issue_number, false),
+    },
+      h("div", { class: "row" },
+        h("a", { class: "issue", href: `#/task/${c.issue_number}` }, `#${c.issue_number}`),
+        h("span", { class: "pill status" }, c.status),
+        c.support ? h("span", { class: "badge support" }, "support") : h("span", { class: "badge task" }, "task")),
+      h("div", { class: "name" }, c.title))));
+  }
+  function draw() { put(board, data.statuses.map(column)); drawTasks(); }
+
+  // Dropping a card here is the only way to take it off the board.
+  const trash = h("div", {
+    class: "jira-trash",
+    ondragover: (e) => { if (dragging) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; e.currentTarget.classList.add("drop"); } },
+    ondragleave: (e) => { if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove("drop"); },
+    ondrop: (e) => {
+      e.preventDefault();
+      e.currentTarget.classList.remove("drop");
+      if (dragging && !dragging.task) removeCard(dragging);
+    },
+  }, "Drop a card here to delete it");
+
+  put(view,
+    h("div", { class: "toolbar" },
+      h("input", {
+        type: "search", class: "jira-search", placeholder: "Search cards…", "aria-label": "Search cards",
+        oninput: (e) => { query = e.target.value.trim().toLowerCase(); draw(); },
+      }),
+      trash),
+    error,
+    h("div", { class: "jira-layout" },
+      h("aside", { class: "jira-side" }, h("h2", {}, "My tasks on the board"), taskNote, taskList),
+      board),
+    picker);
+  draw();
+
+  // Board height = the rest of the window below it; re-measured on resize.
+  const fit = () => {
+    if (!board.isConnected) { window.removeEventListener("resize", fit); return; }
+    const top = board.getBoundingClientRect().top + window.scrollY;
+    board.parentElement.style.setProperty("--board-h", `${Math.max(320, window.innerHeight - top - 52)}px`);
+  };
+  fit();
+  window.addEventListener("resize", fit);
+}
+
+// ---- where a page's data comes from ---------------------------------------
+// Icons only: a green signal = read from Timeline when the page opens or refreshes, a blue database = our
+// stored copy (SQLite), an amber branch = git and GitHub. A page that mixes sources shows each one.
+const SOURCE_ICONS = {
+  live: { label: "Live from Timeline: fetched when you open or refresh the page",
+    path: "M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01" },
+  cache: { label: "From a copy kept in memory for a few minutes: refreshed by background checks and the Refresh button",
+    path: "M12 6v6l4 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z" },
+  db: { label: "From our database: stored by the desk, not fetched from Timeline now",
+    path: "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 6v6c0 1.66 4.03 3 9 3s9-1.34 9-3V6M3 12v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6" },
+  git: { label: "From git and GitHub on this computer",
+    path: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9" },
+};
+const PAGE_SOURCES = {
+  planner: ["live", "cache", "db"], workflows: ["live", "cache", "db"], changes: ["db"], timeline: ["db"],
+  release: ["cache", "git"], task: ["live", "db"], work: ["git"], jira: ["live", "db"],
+};
+
+function sourceIcons(kinds) {
+  return h("span", { class: "sources" }, kinds.map((k) =>
+    h("span", { class: `src ${k}`, role: "img", title: SOURCE_ICONS[k].label, "aria-label": SOURCE_ICONS[k].label }, svgIcon(SOURCE_ICONS[k].path, 14))));
+}
+
+for (const tab of document.querySelectorAll(".tabs a")) {
+  if (PAGE_SOURCES[tab.dataset.view]) tab.append(sourceIcons(PAGE_SOURCES[tab.dataset.view]));
+}
+
+// ---- help -----------------------------------------------------------------
+// The text is in help.js; what can be configured or lives in the code (intervals, workflow steps and buttons)
+// is read from /api/about, so this page shows what the running service really does.
+const HELP_PAGES = HELP.pages;
+const HELP_SOURCES = ["live", "cache", "db", "git"];
+const HELP_SOURCE_NAME = { live: "Live from Timeline", cache: "Short-lived copy in memory", db: "Our database", git: "git and GitHub" };
+
+const HELP_TOPIC_ICON = {
+  planner: "M3 4h18v4H3zM3 12h8v8H3zM15 12h6v8h-6z",
+  workflows: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9",
+  changes: "M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7",
+  timeline: "M12 2v20M12 6h7M12 12H5M12 18h7",
+  release: "M12 2l4 8h-8zM12 10v12M8 22h8",
+  task: "M9 11l3 3 8-8M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9",
+  work: "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
+  jira: "M4 4h5v16H4zM10 4h5v10h-5zM16 4h4v6h-4z",
+  icons: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 8h.01M11 12h1v4h1",
+  glossary: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5zM4 19.5V21h16",
+  background: "M12 6v6l4 2M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z",
+  workflow: "M5 12h14M13 6l6 6-6 6",
+  setup: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 0 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 0 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 0 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 0 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z",
+  safety: "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
+  stored: "M12 3c4.97 0 9 1.34 9 3s-4.03 3-9 3-9-1.34-9-3 4.03-3 9-3zM3 6v6c0 1.66 4.03 3 9 3s9-1.34 9-3V6M3 12v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6",
+  trouble: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01",
+};
+
+function minutesText(m) { return `${Number(m)} minute${Number(m) === 1 ? "" : "s"}`; }
+
+async function showHelp(arg) {
+  loading("Loading help…");
+  const about = await api("/api/about").catch(() => null);
+  const sched = about && about.schedule;
+  const fill = (text) => text.replace("{planner_cache}", about ? String(about.planner_cache_minutes) : "5");
+  const icon = (k) => h("span", { class: `src ${k}` }, svgIcon(SOURCE_ICONS[k].path, 16));
+  const list = (items) => items && items.length ? h("ul", { class: "help-list" }, items.map((t) => h("li", {}, fill(t)))) : null;
+  const block = (id, title, ...children) => h("section", { class: "help-page", id: `help-${id}` }, h("h3", {}, title), ...children);
+  const rows = (pairs) => h("table", { class: "help-table" }, h("tbody", {}, pairs.map(([name, text]) =>
+    h("tr", {}, h("th", {}, name), h("td", {}, text)))));
+  const section = (p) => h("section", { class: "help-page", id: `help-${p.key}` },
+    h("h3", {}, p.title, sourceIcons(p.sources), h("a", { class: "help-go", href: `#/${p.key}` }, "Open page")),
+    h("p", { class: "help-purpose" }, p.purpose),
+    h("table", { class: "help-table" },
+      h("thead", {}, h("tr", {}, h("th", {}, "Shown"), h("th", {}, "Comes from"), h("th", {}, "Details"))),
+      h("tbody", {}, p.from.map(([what, k, text]) => h("tr", {}, h("td", {}, what),
+        h("td", { class: "help-src" }, icon(k), " ", HELP_SOURCE_NAME[k]), h("td", {}, fill(text)))))),
+    h("dl", {},
+      h("dt", {}, "How to use it"), h("dd", {}, list(p.use)),
+      h("dt", {}, "When it changes"), h("dd", {}, fill(p.refresh)),
+      h("dt", {}, "How it works"), h("dd", {}, fill(p.how)),
+      p.know.length ? [h("dt", {}, "Good to know"), h("dd", {}, list(p.know))] : null));
+  const steps = about && about.workflow_steps || [];
+  const stepRows = steps.map((st) => h("tr", {},
+    h("th", {}, st.title, st.optional ? h("small", { class: "note" }, " optional") : null, st.extra ? h("small", { class: "note" }, " only after a live bug") : null,
+      st.side ? h("small", { class: "note" }, " side run") : null),
+    h("td", {}, st.run
+      ? [st.repeat ? h("p", {}, "Repeats: one item per run, until nothing remains.") : null,
+        h("p", {}, h("strong", {}, "Reads: "), (st.reads || []).join("; ")),
+        h("p", {}, h("strong", {}, "Writes: "), (st.writes || []).join("; ")),
+        h("p", {}, h("strong", {}, "Won't: "), (st.wont || []).join("; ")),
+        h("p", {}, h("strong", {}, "You approve when: "), st.approve || "")]
+      : h("p", {}, st.about || ""))));
+  const all = h("div", { class: "help-all" },
+    block("icons", "Icons",
+      h("p", { class: "note" }, "Shown next to each tab. A page that mixes sources shows each one. Hover an icon for its meaning."),
+      h("ul", { class: "help-legend" }, HELP_SOURCES.map((k) => h("li", {}, icon(k), h("strong", {}, HELP_SOURCE_NAME[k]), h("span", {}, SOURCE_ICONS[k].label))))),
+    block("glossary", "Words used", rows(HELP.glossary)),
+    block("background", "Background checks",
+      h("p", { class: "note" }, "While the service runs it keeps the database current, even when no page is open. It polls in tiers so it feels live without bursts of requests."),
+      sched ? h("table", { class: "help-table" }, h("tbody", {},
+        [["Heartbeat", `every ${minutesText(sched.heartbeat_minutes)}`, "Reads only the Now period of your planner (1 request) and the timeline of each watched task (1 request each). Compares the planner with the last check."],
+         ["Full planner check", `when the heartbeat sees a change, or at least every ${minutesText(sched.full_minutes)}`, "Fetches all three periods and saves a snapshot if your tasks differ."],
+         ["Stage lookups", `on a change, or every ${minutesText(sched.stage_minutes)}`, "One request per task for the stage bars stored with snapshots."],
+         ["Active hours", `weekdays ${sched.active_hours}`, `Outside them there is one full check every ${minutesText(sched.off_hours_minutes)}.`],
+         ["Spacing", `waits vary by ±${sched.jitter_percent}%; at least ${about.request_gap_ms} ms between requests`, "So requests arrive as a trickle, never a burst."],
+         ["In-memory planner copy", `kept up to ${minutesText(about.planner_cache_minutes)}`, "What the Planner and Workflows pages read; the Refresh button replaces it."],
+         ["Last planner check", about.last_planner_check ? niceTime(about.last_planner_check) : "none yet", "Recorded even when nothing changed."]]
+          .map(([name, when, text]) => h("tr", {}, h("th", {}, name), h("td", {}, when), h("td", {}, text)))))
+        : h("p", { class: "error" }, "Couldn't read the schedule from the service."),
+      h("p", { class: "note" }, "Failures are logged, not fatal. Change the numbers with --heartbeat, --interval, --active-hours, or TIMELINE_HEARTBEAT_MINUTES, TIMELINE_SNAPSHOT_MINUTES, TIMELINE_ACTIVE_HOURS (then restart the service).")),
+    HELP_PAGES.map(section),
+    block("workflow", "Workflow steps and rules",
+      h("p", {}, "A workflow takes one task through fixed steps. Nothing moves without a decision of yours: the page shows exactly the buttons that are possible right now, and the server refuses anything else. Every run and decision is saved with its time and note."),
+      stepRows.length ? h("table", { class: "help-table" }, h("tbody", {}, stepRows)) : h("p", { class: "note" }, "Couldn't read the steps from the service."),
+      about && about.workflow_buttons ? [h("h4", {}, "Buttons"), h("table", { class: "help-table" }, h("tbody", {}, about.workflow_buttons.map((b) =>
+        h("tr", {}, h("th", {}, b.label), h("td", {}, b.help, b.needs_note ? h("em", {}, " Needs a written reason.") : null)))))] : null,
+      about && about.run_statuses ? [h("h4", {}, "Run statuses"), h("p", {}, about.run_statuses.map((r) => r.label).join(" · "))] : null,
+      h("p", { class: "note" }, "A run is an ordinary Claude Code session in a terminal, in the task's worktree. When it ends it writes a result file (status, summary, files, commits, questions) that the desk reads. Claude never pushes, opens pull requests or merges.")),
+    block("setup", "Setup", rows(HELP.setup)),
+    block("safety", "Safety", list(HELP.safety)),
+    block("stored", "Where things are stored", h("table", { class: "help-table" }, h("tbody", {}, [
+        ["Database", about ? about.database : "database/timeline_task.db", "SQLite: planner snapshots, watchlist and task events, workflows, runs, decisions, findings, Jira cards."],
+        ["Task files", "timeline/<issue>/", "task.md and the documents a workflow writes (analysis, runs). Kept out of git."],
+        ["Request log", "logs/timeline-requests-<date>.jsonl", "One line per call to Timeline: time, path, status, duration. No credentials or query text."],
+        ["Boards and repos", "timeline-desk.json", "Which Timeline board belongs to which repo, and your name. Read again on every request."],
+        ["This browser", "localStorage", "Only small conveniences: timeline filters, when you last saw the Changes page."],
+      ].map(([name, where, text]) => h("tr", {}, h("th", {}, name), h("td", {}, h("code", {}, where)), h("td", {}, text)))))),
+    block("trouble", "Troubleshooting", rows(HELP.trouble)));
+  // The landing page is a dashboard of tiles; a tile opens that topic on its own page.
+  const page = (key) => HELP_PAGES.find((p) => p.key === key);
+  const TOPICS = [
+    ...HELP_PAGES.map((p) => [p.key, p.title, p.purpose, HELP_TOPIC_ICON[p.key], p.sources]),
+    ["icons", "Icons", "What the small icons next to each tab mean.", HELP_TOPIC_ICON.icons, HELP_SOURCES],
+    ["glossary", "Words used", "Issue number, board, stage, watch, snapshot, worktree and the other terms.", HELP_TOPIC_ICON.glossary],
+    ["background", "Background checks", sched ? `Keeps the database current: a check every ${minutesText(sched.heartbeat_minutes)}, a full one at least every ${minutesText(sched.full_minutes)}.` : "How the desk keeps itself current.", HELP_TOPIC_ICON.background],
+    ["workflow", "Workflow steps and rules", "Every step, every button and every run status.", HELP_TOPIC_ICON.workflow],
+    ["setup", "Setup", "Credentials, boards and repos, the service.", HELP_TOPIC_ICON.setup],
+    ["safety", "Safety", "What the desk will never do, and who can reach it.", HELP_TOPIC_ICON.safety],
+    ["stored", "Where things are stored", "The database, task files, logs and settings.", HELP_TOPIC_ICON.stored],
+    ["trouble", "Troubleshooting", "Common problems and what to do.", HELP_TOPIC_ICON.trouble],
+  ];
+  const topic = arg && all.querySelector(`#help-${CSS.escape(arg)}`);
+  if (topic) {
+    put(view, h("div", { class: "toolbar" }, h("a", { href: "#/help", class: "back" }, "← All help")), topic);
+    return;
+  }
+  const tile = ([key, title, blurb, path, sources]) => h("a", { class: "help-tile", href: `#/help/${key}` },
+    h("span", { class: "help-tile-icon", "aria-hidden": "true" }, svgIcon(path, 26)),
+    h("span", { class: "help-tile-body" }, h("strong", {}, title), h("span", {}, blurb)),
+    sources ? sourceIcons(sources) : null);
+  put(view,
+    h("div", { class: "list-title" }, h("h2", {}, "Timeline Desk help")),
+    HELP.intro.map((t) => h("p", { class: "help-intro" }, t)),
+    h("p", { class: "note" }, "Click a tile to open it. The logo at the top left opens the help for the page you are on."),
+    h("h3", { class: "help-group" }, "Pages"),
+    h("div", { class: "help-tiles" }, TOPICS.filter(([k]) => page(k)).map(tile)),
+    h("h3", { class: "help-group" }, "How it works"),
+    h("div", { class: "help-tiles" }, TOPICS.filter(([k]) => !page(k)).map(tile)));
 }
 
 // ---- routing --------------------------------------------------------------
@@ -1652,13 +2226,17 @@ async function route(force) {
     if (tab.dataset.view === name) { tab.setAttribute("aria-current", "page"); label = tab.textContent; }
     else tab.removeAttribute("aria-current");
   }
+  if (name === "help") label = "Help";
+  document.getElementById("page-help").href = HELP_PAGES.some((p) => p.key === name) ? `#/help/${name}` : "#/help";
   document.title = `${name === "task" && /^\d+$/.test(arg || "") ? `${label} #${arg}` : label} · Timeline Desk`;
   try {
     if (name === "changes") await showChanges(false, force);
     else if (name === "timeline") await showTimeline(force);
     else if (name === "release") await showRelease(force);
     else if (name === "work") await showWork();
-    else if (name === "workflows") await showWorkflows();
+    else if (name === "jira") await showJira();
+    else if (name === "workflows") await showWorkflows(arg);
+    else if (name === "help") await showHelp(arg);
     else if (name === "task") await showTask(arg ? decodeURIComponent(arg) : "", force);
     else await showPlanner(force);
   } catch (error) {
@@ -1671,6 +2249,9 @@ document.getElementById("refresh").addEventListener("click", async () => {
   cache.planner = null;
   cache.projectTasks.clear();
   cache.workflows = null;
+  cache.jiraMine = null;
+  cache.jiraSupport = null;
+  cache.supportIds = null;
   await route(true);
   getPlanner().catch(() => {});
 });

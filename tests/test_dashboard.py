@@ -197,14 +197,22 @@ class TestDashboardHttp:
         too_many = ",".join(str(i) for i in range(dashboard.MAX_STATUS_IDS + 1))
         assert client.get(f"/api/statuses?ids={too_many}").status_code == 400
 
+    def test_about(self, client):
+        body = client.get("/api/about").json()
+        assert body["schedule"]["heartbeat_minutes"] == dashboard.DEFAULT_HEARTBEAT_MINUTES
+        assert body["planner_cache_minutes"] == dashboard.PLANNER_CACHE_SECONDS / 60
+        assert body["database"].endswith("timeline_task.db")
+
     def test_task(self, client, monkeypatch):
         monkeypatch.setattr(pc, "fetch_task_data", lambda ident, headers: {
             "issue_id": ident, "task_id": 1,
             "task_meta": {"title": "Hello", "creator": "Ann", "created_date": "2026-10-01", "status": "open",
                           "tags": ["x"], "description": "Body ![](/img/a.png)"},
             "comments": [{"author": "Ann", "created_at": "01.10.2026 10:00", "description": "Hi", "images": []}],
+            "commits": [{"id": 7, "author": "Ann", "created_at": "01.10.2026 11:00", "message": "Fix it", "url": "https://github.com/o/r/commit/abcdef1234"}],
         })
         body = client.get("/api/task/42").json()
+        assert body["commits"][0]["message"] == "Fix it"
         assert body["title"] == "Hello" and body["comments"][0]["author"] == "Ann"
         assert body["description"] == "Body ![](/img/a.png)"
 
@@ -376,6 +384,14 @@ def test_fetch_project_tasks_shapes_and_posts(monkeypatch):
     assert task["url"].endswith("/tasks#/list/15033/edit/5916") and task["tags"][0]["name"] == "BO"
 
 
+def test_fetch_project_tasks_support_body(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(pc._SESSION, "post", lambda url, headers=None, json=None, timeout=None: sent.update(json=json) or FakeResponse(200, PROJECT_PAYLOAD))
+    pc.fetch_project_tasks(16, {}, 111, tab="DOCS", support=True)
+    assert sent["json"] == {"subscribed_by": 111, "tag_id": 0, "status": "open", "support": True, "tab_name": "Support",
+                            "deadline_from": "", "deadline_to": ""}
+
+
 def test_fetch_project_tasks_default_tab_is_first(monkeypatch):
     monkeypatch.setattr(pc._SESSION, "post", lambda *a, **k: FakeResponse(200, PROJECT_PAYLOAD))
     assert pc.fetch_project_tasks(16, {}, 111)["tab"] == "Priority"
@@ -390,13 +406,15 @@ def test_fetch_project_tasks_auth_error(monkeypatch):
 def test_project_endpoint_only_serves_configured_projects(monkeypatch, tmp_path):
     monkeypatch.setenv("PANTEON_BEARER_TOKEN", "tok")
     seen = {}
-    monkeypatch.setattr(pc, "fetch_project_tasks", lambda pid, headers, user, code=None, tab=None: seen.update(
-        pid=pid, code=code, tab=tab) or {"project_id": pid, "tabs": [], "groups": []})
+    monkeypatch.setattr(pc, "fetch_project_tasks", lambda pid, headers, user, code=None, tab=None, support=False: seen.update(
+        pid=pid, code=code, tab=tab, support=support) or {"project_id": pid, "tabs": [], "groups": []})
     config = {"repos": {"15033": {"id": 16, "name": "duell-admin"}}}
     app = dashboard.create_app(user_id=111, base_dir=str(tmp_path), work_config=lambda: config)
     client = TestClient(app, base_url="http://127.0.0.1:8765")
     assert client.get("/api/project/16/tasks?tab=DOCS").status_code == 200
-    assert seen == {"pid": 16, "code": "15033", "tab": "DOCS"}
+    assert seen == {"pid": 16, "code": "15033", "tab": "DOCS", "support": False}
+    assert client.get("/api/project/16/tasks?support=1").status_code == 200
+    assert seen["support"] is True
     assert client.get("/api/project/99/tasks").status_code == 404
     assert client.get("/api/project/abc/tasks").status_code == 404
     assert client.get("/api/work/config").json()["projects"] == [{"code": "15033", "id": 16, "name": "duell-admin"}]

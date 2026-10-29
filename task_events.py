@@ -19,7 +19,7 @@ import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 import requests
 
@@ -149,11 +149,10 @@ def unwatch_task(issue: Any, base_dir: Optional[str] = None) -> bool:
     return bool(changed)
 
 
-def find_my_open_task(issue: Any, headers: Dict[str, str], projects: Iterable[Dict[str, Any]],
-                      user_id: Optional[Any] = None) -> Optional[Dict[str, Any]]:
-    """The task from the user's own open tasks (every tab of every configured
-    project), or None when it isn't one of them."""
-    issue = _issue(issue)
+def iter_my_open_tasks(headers: Dict[str, str], projects: Iterable[Dict[str, Any]],
+                       user_id: Optional[Any] = None) -> Iterator[Dict[str, Any]]:
+    """The user's own open tasks (every tab of every configured project), one at
+    a time and fetching lazily, so a caller that stops early saves requests."""
     for project in projects:
         data = pc.fetch_project_tasks(project["id"], headers, user_id, code=project.get("code"))
         for tab in [t["name"] for t in data["tabs"]] or [None]:
@@ -161,9 +160,7 @@ def find_my_open_task(issue: Any, headers: Dict[str, str], projects: Iterable[Di
                 project["id"], headers, user_id, code=project.get("code"), tab=tab)
             for group in page["groups"]:
                 for task in group["tasks"]:
-                    if str(task["issue_number"]) == issue:
-                        return {"issue_number": issue, "title": task["title"], "code": project.get("code")}
-    return None
+                    yield {"issue_number": str(task["issue_number"]), "title": task["title"], "code": project.get("code")}
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +191,7 @@ def sync_watchlist(headers: Dict[str, str], base_dir: Optional[str] = None, issu
                    now: Optional[datetime] = None, refresh_meta: bool = True) -> Dict[str, Any]:
     """
     Fetches the timeline of every active watched task (or just `issues`) and
-    stores the events not seen before. A task that is no longer open is synced
+    stores the events not seen before. A task that is closed is synced
     one last time and then paused. With `refresh_meta` false a task whose id is
     already known skips the taskbyissue call, so it is not re-checked for being
     closed or retitled until the next sync that refreshes. One task failing is recorded on its row and
@@ -226,14 +223,14 @@ def sync_watchlist(headers: Dict[str, str], base_dir: Optional[str] = None, issu
                         "new_value, employee, photo, body, url, raw) VALUES (:id, :issue_number, :occurred_at, :kind, "
                         ":field_name, :old_value, :new_value, :employee, :photo, :body, :url, :raw)", event)
             result["new_events"] += conn.total_changes - before
-            still_open = (got["meta"].get("status") or "open") == "open"
+            still_open = got["meta"].get("status") != "closed"
             if not still_open:
                 result["paused"].append(issue)
             conn.execute(
                 "UPDATE watchlist SET task_id = ?, title = COALESCE(NULLIF(?, ''), title), active = ?, "
                 "last_synced_at = ?, last_error = ? WHERE issue_number = ?",
                 (got["task_id"], got["meta"].get("title") or "", int(still_open), stamp,
-                 None if still_open else "No longer open", issue))
+                 None if still_open else "Task is closed", issue))
         conn.commit()
     finally:
         conn.close()

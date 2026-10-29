@@ -860,3 +860,14 @@ def test_rendered_comment_heading_has_timeline_comment_id():
     assert comments[0]["id"] == 4242
     md = pc.render_task_markdown("5001", {"title": "T", "description": "d"}, comments)
     assert "### Kari — 2026-10-27 10:00 · comment id 4242" in md
+
+
+def test_parse_commits():
+    items = [
+        {"id": 1, "field_name": "Comment Added", "task_comment": {"description": "hi"}},
+        {"id": 2, "field_name": "Commit Added", "created_at": "01.10.2026 11:00", "employee": {"name": "Ann"},
+         "task_commit": {"description": "Fix it", "commit_url": "https://github.com/o/r/commit/abc1234"}},
+    ]
+    assert pc.parse_commits(items) == [
+        {"id": 2, "author": "Ann", "created_at": "01.10.2026 11:00", "message": "Fix it",
+         "url": "https://github.com/o/r/commit/abc1234"}]

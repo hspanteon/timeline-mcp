@@ -33,6 +33,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 # Importing panteon_client loads the .env next to it (see panteon_client.py).
+import jira_board
 import panteon_client
 import release_check
 import task_events
@@ -58,6 +59,11 @@ STAGE_REFRESH_MINUTES = 60
 OFF_HOURS_MINUTES = 60
 DEFAULT_ACTIVE_HOURS = "7-19"
 JITTER = 0.1
+# What the background scheduler actually runs with (main() overwrites it from the command line / env);
+# the Help page shows it so the numbers can be checked.
+SCHEDULE = {"heartbeat_minutes": DEFAULT_HEARTBEAT_MINUTES, "full_minutes": DEFAULT_SNAPSHOT_MINUTES,
+            "stage_minutes": STAGE_REFRESH_MINUTES, "off_hours_minutes": OFF_HOURS_MINUTES,
+            "active_hours": DEFAULT_ACTIVE_HOURS, "jitter_percent": int(JITTER * 100)}
 
 
 PLANNER_CACHE_SECONDS = 300
@@ -200,8 +206,13 @@ def create_app(
         def load():
             data = panteon_client.fetch_task_data(request.path_params["issue"], headers())
             meta = data["task_meta"]
+            try:  # the board (Timeline list) comes from the project's repo in timeline-desk.json
+                board = work_session.board_for_project(work_config(), meta.get("project_id"))
+            except work_session.WorkSessionError:
+                board = None
             return {
                 "issue_id": data["issue_id"],
+                "url": panteon_client.task_url(data["issue_id"], board) if board else None,
                 "title": meta.get("title"),
                 "creator": meta.get("creator"),
                 "created_date": meta.get("created_date"),
@@ -209,6 +220,7 @@ def create_app(
                 "tags": meta.get("tags") or [],
                 "description": meta.get("description") or "",
                 "comments": data["comments"],
+                "commits": data.get("commits") or [],
             }
         return _respond(load)
 
@@ -283,8 +295,24 @@ def create_app(
                 raise LookupError("Unknown project.")
             return panteon_client.fetch_project_tasks(
                 wanted, headers(), resolved_user(), code=projects[wanted]["code"],
-                tab=request.query_params.get("tab") or None)
+                tab=request.query_params.get("tab") or None, support=request.query_params.get("support") == "1")
         return _respond(load)
+
+    def api_about(request: Request):
+        return _respond(lambda: {
+            "schedule": SCHEDULE,
+            "planner_cache_minutes": PLANNER_CACHE_SECONDS / 60,
+            "request_gap_ms": int(os.getenv("PANTEON_MIN_REQUEST_GAP_MS") or 200),
+            "database": panteon_client.planner_db_path(base_dir),
+            "last_planner_check": panteon_client.last_planner_check(resolved_user(), base_dir),
+            "now": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "workflow_steps": [{k: step.get(k) for k in ("key", "title", "optional", "repeat", "extra", "run", "about",
+                                                         "skills", "reads", "writes", "wont", "approve")}
+                               for step in [*workflow.FLOW, *workflow.SIDE.values()]],
+            "workflow_buttons": [{"key": key, "label": label, "help": text, "needs_note": key in workflow.NEEDS_NOTE}
+                                 for key, (label, text) in workflow.ACTION_TEXT.items()],
+            "run_statuses": [{"key": key, "label": label} for key, label in workflow.RUN_LABELS.items()],
+        })
 
     def api_work_config(request: Request):
         return _respond(lambda: work_session.public_config(work_config()))
@@ -480,12 +508,9 @@ def create_app(
             issue = str(body.get("issue") or "").strip()
             if not issue.isdigit():
                 raise ValueError("Issue ID must be a number.")
-            # Only the user's own open tasks can be watched.
-            task = task_events.find_my_open_task(issue, headers(), work_session.public_config(work_config())["projects"],
-                                                 resolved_user())
-            if not task:
-                raise LookupError(f"Task #{issue} isn't one of your open tasks.")
-            task_events.watch_task(issue, task["code"], task["title"], base_dir)
+            # Any task that exists in Timeline can be watched (one taskbyissue call for its title and project).
+            row = task_lookup([issue])[issue]
+            task_events.watch_task(issue, row["code"], row["title"], base_dir)
             return {"sync": task_events.sync_watchlist(headers(), base_dir, [issue]),
                     "watchlist": task_events.list_watchlist(base_dir)}
         return await run_in_threadpool(_respond, watch)
@@ -501,8 +526,95 @@ def create_app(
             return {"watchlist": task_events.list_watchlist(base_dir)}
         return _respond(unwatch)
 
+    # ---- Jira board (jira_board.py) ----
+    def api_jira_board(request: Request):
+        def load():
+            try:  # older cards have no list code yet; a Timeline hiccup must not hide the board
+                jira_board.fill_missing_codes(headers(), work_session.public_config(work_config())["projects"],
+                                              resolved_user(), base_dir)
+            except (PermissionError, LookupError, ValueError, requests.RequestException):
+                pass
+            return jira_board.board(base_dir)
+        return _respond(load)
+
+    def jira_projects():
+        return work_session.public_config(work_config())["projects"]
+
+    def task_lookup(issues):
+        """{issue: {"title", "code"}} for tasks that exist in Timeline and are not closed (one taskbyissue call
+        each); `code` is the list code of its project when that project is set up in timeline-desk.json, else None."""
+        codes = {str(p["id"]): p["code"] for p in jira_projects()}
+        found = {}
+        for row in panteon_client.get_task_statuses(list(issues), headers()):
+            if row.get("error"):
+                raise LookupError(f"Task #{row['issue_id']}: {row['error']}.")
+            if row.get("task_status") == "closed":  # the one status that rules a task out
+                raise ValueError(f"Task #{row['issue_id']} is closed.")
+            found[str(row["issue_id"])] = {"title": row.get("title") or "", "code": codes.get(str(row.get("project_id")))}
+        return found
+
+    def api_jira_my_tasks(request: Request):
+        return _respond(lambda: {"tasks": jira_board.list_my_tasks(headers(), jira_projects(), resolved_user())})
+
+    def api_jira_support_tasks(request: Request):
+        return _respond(lambda: {"tasks": jira_board.list_support_tasks(headers(), jira_projects(), resolved_user())})
+
+    async def api_jira_add(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        body = await json_body(request)
+
+        def add():
+            raw = body.get("issues") if isinstance(body.get("issues"), list) else [body.get("issue")]
+            issues = []
+            for value in raw:
+                value = str(value or "").strip()
+                if not value.isdigit():
+                    raise ValueError("Issue ID must be a number.")
+                if value not in issues:
+                    issues.append(value)
+            if not issues:
+                raise ValueError("Pick at least one task.")
+            if body.get("status") not in jira_board.STATUSES:
+                raise ValueError(f"Unknown status {body.get('status')!r}.")
+            on_board = {c["issue_number"] for c in jira_board.list_cards(base_dir)}
+            if on_board.intersection(issues):
+                raise ValueError("Already on the board: " + ", ".join(f"#{i}" for i in issues if i in on_board) + ".")
+            # Any task that exists in Timeline can be added. Titles come from Timeline; the support list only
+            # decides which cards carry the "support" tag, so a failed support request is not an error.
+            try:
+                support = {t["issue_number"] for t in jira_board.list_support_tasks(headers(), jira_projects(), resolved_user())}
+            except (LookupError, requests.RequestException):
+                support = set()
+            found = task_lookup(issues)
+            tasks = [{"issue_number": i, "title": found[i]["title"], "code": found[i]["code"], "support": i in support}
+                     for i in issues]
+            cards = jira_board.add_cards(tasks, body.get("status"), base_dir)
+            return {"card": cards[0], "cards": cards}
+        return await run_in_threadpool(_respond, add)
+
+    async def api_jira_move(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        body = await json_body(request)
+        return _respond(lambda: {"card": jira_board.move_card(request.path_params["issue"], body.get("status"), base_dir)})
+
+    def api_jira_remove(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        return _respond(lambda: {"card": jira_board.remove_card(request.path_params["issue"], base_dir)})
+
     routes = [
         Route("/", index),
+        Route("/api/jira/board", api_jira_board),
+        Route("/api/jira/my-tasks", api_jira_my_tasks),
+        Route("/api/jira/support-tasks", api_jira_support_tasks),
+        Route("/api/jira/cards", api_jira_add, methods=["POST"]),
+        Route("/api/jira/cards/{issue}/move", api_jira_move, methods=["POST"]),
+        Route("/api/jira/cards/{issue}", api_jira_remove, methods=["DELETE"]),
         Route("/api/events", api_events),
         Route("/api/events/sync", api_events_sync, methods=["POST"]),
         Route("/api/watchlist", lambda request: _respond(lambda: {"watchlist": task_events.list_watchlist(base_dir)})),
@@ -518,6 +630,7 @@ def create_app(
         Route("/api/release", api_release),
         Route("/api/release", api_release_refresh, methods=["POST"]),
         Route("/api/project/{project}/tasks", api_project_tasks),
+        Route("/api/about", api_about),
         Route("/api/work/config", api_work_config),
         Route("/api/workflows", api_workflows),
         Route("/api/workflow/{issue}", api_workflow),
@@ -641,6 +754,8 @@ def main(argv=None) -> int:
             print(f"Watchlist sync failed: {exc}", flush=True)
         return {"full": full, "stages": stages}
 
+    SCHEDULE.update(heartbeat_minutes=max(args.heartbeat, 1), full_minutes=max(args.interval, args.heartbeat, 1),
+                    active_hours=args.active_hours)
     stop = threading.Event()
     threading.Thread(target=run_snapshot_scheduler, args=(take_snapshot, stop), daemon=True, kwargs={
         "heartbeat_seconds": max(args.heartbeat, 1) * 60,

@@ -1069,7 +1069,8 @@ def list_workflows(base_dir: Optional[str] = None, me: Optional[str] = None) -> 
             active = wf["state"] == "active"
             open_run = _open_run(_runs(conn, wf["issue_number"])) if active else None
             signals = workflow_signals(wf, _task_events(conn, wf["issue_number"]), me) if active else []
-            items.append({"issue": wf["issue_number"], "code": wf["code"], "title": wf["title"], "step": wf["step"],
+            items.append({"issue": wf["issue_number"], "code": wf["code"], "url": pc.task_url(wf["issue_number"], wf["code"]),
+                          "title": wf["title"], "step": wf["step"],
                           "step_title": STEPS[wf["step"]]["title"], "state": wf["state"],
                           "status": workflow_status(wf, open_run, signals), "updated_at": wf["updated_at"],
                           "step_since": wf.get("step_since"), "signals": len(signals),

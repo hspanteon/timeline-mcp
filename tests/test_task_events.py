@@ -111,7 +111,7 @@ class TestSync:
         result = te.sync_watchlist({}, str(tmp_path), now=NOW)
         assert result["paused"] == ["5"] and result["new_events"] == 4
         row = te.list_watchlist(str(tmp_path))[0]
-        assert row["active"] is False and row["last_error"] == "No longer open"
+        assert row["active"] is False and row["last_error"] == "Task is closed"
         assert te.sync_watchlist({}, str(tmp_path), now=NOW)["tasks"] == 0
 
     def test_one_failure_does_not_stop_the_others(self, fake_api, tmp_path):
@@ -184,10 +184,21 @@ class TestDashboard:
         assert client.delete("/api/watchlist/5").status_code == 403
         assert client.post("/api/events/sync").status_code == 403
 
-    def test_watch_only_my_open_tasks(self, client):
-        assert client.post("/api/watchlist", json={"issue": "99"}, headers=self.G).status_code == 404
+    def test_watch_needs_a_task_that_exists_in_timeline(self, client):
+        assert client.post("/api/watchlist", json={"issue": "404"}, headers=self.G).status_code == 404
         assert client.post("/api/watchlist", json={"issue": "abc"}, headers=self.G).status_code == 400
         assert client.get("/api/watchlist").json()["watchlist"] == []
+
+    def test_a_closed_task_cannot_be_watched(self, client, fake_api):
+        fake_api["status"] = "closed"
+        response = client.post("/api/watchlist", json={"issue": "77"}, headers=self.G)
+        assert response.status_code == 400 and "closed" in response.json()["error"]
+        assert client.get("/api/watchlist").json()["watchlist"] == []
+
+    def test_watch_a_task_that_is_not_on_my_lists(self, client):
+        # The fixture's project lists only #5; #77 exists in Timeline but is on none of my lists (e.g. a support task).
+        body = client.post("/api/watchlist", json={"issue": "77"}, headers=self.G).json()
+        assert [w["issue_number"] for w in body["watchlist"]] == ["77"]
 
     def test_watch_backfills_and_feed_reads(self, client):
         body = client.post("/api/watchlist", json={"issue": "5"}, headers=self.G).json()
@@ -197,3 +208,4 @@ class TestDashboard:
         assert feed["watchlist"][0]["events"] == 4
         assert client.delete("/api/watchlist/5", headers=self.G).status_code == 200
         assert client.delete("/api/watchlist/5", headers=self.G).status_code == 404
+

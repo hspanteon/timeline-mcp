@@ -12,8 +12,8 @@
 <body>
   <header class="top">
     <div class="brand">
+      <a class="brand-icon" id="page-help" href="#/help" title="Help: how this page gets its data" aria-label="Help for this page"></a>
       <h1>Timeline<span>Desk</span></h1>
-      <p class="meta" id="meta">Loading your planner…</p>
     </div>
     <nav class="tabs" aria-label="Views">
       <a href="#/planner" data-view="planner">Planner</a>
@@ -23,12 +23,17 @@
       <a href="#/release" data-view="release">Release</a>
       <a href="#/task" data-view="task">Task</a>
       <a href="#/work" data-view="work">Work</a>
+      <a href="#/jira" data-view="jira">Jira</a>
     </nav>
-    <button type="button" class="btn ghost" id="refresh">Refresh</button>
+    <div class="top-actions">
+      <p class="meta" id="meta">Loading your planner…</p>
+      <button type="button" class="btn ghost" id="refresh">Refresh</button>
+    </div>
   </header>
 
   <main id="view" tabindex="-1" aria-live="polite"></main>
 
+  <script src="/static/help.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
