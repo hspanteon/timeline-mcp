@@ -37,6 +37,7 @@ import jira_board
 import panteon_client
 import release_check
 import task_events
+import timeline_socket
 import work_session
 import workflow
 
@@ -59,6 +60,8 @@ STAGE_REFRESH_MINUTES = 60
 OFF_HOURS_MINUTES = 60
 DEFAULT_ACTIVE_HOURS = "7-19"
 JITTER = 0.1
+WAKE_GAP_SECONDS = 15.0  # least time between two checks started by socket events
+WAKE_DEBOUNCE_SECONDS = 2.0  # a burst of events becomes one check
 # What the background scheduler actually runs with (main() overwrites it from the command line / env);
 # the Help page shows it so the numbers can be checked.
 SCHEDULE = {"heartbeat_minutes": DEFAULT_HEARTBEAT_MINUTES, "full_minutes": DEFAULT_SNAPSHOT_MINUTES,
@@ -301,6 +304,7 @@ def create_app(
     def api_about(request: Request):
         return _respond(lambda: {
             "schedule": SCHEDULE,
+            "socket": timeline_socket.STATUS,
             "planner_cache_minutes": PLANNER_CACHE_SECONDS / 60,
             "request_gap_ms": int(os.getenv("PANTEON_MIN_REQUEST_GAP_MS") or 200),
             "database": panteon_client.planner_db_path(base_dir),
@@ -492,6 +496,9 @@ def create_app(
             "watchlist": task_events.list_watchlist(base_dir),
         })
 
+    def api_events_marker(request: Request):
+        return _respond(lambda: task_events.events_marker(base_dir))
+
     def api_events_sync(request: Request):
         denied = guarded(request)
         if denied:
@@ -616,6 +623,7 @@ def create_app(
         Route("/api/jira/cards/{issue}/move", api_jira_move, methods=["POST"]),
         Route("/api/jira/cards/{issue}", api_jira_remove, methods=["DELETE"]),
         Route("/api/events", api_events),
+        Route("/api/events/marker", api_events_marker),
         Route("/api/events/sync", api_events_sync, methods=["POST"]),
         Route("/api/watchlist", lambda request: _respond(lambda: {"watchlist": task_events.list_watchlist(base_dir)})),
         Route("/api/watchlist", api_watch, methods=["POST"]),
@@ -681,13 +689,19 @@ def run_snapshot_scheduler(
     clock: Callable[[], float] = time.monotonic,
     now: Callable[[], datetime] = datetime.now,
     jitter: float = JITTER,
+    wake: Optional[threading.Event] = None,
+    wake_gap_seconds: float = WAKE_GAP_SECONDS,
+    wake_debounce_seconds: float = WAKE_DEBOUNCE_SECONDS,
 ) -> None:
     """Calls `take(full=…, stages=…)` at startup and then every heartbeat (hourly
     outside the active hours) until `stop` is set; each call says whether a full
     planner check and stage lookups are due. `take` may return {"full", "stages"}
     for what it actually did (a heartbeat that saw a change upgrades itself).
     A failed attempt (offline, expired token) is logged and the loop carries on.
-    Waits are jittered so the calls never land on a fixed beat."""
+    Waits are jittered so the calls never land on a fixed beat. `wake` (set by the socket
+    listener when Timeline pushes an event) ends the wait early during the active hours:
+    a burst is coalesced for `wake_debounce_seconds` and runs are at least `wake_gap_seconds`
+    apart; outside the active hours it is ignored."""
     last_full = last_stages = None
     while True:
         active = is_active(now(), active_hours)
@@ -702,8 +716,28 @@ def run_snapshot_scheduler(
                 last_stages = t
         except Exception as exc:  # keep the scheduler alive whatever fails
             print(f"Planner check failed: {exc}", flush=True)
-        wait = heartbeat_seconds if active else off_hours_seconds
-        if stop.wait(wait * (1 + random.uniform(-jitter, jitter))):
+        wait = (heartbeat_seconds if active else off_hours_seconds) * (1 + random.uniform(-jitter, jitter))
+        if wake is None:
+            if stop.wait(wait):
+                return
+            continue
+        end = time.monotonic() + wait
+        while (left := end - time.monotonic()) > 0:
+            if stop.is_set():
+                return
+            if not wake.wait(min(left, 1.0)):  # short slices: `stop` can't wake this wait itself
+                continue
+            wake.clear()
+            if not active:
+                continue
+            if stop.wait(wake_debounce_seconds):
+                return
+            wake.clear()
+            gap = wake_gap_seconds - (clock() - t)
+            if gap > 0 and stop.wait(gap):
+                return
+            break
+        if stop.is_set():
             return
 
 
@@ -719,6 +753,8 @@ def main(argv=None) -> int:
                         help=f"Minutes between cheap change checks (default {DEFAULT_HEARTBEAT_MINUTES}, or TIMELINE_HEARTBEAT_MINUTES).")
     parser.add_argument("--active-hours", default=os.getenv("TIMELINE_ACTIVE_HOURS") or DEFAULT_ACTIVE_HOURS,
                         help="Weekday hours to poll at the heartbeat, e.g. 7-19, or 'all' (default 7-19, or TIMELINE_ACTIVE_HOURS).")
+    parser.add_argument("--no-socket", action="store_true",
+                        help="Don't listen on Timeline's live socket; rely on polling alone (or TIMELINE_SOCKET=0).")
     args = parser.parse_args(argv)
 
     import uvicorn
@@ -757,7 +793,14 @@ def main(argv=None) -> int:
     SCHEDULE.update(heartbeat_minutes=max(args.heartbeat, 1), full_minutes=max(args.interval, args.heartbeat, 1),
                     active_hours=args.active_hours)
     stop = threading.Event()
+    wake = threading.Event()
+    if not args.no_socket and timeline_socket.socket_enabled():
+        threading.Thread(target=timeline_socket.run_socket_listener, args=(wake, stop), daemon=True, kwargs={
+            "events": timeline_socket.parse_event_filter(os.getenv("TIMELINE_SOCKET_EVENTS")),
+            "log_payloads": os.getenv("TIMELINE_SOCKET_LOG_PAYLOADS") == "1",
+        }).start()
     threading.Thread(target=run_snapshot_scheduler, args=(take_snapshot, stop), daemon=True, kwargs={
+        "wake": wake,
         "heartbeat_seconds": max(args.heartbeat, 1) * 60,
         "full_seconds": max(args.interval, args.heartbeat, 1) * 60,
         "active_hours": parse_active_hours(args.active_hours),
@@ -766,6 +809,7 @@ def main(argv=None) -> int:
         uvicorn.run(create_app(args.user_id, args.base_dir, args.repo_dir, planner_cache=planner_cache), host="127.0.0.1", port=args.port, log_level="warning")
     finally:
         stop.set()
+        wake.set()
     return 0
 
 

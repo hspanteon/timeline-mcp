@@ -94,7 +94,7 @@ const HELP = {
         "Commits are hidden until you switch them on. Click the task name on a card to open the task.",
         "The watchlist dialog shows every watched task; Stop watching pauses it (its events stay).",
       ],
-      refresh: "No automatic refresh of the page. The background checks copy new events of each watched task every heartbeat (one request per task). The Refresh button syncs the watched tasks right away, then reads the database.",
+      refresh: "The page updates itself: it checks the local database every 2 seconds and adds new events at the top with a brief glow, keeping your filters and scroll position. Events reach the database when the live socket tells the background check to run (within a few seconds), or at the latest on the next heartbeat (one request per watched task). The Refresh button syncs the watched tasks right away, then reads the database.",
       how: "The first sync of a task copies its whole history. After that only new events are added. A task is paused automatically once it is closed in Timeline.",
       know: [
         "Times are Timeline's own clock (not converted).",

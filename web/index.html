@@ -16,14 +16,34 @@
       <h1>Timeline<span>Desk</span></h1>
     </div>
     <nav class="tabs" aria-label="Views">
-      <a href="#/planner" data-view="planner">Planner</a>
-      <a href="#/workflows" data-view="workflows">Workflows</a>
-      <a href="#/changes" data-view="changes">Changes</a>
-      <a href="#/timeline" data-view="timeline">Timeline</a>
-      <a href="#/release" data-view="release">Release</a>
-      <a href="#/task" data-view="task">Task</a>
-      <a href="#/work" data-view="work">Work</a>
-      <a href="#/jira" data-view="jira">Jira</a>
+      <div class="tab-group" role="group" aria-label="Planner">
+        <span class="tab-group-label">Planner</span>
+        <div class="tab-group-links">
+        <a href="#/planner" data-view="planner">Planner</a>
+        <a href="#/changes" data-view="changes">Changes</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Timeline">
+        <span class="tab-group-label">Timeline</span>
+        <div class="tab-group-links">
+        <a href="#/timeline" data-view="timeline">Timeline</a>
+        <a href="#/task" data-view="task">Task</a>
+        <a href="#/jira" data-view="jira">Jira</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Workflow">
+        <span class="tab-group-label">Workflow</span>
+        <div class="tab-group-links">
+        <a href="#/workflows" data-view="workflows">Workflows</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Git">
+        <span class="tab-group-label">Git</span>
+        <div class="tab-group-links">
+        <a href="#/release" data-view="release">Release</a>
+        <a href="#/work" data-view="work">Work</a>
+        </div>
+      </div>
     </nav>
     <div class="top-actions">
       <p class="meta" id="meta">Loading your planner…</p>

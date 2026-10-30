@@ -418,3 +418,8 @@ def test_project_endpoint_only_serves_configured_projects(monkeypatch, tmp_path)
     assert client.get("/api/project/99/tasks").status_code == 404
     assert client.get("/api/project/abc/tasks").status_code == 404
     assert client.get("/api/work/config").json()["projects"] == [{"code": "15033", "id": 16, "name": "duell-admin"}]
+
+
+def test_events_marker_endpoint(tmp_path):
+    client = TestClient(dashboard.create_app(None, str(tmp_path)), base_url="http://127.0.0.1")
+    assert client.get("/api/events/marker").json() == {"max_id": 0, "count": 0}

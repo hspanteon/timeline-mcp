@@ -67,10 +67,16 @@ a { color: var(--accent-ink); }
 .top-actions .meta { margin: 0; color: var(--muted); font-size: 14px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .top-actions .btn { flex: none; }
 
-.tabs { display: flex; gap: 2px; align-self: stretch; }
+.tabs { display: flex; gap: 0; align-self: stretch; }
+/* Tabs come in groups (planner, timeline, workflow, git): a small label over each, a divider between. */
+.tab-group { display: flex; flex-direction: column; justify-content: flex-end; padding: 0 10px; border-left: 1px solid var(--line); }
+.tab-group-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); opacity: 0.8; padding: 0 11px; margin-top: 6px; }
+.tab-group-links { display: flex; gap: 2px; align-self: stretch; }
 
 .tabs a {
   display: flex;
+  align-self: stretch;
+  min-height: 36px;
   align-items: center;
   padding: 0 11px;
   color: var(--muted);
@@ -320,6 +326,7 @@ textarea { width: 100%; min-height: 70px; resize: vertical; }
   .top { gap: 8px 16px; padding-top: 8px; }
   .top-actions { order: 2; }
   .tabs { order: 3; flex: 1 0 100%; overflow-x: auto; }
+  .tab-group { flex: none; }
 }
 @media (max-width: 860px) {
   .board { grid-template-columns: 1fr; }
@@ -935,3 +942,11 @@ a:hover > .tl-sha { border-color: #c4a5ff; }
 .jira-card.support { border-color: var(--progress); }
 .jira-card.task { border-color: var(--accent); }
 .jira-task .badge.task { color: var(--accent-ink); border-color: var(--accent); margin-left: 6px; }
+
+/* an event that just arrived through the live refresh */
+.tl-event.tl-live .tl-card { animation: tl-live-glow 8s ease-out; }
+@keyframes tl-live-glow {
+  0%, 35% { box-shadow: 0 0 0 2px var(--accent), var(--shadow); background: color-mix(in srgb, var(--accent) 14%, var(--surface)); }
+  100% { box-shadow: var(--shadow); }
+}
+@media (prefers-reduced-motion: reduce) { .tl-event.tl-live .tl-card { animation: none; } }

@@ -544,6 +544,31 @@ function saveFilters() {
 }
 const eventsState = loadFilters();
 let eventsToken = 0;
+let liveTimer = null;
+let liveBusy = false;
+const LIVE_POLL_MS = 2000;
+
+function stopLive() {
+  clearInterval(liveTimer);
+  liveTimer = null;
+}
+
+// Watches the local event marker (a database read, never Timeline) and calls `refresh` when the stored
+// events changed, so a comment the background sync just saved appears without pressing Refresh.
+function startLive(marker, refresh) {
+  stopLive();
+  liveTimer = setInterval(async () => {
+    if (liveBusy || document.hidden) return;
+    liveBusy = true;
+    try {
+      const now = await api("/api/events/marker");
+      if (now.max_id !== marker.max_id || now.count !== marker.count) {
+        marker = now;
+        await refresh();
+      }
+    } catch (error) { /* the next tick tries again */ } finally { liveBusy = false; }
+  }, LIVE_POLL_MS);
+}
 
 function svgIcon(path, size = 16) {
   return new DOMParser().parseFromString(
@@ -682,6 +707,7 @@ function openWatchlist(initial, onClose) {
 
 async function showTimeline(force) {
   const token = ++eventsToken;
+  stopLive();
   loading(force ? "Syncing watched tasks…" : "Loading the timeline…");
   if (force) {
     try { await api("/api/events/sync", { method: "POST", headers: writeHeaders }); } catch (error) { toast(error.message, true); }
@@ -692,7 +718,7 @@ async function showTimeline(force) {
     if (before) q.set("before", before);
     return api(`/api/events?${q}`);
   };
-  const [first] = await Promise.all([query(), loadSupportIds()]);
+  const [first, , marker] = await Promise.all([query(), loadSupportIds(), api("/api/events/marker")]);
   if (token !== eventsToken) return;
   const active = first.watchlist.filter((w) => w.active);
   cache.watched = new Set(active.map((w) => String(w.issue_number)));
@@ -700,7 +726,9 @@ async function showTimeline(force) {
   for (const issue of [...eventsState.issues]) if (!cache.watched.has(String(issue))) eventsState.issues.delete(issue);
   const redraw = () => { saveFilters(); return showTimeline(false); };
 
-  // ---- summary tiles
+  // ---- summary tiles (refilled by the live refresh)
+  const summary = h("section", { class: "tl-summary", "aria-label": "Summary" });
+  const fillSummary = (active) => {
   const lastSync = active.map((w) => w.last_synced_at).filter(Boolean).sort().pop();
   const totalEvents = active.reduce((n, w) => n + w.events, 0);
   const tile = (value, label, sub) => h("div", { class: "tl-tile" }, h("b", {}, value), h("span", {}, label), sub ? h("small", {}, sub) : null);
@@ -713,11 +741,13 @@ async function showTimeline(force) {
     watchedTile.append(h("ul", { class: "tl-hover-list", "aria-label": "Watched tasks" }, active.map((w) => h("li", {},
       h("strong", {}, `#${w.issue_number}`), " ", w.title || "", " ", openInTimeline(w.issue_number, w.url), supportTag(w.issue_number)))));
   }
-  const summary = h("section", { class: "tl-summary", "aria-label": "Summary" },
+  put(summary,
     watchedTile,
     tile(totalEvents, "events recorded"),
     tile(lastSync ? clock(lastSync) : "—", "last synced", lastSync ? ago(lastSync) : "press Refresh"),
     errors.length ? h("div", { class: "tl-tile bad" }, h("b", {}, "!"), h("span", {}, errors.map((w) => `#${w.issue_number}: ${w.last_error}`).join(" · "))) : null);
+  };
+  fillSummary(active);
 
   // ---- filters
   const kindFilters = h("div", { class: "tl-kinds", role: "group", "aria-label": "Event types" },
@@ -727,7 +757,8 @@ async function showTimeline(force) {
       onclick: () => { if (eventsState.kinds.has(key)) eventsState.kinds.delete(key); else eventsState.kinds.add(key); redraw(); } },
       svgIcon(k.icon, 14), k.label)));
   const search = h("input", { type: "search", class: "tl-search", placeholder: "Search the loaded events…", "aria-label": "Search events", value: eventsState.q });
-  const chips = h("div", { class: "tl-chips", role: "group", "aria-label": "Filter by task" },
+  const chips = h("div", { class: "tl-chips", role: "group", "aria-label": "Filter by task" });
+  const fillChips = (active) => put(chips,
     active.map((w) => h("span", { class: "tl-chip", style: taskStyle(w.issue_number) },
       h("button", { type: "button", class: "tl-chip-main", "aria-pressed": String(eventsState.issues.has(w.issue_number)),
         title: `Show only #${w.issue_number}${w.title ? ` · ${w.title}` : ""}${w.last_synced_at ? ` (synced ${niceTime(w.last_synced_at)})` : ""}`,
@@ -738,6 +769,7 @@ async function showTimeline(force) {
           redraw();
         } },
         h("i", { "aria-hidden": "true" }), h("b", {}, `#${w.issue_number}`), supportTag(w.issue_number), h("small", {}, w.events)))));
+  fillChips(active);
 
   // Watchlist dialog: the only place a task is removed from the watchlist.
   const watchlistButton = h("button", { type: "button", class: "btn ghost", onclick: () => openWatchlist(active, redraw) }, "Watchlist");
@@ -746,6 +778,7 @@ async function showTimeline(force) {
   const loaded = [];
   const tasks = {};
   let cursor = null;
+  const fresh = new Set(); // ids that just arrived live; they glow briefly
   const feed = h("ol", { class: "tl-feed" });
   const more = h("div", { class: "tl-footer" });
   const empty = h("div", { class: "tl-empty" });
@@ -762,7 +795,9 @@ async function showTimeline(force) {
         rows.push(h("li", { class: "tl-day" }, h("h2", {}, niceDate(date), dayNote(date) ? h("em", {}, dayNote(date)) : null),
           h("span", { class: "tl-count" }, `${countFor(date)} event${countFor(date) === 1 ? "" : "s"}`)));
       }
-      rows.push(eventCard(e, tasks));
+      const card = eventCard(e, tasks);
+      if (fresh.has(e.id)) card.classList.add("tl-live");
+      rows.push(card);
     }
     put(feed, rows);
     put(empty, rows.length ? null : h("p", { class: "note" }, q ? "No loaded event matches your search." : "No events match these filters."));
@@ -775,6 +810,27 @@ async function showTimeline(force) {
   search.addEventListener("input", () => { eventsState.q = search.value; render(); });
   add(first);
 
+  // Live: merge events that arrived since the page was drawn, without losing scroll, filters or older pages.
+  const liveRefresh = async () => {
+    const page = await query();
+    if (token !== eventsToken) return;
+    const now = page.watchlist.filter((w) => w.active);
+    cache.watched = new Set(now.map((w) => String(w.issue_number)));
+    fillSummary(now);
+    fillChips(now);
+    const seen = new Set(loaded.map((e) => e.id));
+    const arrived = page.events.filter((e) => !seen.has(e.id));
+    if (!arrived.length) return;
+    for (const e of arrived) {
+      fresh.add(e.id);
+      setTimeout(() => fresh.delete(e.id), 8000);
+    }
+    loaded.push(...arrived);
+    loaded.sort((a, b) => b.occurred_at.localeCompare(a.occurred_at) || b.id - a.id);
+    Object.assign(tasks, page.tasks);
+    render();
+  };
+
   if (!active.length) {
     put(view, h("div", { class: "tl-hero" },
       h("div", { class: "tl-hero-star", "aria-hidden": "true" }, "★"),
@@ -786,6 +842,7 @@ async function showTimeline(force) {
   put(view, h("div", { class: "tl-page" },
     h("div", { class: "tl-head" }, summary, h("div", { class: "tl-controls" }, kindFilters, search, watchlistButton)),
     chips, feed, empty, more));
+  startLive(marker, liveRefresh);
 }
 
 // ---- release --------------------------------------------------------------
@@ -2114,6 +2171,11 @@ const HELP_TOPIC_ICON = {
   trouble: "M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01",
 };
 
+function socketText(sock) {
+  if (sock.state === "connected") return sock.last_event ? `connected, ${sock.events} events (last: ${sock.last_event})` : "connected, no events yet";
+  return sock.error ? `${sock.state}: ${sock.error}` : sock.state;
+}
+
 function minutesText(m) { return `${Number(m)} minute${Number(m) === 1 ? "" : "s"}`; }
 
 async function showHelp(arg) {
@@ -2161,6 +2223,7 @@ async function showHelp(arg) {
          ["Full planner check", `when the heartbeat sees a change, or at least every ${minutesText(sched.full_minutes)}`, "Fetches all three periods and saves a snapshot if your tasks differ."],
          ["Stage lookups", `on a change, or every ${minutesText(sched.stage_minutes)}`, "One request per task for the stage bars stored with snapshots."],
          ["Active hours", `weekdays ${sched.active_hours}`, `Outside them there is one full check every ${minutesText(sched.off_hours_minutes)}.`],
+         ["Live socket", about.socket && about.socket.enabled ? socketText(about.socket) : "off", "Timeline's own push channel. An event makes the heartbeat run right away (at most every 15 s, active hours only); polling stays as the fallback. Turn off with --no-socket or TIMELINE_SOCKET=0; TIMELINE_SOCKET_EVENTS limits which events count."],
          ["Spacing", `waits vary by ±${sched.jitter_percent}%; at least ${about.request_gap_ms} ms between requests`, "So requests arrive as a trickle, never a burst."],
          ["In-memory planner copy", `kept up to ${minutesText(about.planner_cache_minutes)}`, "What the Planner and Workflows pages read; the Refresh button replaces it."],
          ["Last planner check", about.last_planner_check ? niceTime(about.last_planner_check) : "none yet", "Recorded even when nothing changed."]]
@@ -2222,6 +2285,7 @@ async function route(force) {
   const [, rawName = "planner", arg] = (location.hash || "#/planner").split("/");
   const name = rawName === "board" ? "planner" : rawName; // old #/board links keep working
   let label = "Planner";
+  stopLive();
   for (const tab of document.querySelectorAll(".tabs a")) {
     if (tab.dataset.view === name) { tab.setAttribute("aria-current", "page"); label = tab.textContent; }
     else tab.removeAttribute("aria-current");

@@ -209,3 +209,18 @@ class TestDashboard:
         assert client.delete("/api/watchlist/5", headers=self.G).status_code == 200
         assert client.delete("/api/watchlist/5", headers=self.G).status_code == 404
 
+
+
+def test_events_marker_changes_when_events_are_stored(fake_api, tmp_path):
+    base = str(tmp_path)
+    assert te.events_marker(base) == {"max_id": 0, "count": 0}  # no database yet, and none is created
+    assert not (tmp_path / "database").exists()
+    te.watch_task(5, "15033", "Five", base, now=NOW)
+    te.sync_watchlist({}, base, now=NOW)
+    before = te.events_marker(base)
+    assert before["count"] == 4
+    assert te.events_marker(base) == before  # unchanged while nothing is stored
+    fake_api["items"].append(_item(5, "Comment Added", "27.10.2026 10:00", task_comment={"description": "hi"}))
+    te.sync_watchlist({}, base, now=NOW)
+    after = te.events_marker(base)
+    assert after["count"] == 5 and after["max_id"] > before["max_id"]

@@ -240,6 +240,19 @@ def sync_watchlist(headers: Dict[str, str], base_dir: Optional[str] = None, issu
 # --------------------------------------------------------------------------- #
 # Reading
 # --------------------------------------------------------------------------- #
+def events_marker(base_dir: Optional[str] = None) -> Dict[str, int]:
+    """{"max_id", "count"} of the stored events: a local read, cheap enough for the Timeline page
+    to poll every couple of seconds and re-read the feed only when it changed."""
+    conn = pc._open_planner_db(base_dir, create=False)
+    if conn is None:
+        return {"max_id": 0, "count": 0}
+    try:
+        max_id, count = conn.execute("SELECT COALESCE(MAX(id), 0), COUNT(*) FROM task_events").fetchone()
+    finally:
+        conn.close()
+    return {"max_id": int(max_id), "count": int(count)}
+
+
 def list_events(base_dir: Optional[str] = None, issues: Optional[Iterable[Any]] = None,
                 kinds: Optional[Iterable[str]] = None, limit: int = 200,
                 before: Optional[str] = None) -> Dict[str, Any]:
