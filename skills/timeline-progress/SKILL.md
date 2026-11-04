@@ -42,13 +42,15 @@ timeline/{task-id}/progress.md
 timeline/{task-id}/release-note.md   # only if it exists
 ```
 
-If the folder does not exist, stop and say:
+If `timeline/{task-id}/analysis.md` does not exist, intake has not run (no folder, or only a fetched `task.md`). Stop and say:
 
 ```text
-No timeline folder found for task {task-id}. Run timeline-intake {task-id} first.
+No intake for task {task-id} yet. Run timeline-intake {task-id} first.
 ```
 
 Determine the current phase from the `## Releases` table in `progress.md`: no releases yet -> `dev`; last release target `qa` -> `qa-fix`; last release target `prod` or `hotfix` -> `prod-fix`.
+
+A task can reach QA or production without `timeline-release` (released through the team's PRs). So when the table has no rows, check the stages with the timeline MCP's `get_task_statuses`: Live started -> `prod-fix`; otherwise Testing or QA started -> `qa-fix`; otherwise `dev`. A phase the user names wins over both.
 
 ## Work Mode
 

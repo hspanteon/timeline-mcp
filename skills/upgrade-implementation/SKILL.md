@@ -60,7 +60,7 @@ If legacy code is missing or contradictory, state the gap and preserve current n
 
 For `/upgrade-bug` or lost/broken upgrade behavior:
 
-1. If no `timeline/{bug-id}/` folder exists and the user wants one, run `timeline-intake` for it first.
+1. If `timeline/{bug-id}/analysis.md` doesn't exist and the user wants a timeline record, run `timeline-intake` for it first.
 2. Search current code for the broken feature using 2-3 keywords.
 3. Search legacy `../duell-pos` for the original flow.
 4. Compare legacy and current behavior across route, controller, repository, response shape, frontend logic, template, and DB fields.

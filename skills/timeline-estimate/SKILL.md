@@ -35,9 +35,9 @@ This skill takes either a **task ID** or a plain description of work — estimat
 
 When a **task ID** is given:
 
-1. If `timeline/{task-id}/` does not exist, run the `timeline-intake` skill for it **first**, then estimate. Its `analysis.md` is the inventory starting point — do not re-derive the impact analysis it already produced.
-2. If the folder exists, read `task.md` and `analysis.md` before inventorying. Take the deliverables from the acceptance criteria and the touched surface from the impact analysis, then verify both against real code rather than trusting the analysis outright.
-3. Never call `timeline-intake` a second time in one run, and never call it when the folder already exists — intake refuses to overwrite an in-flight task anyway.
+1. If `timeline/{task-id}/analysis.md` does not exist (no folder, or only a fetched `task.md`), run the `timeline-intake` skill for it **first**, then estimate. Its `analysis.md` is the inventory starting point — do not re-derive the impact analysis it already produced.
+2. If `analysis.md` exists, read `task.md` and `analysis.md` before inventorying. Take the deliverables from the acceptance criteria and the touched surface from the impact analysis, then verify both against real code rather than trusting the analysis outright.
+3. Never call `timeline-intake` a second time in one run, and never call it when `analysis.md` already exists — intake refuses to overwrite an in-flight task anyway.
 
 Report the estimate in the response. To record it in the task, write the result into `analysis.md`'s Time Analysis section, replacing whatever placeholder rows are there.
 

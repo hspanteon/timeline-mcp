@@ -1,6 +1,6 @@
 """Dashboard data helpers and HTTP layer. No network: the client is monkeypatched."""
 import json
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 import requests
@@ -115,9 +115,45 @@ class TestPlannerHistory:
         assert [c["diff"]["removed"][0]["issue_number"] for c in pc.planner_history(135, str(tmp_path))["changes"]] == [1]
 
 
+class TestPlannerCache:
+    def test_serves_from_memory_until_expired_or_forced(self):
+        clock, calls = [0.0], []
+        cache = dashboard.PlannerCache(ttl=300, clock=lambda: clock[0])
+        fetch = lambda: calls.append(1) or {"now": len(calls)}
+        assert cache.get(fetch) == {"now": 1} and cache.get(fetch) == {"now": 1}
+        clock[0] = 299
+        assert cache.get(fetch) == {"now": 1}
+        clock[0] = 301
+        assert cache.get(fetch) == {"now": 2}
+        assert cache.get(fetch, force=True) == {"now": 3}
+
+    def test_update_swaps_one_period_without_refreshing_the_age(self):
+        clock = [0.0]
+        cache = dashboard.PlannerCache(ttl=300, clock=lambda: clock[0])
+        cache.put({"now": "a", "next": "b"})
+        clock[0] = 250
+        cache.update("now", "c")
+        assert cache.data == {"now": "c", "next": "b"}
+        clock[0] = 301
+        assert cache.get(lambda: {"fresh": True}) == {"fresh": True}
+
+
+class TestPlannerEndpointCaching:
+    def test_page_loads_do_not_call_timeline_again(self, client, monkeypatch):
+        calls, planners = [], _planners({"now": [_task(1, 1)]})
+        monkeypatch.setattr(pc, "get_priority_tasks", lambda headers, period: calls.append(period) or planners[period])
+        for _ in range(3):
+            assert client.get("/api/planner").status_code == 200
+        assert len(calls) == 3                      # one fetch of the three periods, not three
+        client.get("/api/planner?refresh=1")
+        assert len(calls) == 6                      # Refresh forces a new one
+
+
 class TestDashboardHttp:
     def test_index_and_static(self, client):
-        assert "Timeline desk" in client.get("/").text
+        page = client.get("/").text
+        assert "<title>Timeline Desk · Panteon</title>" in page and "/static/favicon.svg" in page
+        assert client.get("/static/favicon.svg").headers["content-type"].startswith("image/svg")
         assert client.get("/static/app.js").status_code == 200
 
     def test_accepts_timeline_localhost(self, tmp_path):
@@ -161,14 +197,22 @@ class TestDashboardHttp:
         too_many = ",".join(str(i) for i in range(dashboard.MAX_STATUS_IDS + 1))
         assert client.get(f"/api/statuses?ids={too_many}").status_code == 400
 
+    def test_about(self, client):
+        body = client.get("/api/about").json()
+        assert body["schedule"]["heartbeat_minutes"] == dashboard.DEFAULT_HEARTBEAT_MINUTES
+        assert body["planner_cache_minutes"] == dashboard.PLANNER_CACHE_SECONDS / 60
+        assert body["database"].endswith("timeline_task.db")
+
     def test_task(self, client, monkeypatch):
         monkeypatch.setattr(pc, "fetch_task_data", lambda ident, headers: {
             "issue_id": ident, "task_id": 1,
             "task_meta": {"title": "Hello", "creator": "Ann", "created_date": "2026-10-01", "status": "open",
                           "tags": ["x"], "description": "Body ![](/img/a.png)"},
             "comments": [{"author": "Ann", "created_at": "01.10.2026 10:00", "description": "Hi", "images": []}],
+            "commits": [{"id": 7, "author": "Ann", "created_at": "01.10.2026 11:00", "message": "Fix it", "url": "https://github.com/o/r/commit/abcdef1234"}],
         })
         body = client.get("/api/task/42").json()
+        assert body["commits"][0]["message"] == "Fix it"
         assert body["title"] == "Hello" and body["comments"][0]["author"] == "Ann"
         assert body["description"] == "Body ![](/img/a.png)"
 
@@ -184,6 +228,24 @@ class TestDashboardHttp:
         assert "headers" not in seen and seen["allow_redirects"] is False
         r = client.get("/api/attachment/image_1790233365.png")
         assert r.status_code == 200 and seen["url"] == f"{pc.BASE_URL}/storage/attachments/image_1790233365.png"
+
+    def test_images_are_fetched_once_then_served_from_disk(self, client, monkeypatch, tmp_path):
+        calls = []
+        def fake_get(url, **kwargs):
+            calls.append(url)
+            return type("R", (), {"status_code": 200, "content": b"PNGDATA", "headers": {"content-type": "image/png"}})()
+        monkeypatch.setattr(requests, "get", fake_get)
+        first = client.get("/api/attachment/image_1.png")
+        second = client.get("/api/attachment/image_1.png")
+        assert len(calls) == 1 and second.content == b"PNGDATA" and second.headers["content-type"] == "image/png"
+        assert "immutable" in second.headers["cache-control"] and "max-age=31536000" in first.headers["cache-control"]
+        assert (tmp_path / "database" / "images" / "attachments" / "image_1.png").read_bytes() == b"PNGDATA"
+
+    def test_failed_or_non_image_responses_are_not_stored(self, client, monkeypatch, tmp_path):
+        monkeypatch.setattr(requests, "get", lambda *a, **k: type("R", (), {
+            "status_code": 200, "content": b"<svg/>", "headers": {"content-type": "image/svg+xml"}})())
+        assert client.get("/api/photo/9.jpg").status_code == 404
+        assert not (tmp_path / "database" / "images").exists()
 
     @pytest.mark.parametrize("name", ["..%2Fsecret.jpg", "a.php", "x.jpg%00.png", "a b.jpg"])
     def test_photo_rejects_odd_names(self, client, monkeypatch, name):
@@ -214,19 +276,69 @@ class TestDashboardHttp:
 
 
 class TestSnapshotScheduler:
-    def test_checks_at_startup_then_every_interval_and_survives_failure(self):
+    WEEKDAY = datetime(2026, 10, 27, 10, 0)   # Tuesday 10:00
+    NIGHT = datetime(2026, 10, 27, 22, 0)
+    SATURDAY = datetime(2026, 10, 31, 10, 0)
+
+    def run(self, now, stops_after, **kw):
         import threading
-        calls = []
-        stop = threading.Event()
+        calls, stop, ticks = [], threading.Event(), [0.0]
 
-        def take():
-            calls.append(1)
-            if len(calls) == 3:
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == stops_after:
                 stop.set()
-            raise RuntimeError("offline")
+            raise RuntimeError("offline")  # errors are swallowed
 
-        dashboard.run_snapshot_scheduler(take, stop, interval_seconds=0)
-        assert len(calls) == 3  # errors swallowed, loop kept going until stopped
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         off_hours_seconds=0, clock=lambda: ticks[0], now=lambda: now, jitter=0, **kw)
+        return calls
+
+    def test_full_and_stages_at_startup_then_heartbeats_until_due(self):
+        calls = self.run(self.WEEKDAY, 6)
+        # a failed attempt doesn't count as done, so every call stays a full one while offline
+        assert len(calls) == 6 and all(full for full, _ in calls)
+
+    def test_heartbeat_only_between_full_checks(self):
+        import threading
+        stop, ticks, calls = threading.Event(), [0.0], []
+
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == 6:
+                stop.set()
+
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         clock=lambda: ticks[0], now=lambda: self.WEEKDAY, jitter=0)
+        assert calls == [(True, True), (False, False), (False, False), (False, False), (True, False), (False, False)]
+
+    def test_an_upgraded_heartbeat_resets_the_full_timer(self):
+        import threading
+        stop, ticks, calls = threading.Event(), [0.0], []
+
+        def take(full, stages):
+            calls.append((full, stages))
+            ticks[0] += 180
+            if len(calls) == 5:
+                stop.set()
+            return {"full": True, "stages": True} if len(calls) == 2 else None
+
+        dashboard.run_snapshot_scheduler(take, stop, heartbeat_seconds=0, full_seconds=600, stage_seconds=3600,
+                                         clock=lambda: ticks[0], now=lambda: self.WEEKDAY, jitter=0)
+        assert calls == [(True, True), (False, False), (False, False), (False, False), (False, False)]
+
+    def test_outside_active_hours_every_check_is_full_without_stages(self):
+        for moment in (self.NIGHT, self.SATURDAY):
+            calls = self.run(moment, 2, active_hours=(7, 19))
+            assert calls == [(True, False), (True, False)]
+
+    def test_parse_active_hours(self):
+        assert dashboard.parse_active_hours("7-19") == (7, 19)
+        assert dashboard.parse_active_hours("all") is None and dashboard.parse_active_hours("") is None
+        with pytest.raises(ValueError):
+            dashboard.parse_active_hours("19-7")
 
 
 # ---- project task list -----------------------------------------------------
@@ -272,6 +384,14 @@ def test_fetch_project_tasks_shapes_and_posts(monkeypatch):
     assert task["url"].endswith("/tasks#/list/15033/edit/5916") and task["tags"][0]["name"] == "BO"
 
 
+def test_fetch_project_tasks_support_body(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(pc._SESSION, "post", lambda url, headers=None, json=None, timeout=None: sent.update(json=json) or FakeResponse(200, PROJECT_PAYLOAD))
+    pc.fetch_project_tasks(16, {}, 111, tab="DOCS", support=True)
+    assert sent["json"] == {"subscribed_by": 111, "tag_id": 0, "status": "open", "support": True, "tab_name": "Support",
+                            "deadline_from": "", "deadline_to": ""}
+
+
 def test_fetch_project_tasks_default_tab_is_first(monkeypatch):
     monkeypatch.setattr(pc._SESSION, "post", lambda *a, **k: FakeResponse(200, PROJECT_PAYLOAD))
     assert pc.fetch_project_tasks(16, {}, 111)["tab"] == "Priority"
@@ -286,13 +406,20 @@ def test_fetch_project_tasks_auth_error(monkeypatch):
 def test_project_endpoint_only_serves_configured_projects(monkeypatch, tmp_path):
     monkeypatch.setenv("PANTEON_BEARER_TOKEN", "tok")
     seen = {}
-    monkeypatch.setattr(pc, "fetch_project_tasks", lambda pid, headers, user, code=None, tab=None: seen.update(
-        pid=pid, code=code, tab=tab) or {"project_id": pid, "tabs": [], "groups": []})
+    monkeypatch.setattr(pc, "fetch_project_tasks", lambda pid, headers, user, code=None, tab=None, support=False: seen.update(
+        pid=pid, code=code, tab=tab, support=support) or {"project_id": pid, "tabs": [], "groups": []})
     config = {"repos": {"15033": {"id": 16, "name": "duell-admin"}}}
     app = dashboard.create_app(user_id=111, base_dir=str(tmp_path), work_config=lambda: config)
     client = TestClient(app, base_url="http://127.0.0.1:8765")
     assert client.get("/api/project/16/tasks?tab=DOCS").status_code == 200
-    assert seen == {"pid": 16, "code": "15033", "tab": "DOCS"}
+    assert seen == {"pid": 16, "code": "15033", "tab": "DOCS", "support": False}
+    assert client.get("/api/project/16/tasks?support=1").status_code == 200
+    assert seen["support"] is True
     assert client.get("/api/project/99/tasks").status_code == 404
     assert client.get("/api/project/abc/tasks").status_code == 404
     assert client.get("/api/work/config").json()["projects"] == [{"code": "15033", "id": 16, "name": "duell-admin"}]
+
+
+def test_events_marker_endpoint(tmp_path):
+    client = TestClient(dashboard.create_app(None, str(tmp_path)), base_url="http://127.0.0.1")
+    assert client.get("/api/events/marker").json() == {"max_id": 0, "count": 0}

@@ -1,12 +1,16 @@
 import base64
+import hashlib
 import json
 import os
 import re
 import sqlite3
+import sys
+import threading
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 import requests
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from dotenv import load_dotenv
 
 # Load the .env sitting next to this module, so credentials resolve regardless of
@@ -27,6 +31,73 @@ DEFAULT_COMPANY_ID = "16"
 # Reused across calls for connection pooling.
 _SESSION = requests.Session()
 
+# Spaces out the start of Timeline API calls (across all threads), so a burst such
+# as one planner check turns into a steady trickle instead of a spike.
+# PANTEON_MIN_REQUEST_GAP_MS overrides the gap; 0 turns it off.
+DEFAULT_REQUEST_GAP_MS = 200
+_pace_lock = threading.Lock()
+_next_slot = 0.0
+
+
+def _pace() -> None:
+    global _next_slot
+    raw = os.environ.get("PANTEON_MIN_REQUEST_GAP_MS")
+    gap = (float(raw) if raw not in (None, "") else DEFAULT_REQUEST_GAP_MS) / 1000
+    if gap <= 0:
+        return
+    with _pace_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_slot - now)
+        _next_slot = max(now, _next_slot) + gap
+    if wait:
+        time.sleep(wait)
+
+
+def request_log_dir() -> Path:
+    """Folder for the daily request logs: PANTEON_REQUEST_LOG_DIR, else `logs/` next to
+    this module, so the MCP server, CLI and dashboard all write to the same place."""
+    return Path(os.environ.get("PANTEON_REQUEST_LOG_DIR") or Path(__file__).resolve().parent / "logs")
+
+
+def log_request(method: str, url: str, status: Optional[int], started: float, error: str = "") -> None:
+    """
+    Appends one JSON line (time, process, method, path, status, duration in ms) to
+    `<log dir>/timeline-requests-YYYY-MM-DD.jsonl`, to count Timeline requests per
+    day. Only the URL path is logged (no query, headers or credentials). Never raises.
+    """
+    try:
+        now = datetime.now()
+        path = url.split("://", 1)[-1].partition("/")[2].partition("?")[0]
+        entry = {
+            "time": now.isoformat(timespec="milliseconds"),
+            "source": Path(sys.argv[0]).name or "python",
+            "pid": os.getpid(),
+            "method": method,
+            "path": "/" + path,
+            "status": status,
+            "ms": round((time.perf_counter() - started) * 1000),
+        }
+        if error:
+            entry["error"] = error
+        log_dir = request_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / f"timeline-requests-{now.date().isoformat()}.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def timed_request(method: str, url: str, send: Callable[[], requests.Response]) -> requests.Response:
+    """Runs `send()` and logs the request's status and duration (see `log_request`)."""
+    started = time.perf_counter()
+    try:
+        response = send()
+    except Exception as exc:
+        log_request(method, url, None, started, error=type(exc).__name__)
+        raise
+    log_request(method, url, response.status_code, started)
+    return response
+
 # Markdown image: ![alt](src)  and  HTML image: <img src="...">
 # Shared by extract_images (src only) and absolutize_markdown_images (alt + src,
 # to rewrite in place) so the two never drift apart.
@@ -40,7 +111,8 @@ def _api_get(url: str, headers: Dict[str, str], *, context: str = "") -> request
     and uniform authentication-error handling. `context` is appended to the
     auth-error message (e.g. " when fetching task 5461").
     """
-    response = _SESSION.get(url, headers=headers, timeout=30)
+    _pace()
+    response = timed_request("GET", url, lambda: _SESSION.get(url, headers=headers, timeout=30))
     if response.status_code in (401, 403):
         raise PermissionError(
             f"Authentication failed (HTTP {response.status_code}){context}. "
@@ -233,6 +305,7 @@ def extract_task_meta(raw_task: Dict[str, Any]) -> Dict[str, Any]:
     tags = [t.get("name") for t in (data.get("task_tags") or []) if isinstance(t, dict) and t.get("name")]
     return {
         "issue_number": data.get("issue_number"),
+        "project_id": data.get("project_id"),
         "title": data.get("title") or data.get("name") or "",
         "description": (data.get("description") or "").strip(),
         "creator": creator.get("name") if isinstance(creator, dict) else "",
@@ -289,9 +362,9 @@ def release_state(stages: Dict[str, Optional[int]]) -> str:
 def extract_task_status(raw_task: Dict[str, Any], issue_id: str) -> Dict[str, Any]:
     """
     Pulls the workflow status out of an API-1 (taskbyissue) response:
-    {"issue_id", "title", "task_status", "stage_status", "stages", "release_state",
-    "qa_approved"}. `stages` maps each TASK_STAGES label to its progress word.
-    `qa_approved` is true once QA is done (or the task is already live).
+    {"issue_id", "title", "project_id", "task_status", "stage_status", "stages",
+    "release_state", "qa_approved"}. `stages` maps each TASK_STAGES label to its
+    progress word. `qa_approved` is true once QA is done (or the task is already live).
     """
     data = raw_task.get("data") if isinstance(raw_task.get("data"), dict) else raw_task
     data = data or {}
@@ -300,6 +373,7 @@ def extract_task_status(raw_task: Dict[str, Any], issue_id: str) -> Dict[str, An
     return {
         "issue_id": str(issue_id),
         "title": data.get("title") or data.get("name") or "",
+        "project_id": data.get("project_id"),
         "task_status": data.get("task_status") or "",
         "stage_status": data.get("stage_status") or "",
         "stages": {
@@ -479,6 +553,26 @@ def absolutize_markdown_images(description: str) -> str:
     return _MD_IMAGE_RE.sub(_repl, description or "")
 
 
+def parse_commits(timeline_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The commits linked to a task (timeline items with a `task_commit`), oldest first:
+    {"id", "author", "created_at", "message", "url"}."""
+    commits: List[Dict[str, Any]] = []
+    for item in timeline_items:
+        commit = item.get("task_commit") if isinstance(item, dict) else None
+        if not isinstance(commit, dict) and not (isinstance(item, dict) and item.get("field_name") == "Commit Added"):
+            continue
+        commit = commit if isinstance(commit, dict) else {}
+        employee = item.get("employee") if isinstance(item.get("employee"), dict) else {}
+        commits.append({
+            "id": item.get("id"),
+            "author": employee.get("name") or item.get("employee_name") or "Unknown",
+            "created_at": item.get("created_at") or "",
+            "message": (commit.get("description") or "").strip(),
+            "url": commit.get("commit_url") or None,
+        })
+    return commits
+
+
 def parse_conversation_comments(timeline_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Filters timeline events for task comments and returns them chronologically,
@@ -515,6 +609,7 @@ def parse_conversation_comments(timeline_items: List[Dict[str, Any]]) -> List[Di
 
         photo = employee.get("photo") if isinstance(employee, dict) else None
         comments.append({
+            "id": item.get("id") if isinstance(item.get("id"), int) else None,
             "author": author,
             "photo": photo if isinstance(photo, str) else None,
             "created_at": item.get("created_at", ""),
@@ -621,6 +716,9 @@ def render_task_markdown(
             header += " (task creator)"
         if comment.get("created_at"):
             header += f" — {comment['created_at']}"
+        if comment.get("id"):
+            # Timeline's id for the comment, so a workflow can point at one finding without quoting it.
+            header += f" · comment id {comment['id']}"
         lines.append(f"### {header}")
         lines.append("")
         body = absolutize_markdown_images(comment["description"])
@@ -952,6 +1050,203 @@ def _open_planner_db(base_dir: Optional[str], create: bool) -> Optional[sqlite3.
         _import_json_snapshots(conn, planner_snapshot_dir(base_dir))
         conn.execute("PRAGMA user_version = 1")
         conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 2:
+        # Per-task event history (see task_events.py): the tasks being watched
+        # and every Timeline event fetched for them, keyed by Timeline's own id.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS watchlist (
+                issue_number TEXT PRIMARY KEY,
+                task_id INTEGER,
+                code TEXT,
+                title TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                added_at TEXT NOT NULL,
+                last_synced_at TEXT,
+                last_error TEXT
+            );
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                field_name TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                employee TEXT,
+                photo TEXT,
+                body TEXT,
+                url TEXT,
+                raw TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS task_events_time ON task_events (occurred_at, id);
+            CREATE INDEX IF NOT EXISTS task_events_issue ON task_events (issue_number, occurred_at);
+            """
+        )
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 3:
+        # Task workflows (see workflow.py): each task's current step, every
+        # Claude run of a step, and every decision (approvals, skips, …).
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS workflows (
+                issue_number TEXT PRIMARY KEY,
+                code TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                repo TEXT NOT NULL,
+                branch TEXT,
+                worktree TEXT,
+                step TEXT NOT NULL,
+                state TEXT NOT NULL,
+                qa_round INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS workflow_runs (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                step TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                exit_code INTEGER,
+                result TEXT,
+                result_at TEXT,
+                decision TEXT,
+                decided_at TEXT,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS workflow_runs_issue ON workflow_runs (issue_number, id);
+            CREATE TABLE IF NOT EXISTS workflow_events (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                at TEXT NOT NULL,
+                step TEXT,
+                run_id INTEGER,
+                kind TEXT NOT NULL,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS workflow_events_issue ON workflow_events (issue_number, id);
+            """
+        )
+        conn.execute("PRAGMA user_version = 3")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 4:
+        # Workflows follow Timeline (phase 2): the last Timeline event the user
+        # has seen, and where the current step started (its time, the last run
+        # and the last Timeline event before it), so "new since" is exact.
+        conn.executescript(
+            """
+            ALTER TABLE workflows ADD COLUMN seen_event_id INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflows ADD COLUMN step_since TEXT;
+            ALTER TABLE workflows ADD COLUMN step_run_floor INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflows ADD COLUMN step_event_floor INTEGER NOT NULL DEFAULT 0;
+            """
+        )
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
+        # QA findings checklist and prod fixes (phase 3): each QA comment (or a
+        # finding you add) with your verdict, the run that fixed it, and where
+        # the current QA window started.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS qa_findings (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                event_id INTEGER,
+                author TEXT,
+                posted_at TEXT,
+                label TEXT,
+                qa_round INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                run_id INTEGER,
+                note TEXT,
+                created_at TEXT NOT NULL,
+                decided_at TEXT
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS qa_findings_comment ON qa_findings (issue_number, event_id) WHERE label IS NULL;
+            CREATE INDEX IF NOT EXISTS qa_findings_issue ON qa_findings (issue_number, id);
+            ALTER TABLE workflow_runs ADD COLUMN finding_id INTEGER;
+            ALTER TABLE workflows ADD COLUMN qa_event_floor INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workflows ADD COLUMN prod_round INTEGER NOT NULL DEFAULT 0;
+            """
+        )
+        conn.execute("PRAGMA user_version = 5")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 6:
+        # Runs on the page (phase 4): a run is in a terminal or in the background
+        # on the desk, and a background run's process group id.
+        conn.executescript(
+            """
+            ALTER TABLE workflow_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'terminal';
+            ALTER TABLE workflow_runs ADD COLUMN pid INTEGER;
+            """
+        )
+        conn.execute("PRAGMA user_version = 6")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 7:
+        # Approvals on the page (phase 5): every tool call an in-dashboard run
+        # wants to make, and your decision on it.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_permissions (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL,
+                issue_number TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                summary TEXT,
+                input TEXT,
+                status TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                decided_at TEXT,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS workflow_permissions_run ON workflow_permissions (run_id, id);
+            """
+        )
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 8:
+        # The Jira board (see jira_board.py): the cards you added and the column
+        # each is in, plus a log of every change, which a Jira bot reads and
+        # marks delivered.
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS jira_cards (
+                issue_number TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jira_events (
+                id INTEGER PRIMARY KEY,
+                issue_number TEXT NOT NULL,
+                title TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                delivered_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS jira_events_pending ON jira_events (delivered_at, id);
+            """
+        )
+        conn.execute("PRAGMA user_version = 8")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 9:
+        # The board's list code, so a card can link to its page in Timeline.
+        conn.execute("ALTER TABLE jira_cards ADD COLUMN code TEXT")
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+    if conn.execute("PRAGMA user_version").fetchone()[0] < 10:
+        # Whether the card is one of Timeline's support tasks, so it stays highlighted.
+        conn.execute("ALTER TABLE jira_cards ADD COLUMN support INTEGER NOT NULL DEFAULT 0")
+        conn.execute("PRAGMA user_version = 10")
+        conn.commit()
     return conn
 
 
@@ -1249,9 +1544,28 @@ def fetch_my_planner_changes(
     }
 
 
-def fetch_all_planners(headers: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
-    """One request per planner period: {period: raw planner}. Blocking I/O."""
-    return {period: get_priority_tasks(headers, period) for period in PLANNER_PERIODS}
+def fetch_all_planners(
+    headers: Dict[str, str],
+    known: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """One request per planner period: {period: raw planner}. Periods already
+    fetched can be passed in `known` and are not requested again. Blocking I/O."""
+    known = known or {}
+    return {period: known[period] if period in known else get_priority_tasks(headers, period)
+            for period in PLANNER_PERIODS}
+
+
+def planner_fingerprint(planner: List[Dict[str, Any]], user_id: Any) -> str:
+    """A short hash of one user's tasks in one planner period (issue, order, stages,
+    status, deadline): equal fingerprints mean nothing visible there changed, so a
+    one-request check can decide whether the full set of calls is worth making."""
+    try:
+        tasks = extract_user_priority_tasks(planner, user_id)
+    except LookupError:
+        tasks = []
+    rows = [[t.get("issue_number"), t.get("stage_status"), t.get("task_status"), t.get("deadline"), bool(t.get("support"))]
+            for t in tasks]
+    return hashlib.sha1(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def fetch_my_day(
@@ -1379,20 +1693,27 @@ def fetch_project_tasks(
     code: Optional[Any] = None,
     tab: Optional[str] = None,
     today: Optional[date] = None,
+    support: bool = False,
 ) -> Dict[str, Any]:
     """
     The user's open tasks in one project, as Timeline lists them: tabs (with
     counts) and, for the active tab, its groups of tasks. `project_id` is the
     API id (not the list code in task URLs); `code` is that list code, used for
-    task URLs. Without `tab` Timeline answers with its first tab. Read-only,
-    although the endpoint itself is a POST.
+    task URLs. Without `tab` Timeline answers with its first tab. With `support`
+    the project's Support tab is asked for instead (Timeline's own request for
+    it carries `support: true` and `tab_name: "Support"`; `tab` is ignored).
+    Read-only, although the endpoint itself is a POST.
     {"project_id", "tab", "tabs": [{"name", "count"}], "groups": [{"name", "tasks"}]}
     """
     project_id = int(project_id)
     body: Dict[str, Any] = {"subscribed_by": resolve_user_id(user_id), "tag_id": 0, "status": "open"}
-    if tab:
+    if support:
+        body.update({"support": True, "tab_name": "Support", "deadline_from": "", "deadline_to": ""})
+    elif tab:
         body["tab_name"] = tab
-    response = _SESSION.post(f"{BASE_URL}/api/project/{project_id}/tasks", headers=headers, json=body, timeout=30)
+    url = f"{BASE_URL}/api/project/{project_id}/tasks"
+    _pace()
+    response = timed_request("POST", url, lambda: _SESSION.post(url, headers=headers, json=body, timeout=30))
     if response.status_code in (401, 403):
         raise PermissionError(
             f"Authentication failed (HTTP {response.status_code}) when fetching project {project_id} tasks. "
@@ -1512,7 +1833,7 @@ def fetch_task_data(
     Runs the full read pipeline for a single task — resolve the issue id, call the
     two Panteon APIs, and parse the results — and returns the parsed pieces:
 
-        {"issue_id", "task_id", "task_meta", "comments"}
+        {"issue_id", "task_id", "task_meta", "comments", "commits"}
 
     This is the shared orchestration used by both the MCP tool and the CLI. It is
     synchronous and performs blocking network I/O, so async callers should offload
@@ -1525,12 +1846,14 @@ def fetch_task_data(
 
     timeline_items = get_task_timeline(task_id, headers)
     comments = parse_conversation_comments(timeline_items)
+    commits = parse_commits(timeline_items)
 
     return {
         "issue_id": issue_id,
         "task_id": task_id,
         "task_meta": task_meta,
         "comments": comments,
+        "commits": commits,
     }
 
 

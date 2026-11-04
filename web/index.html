@@ -4,27 +4,56 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Timeline desk</title>
+  <title>Timeline Desk · Panteon</title>
+  <meta name="description" content="Local desk for Panteon Timeline: planner, changes, releases and task workflows.">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header class="top">
     <div class="brand">
+      <a class="brand-icon" id="page-help" href="#/help" title="Help: how this page gets its data" aria-label="Help for this page"></a>
       <h1>Timeline<span>Desk</span></h1>
-      <p class="meta" id="meta">Loading your planner…</p>
     </div>
     <nav class="tabs" aria-label="Views">
-      <a href="#/planner" data-view="planner">Planner</a>
-      <a href="#/changes" data-view="changes">Changes</a>
-      <a href="#/release" data-view="release">Release</a>
-      <a href="#/task" data-view="task">Task</a>
-      <a href="#/work" data-view="work">Work</a>
+      <div class="tab-group" role="group" aria-label="Planner">
+        <span class="tab-group-label">Planner</span>
+        <div class="tab-group-links">
+        <a href="#/planner" data-view="planner">Planner</a>
+        <a href="#/changes" data-view="changes">Changes</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Timeline">
+        <span class="tab-group-label">Timeline</span>
+        <div class="tab-group-links">
+        <a href="#/timeline" data-view="timeline">Timeline</a>
+        <a href="#/task" data-view="task">Task</a>
+        <a href="#/jira" data-view="jira">Jira</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Workflow">
+        <span class="tab-group-label">Workflow</span>
+        <div class="tab-group-links">
+        <a href="#/workflows" data-view="workflows">Workflows</a>
+        </div>
+      </div>
+      <div class="tab-group" role="group" aria-label="Git">
+        <span class="tab-group-label">Git</span>
+        <div class="tab-group-links">
+        <a href="#/release" data-view="release">Release</a>
+        <a href="#/work" data-view="work">Work</a>
+        </div>
+      </div>
     </nav>
-    <button type="button" class="btn ghost" id="refresh">Refresh</button>
+    <div class="top-actions">
+      <p class="meta" id="meta">Loading your planner…</p>
+      <button type="button" class="btn ghost" id="refresh">Refresh</button>
+    </div>
   </header>
 
   <main id="view" tabindex="-1" aria-live="polite"></main>
 
+  <script src="/static/help.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

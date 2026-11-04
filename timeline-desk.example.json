@@ -9,5 +9,6 @@
     }
   },
   "claude": "~/.local/bin/claude",
-  "terminal": "gnome-terminal"
+  "terminal": "gnome-terminal",
+  "me": "Your Name As Timeline Shows It"
 }
