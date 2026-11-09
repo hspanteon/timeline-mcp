@@ -109,7 +109,9 @@ _BULLET = re.compile(r"^(?P<indent>\s*)[-*]\s+(?P<text>\S.*)$")
 def release_entry(body: str, issue_id: str) -> Optional[Dict[str, Any]]:
     """
     Finds `- #<id> - <title>` in a PR body and the indented bullets under it.
-    Returns {title, bullets: [(level, text)], indent_ok}, or None if absent.
+    Returns {title, bullets: [(level, text)], indent_ok, lines}, or None if
+    absent. `lines` is the entry as written (blank lines dropped, the entry's
+    own indent removed), for copying it into a release note verbatim.
     """
     lines = (body or "").replace("\r\n", "\n").split("\n")
     for i, line in enumerate(lines):
@@ -118,6 +120,7 @@ def release_entry(body: str, issue_id: str) -> Optional[Dict[str, Any]]:
             continue
         base = len(m.group("indent"))
         raw: List[Tuple[int, str]] = []
+        verbatim = [line.rstrip()[base:]]
         for follow in lines[i + 1:]:
             if not follow.strip():
                 continue
@@ -125,10 +128,11 @@ def release_entry(body: str, issue_id: str) -> Optional[Dict[str, Any]]:
             if not b or len(b.group("indent")) <= base:
                 break
             raw.append((len(b.group("indent")), b.group("text").strip()))
+            verbatim.append(follow.rstrip()[base:])
         depths = sorted({d for d, _ in raw})
         bullets = [(depths.index(d) + 1, text) for d, text in raw]
         indent_ok = base == 0 and all(d == 2 * (depths.index(d) + 1) for d in depths)
-        return {"title": m.group("title"), "bullets": bullets, "indent_ok": indent_ok}
+        return {"title": m.group("title"), "bullets": bullets, "indent_ok": indent_ok, "lines": verbatim}
     return None
 
 
@@ -424,15 +428,30 @@ def build_report(
 
     drafted: List[str] = []
 
-    def entry_lines(issue_id: str, fallback_title: str = "") -> List[str]:
+    def entry_lines(issue_id: str, fallback_title: str = "", indent: str = "") -> List[str]:
+        """
+        The PR's own entry, copied verbatim (only the indent changes). Without
+        one, a bare `- #<id> - <title>` line, and the ticket goes in `drafted`
+        so the missing entry is flagged; nothing is written in its place.
+        """
         found = release_entry(bodies.get(issue_id, ""), issue_id)
-        title = title_of(issue_id) or (found and found["title"]) or fallback_title or "(title unknown)"
-        lines = [f"- #{issue_id} - {title}"]
-        if found and found["bullets"]:
-            lines += ["  " * level + f"- {text}" for level, text in found["bullets"]]
+        if found:
+            lines = found["lines"]
+            if not found["bullets"]:
+                drafted.append(issue_id)
         else:
+            title = fallback_title or title_of(issue_id) or "(title unknown)"
+            lines = [f"- #{issue_id} - {title}"]
             drafted.append(issue_id)
-        return lines
+        return [indent + line for line in lines]
+
+    def pr_title(issue_id: str) -> str:
+        """An open PR's title, without its PROD:/QA: prefix and ticket number."""
+        for base in ("master", "qa-release"):
+            for p in prs[base]:
+                if p["issue_id"] == issue_id:
+                    return re.sub(r"^\s*(PROD|QA)\s*:\s*(TL\s*)?#?\d+\s*-?\s*", "", p["title"], flags=re.I).strip()
+        return ""
 
     master_prs = {p["issue_id"]: p for p in prs["master"] if p["issue_id"]}
     qa_open = [p for p in prs["qa-release"] if p["issue_id"] and p["issue_id"] not in qa_branches]
@@ -466,19 +485,22 @@ def build_report(
     date = today.strftime("%d.%m.%Y")
     master_body: List[str] = []
     held_back: List[str] = []
+    master_held: List[Dict[str, Any]] = []
     in_note: Set[str] = set()
     for r in approved:
         master_body += entry_lines(r["issue_id"])
         in_note.add(r["issue_id"])
     direct = [p for p in prs["master"] if p["issue_id"] and p.get("via_qa") == "no" and p["issue_id"] not in in_note]
     for p in direct:
-        master_body += entry_lines(p["issue_id"], p["title"])
+        master_body += entry_lines(p["issue_id"], pr_title(p["issue_id"]))
         in_note.add(p["issue_id"])
     master_hotfixes = [p["title"] for p in prs["master"] if not p["issue_id"]]
     if master_hotfixes:
         master_body += ["- Hotfixes"] + [f"  - {t}" for t in master_hotfixes]
+    # Held-back tickets keep their whole PR entry; the reason stays out of the body.
     for r in not_approved:
-        held_back.append(f"  - #{r['issue_id']} - {r['title'] or '(title unknown)'} — {(r['status'] or {}).get('stage_status') or 'status unknown'}")
+        held_back += entry_lines(r["issue_id"], pr_title(r["issue_id"]), indent="  ")
+        master_held.append({"issue_id": r["issue_id"], "reason": (r["status"] or {}).get("stage_status") or "status unknown"})
     if held_back:
         master_body += ["- Not approved (held back)"] + held_back
 
@@ -488,10 +510,12 @@ def build_report(
     qa_hotfixes = [b for t in no_ticket for b in t["branches"]] + [p["title"] for p in prs["qa-release"] if not p["issue_id"]]
     if qa_hotfixes:
         qa_body += ["- Hotfixes"] + [f"  - {b}" for b in qa_hotfixes]
+    qa_held: List[Dict[str, Any]] = []
     if qa_open:
-        qa_body += ["- Not approved (held back)"] + [
-            f"  - #{p['issue_id']} - {title_of(p['issue_id']) or p['title']} — not on QA yet" for p in qa_open
-        ]
+        qa_body.append("- Not approved (held back)")
+        for p in qa_open:
+            qa_body += entry_lines(p["issue_id"], pr_title(p["issue_id"]), indent="  ")
+            qa_held.append({"issue_id": p["issue_id"], "reason": "not on QA yet"})
 
     total = len(ticket_rows) + len(qa_open)
     return {
@@ -512,13 +536,13 @@ def build_report(
                 "name": f"Release note {date} {versions['next_prod']}" if versions["next_prod"] else None,
                 "tag": versions["next_prod"], "target": "master",
                 "body": "\n".join(master_body),
-                "included": len(in_note), "held_back": len(held_back),
+                "included": len(in_note), "held_back": len(master_held), "held": master_held,
             },
             "qa": {
                 "name": f"QA Release note {date} {versions['next_qa']}" if versions["next_qa"] else None,
                 "tag": versions["next_qa"], "target": "qa-release",
                 "body": "\n".join(qa_body),
-                "on_qa": len(ticket_rows), "pending": len(qa_open),
+                "on_qa": len(ticket_rows), "pending": len(qa_open), "held": qa_held,
             },
             "drafted": sorted(set(drafted)),
         },

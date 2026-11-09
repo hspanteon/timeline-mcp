@@ -180,19 +180,39 @@ def test_full_report(repo):
         "- #1111 - One", "  - Changed the first screen",
         "- #5555 - Five", "  - Direct fix for five",
         "- Hotfixes", "  - PROD: quick css fix",
-        "- Not approved (held back)", "  - #2222 - Two — QA in progress",
+        "- Not approved (held back)", "  - #2222 - Two", "    - Updated the second report",
     ]
+    assert notes["master"]["held"] == [{"issue_id": "2222", "reason": "QA in progress"}]
     assert notes["qa"]["name"] == "QA Release note 16.10.2026 v1.0.3.2-qa"
     assert notes["qa"]["body"].splitlines() == [
         "- #1111 - One", "  - Changed the first screen",
         "- #2222 - Two", "  - Updated the second report",
         "- Hotfixes", "  - hotfix-logs",
-        "- Not approved (held back)", "  - #4444 - Four — not on QA yet",
+        "- Not approved (held back)", "  - #4444 - Four", "    - Added the fourth thing",
     ]
+    assert notes["qa"]["held"] == [{"issue_id": "4444", "reason": "not on QA yet"}]
     assert notes["drafted"] == []
     # Read-only: the only commands are these.
     assert {c[:2] for c in calls} <= {("git", "remote"), ("git", "fetch"), ("git", "log"), ("git", "rev-list"), ("gh", "pr"), ("gh", "release")}
     assert all(c[2] == "list" for c in calls if c[0] == "gh")
+
+
+def test_notes_keep_pr_heading_over_timeline_title(repo):
+    renamed = {k: {**v, "title": v["title"].upper() + " (renamed in Timeline)"} for k, v in STATUSES.items()}
+    report = rc.build_report(repo, status_lookup=lambda ids: [renamed[i] for i in ids],
+                             runner=fake_runner([]), today=date(2026, 10, 16))
+    body = report["notes"]["master"]["body"].splitlines()
+    assert body[0] == "- #1111 - One"  # PR heading, not the Timeline title
+    assert "  - #2222 - Two" in body
+    # The check still flags the difference.
+    master = {p["number"]: p for p in report["prs"]["master"]}
+    assert any("differs from Timeline" in x for x in master[11]["problems"])
+
+
+def test_release_entry_lines_are_verbatim():
+    body = "Intro\n  - #1234 - BUG: Fix  the Kontoplan\n    - **Bold.** Kept as-is!\n      - nested\n\n  - #9 - other\n"
+    entry = rc.release_entry(body, "1234")
+    assert entry["lines"] == ["- #1234 - BUG: Fix  the Kontoplan", "  - **Bold.** Kept as-is!", "    - nested"]
 
 
 def test_timeline_failure_keeps_git_side(repo):

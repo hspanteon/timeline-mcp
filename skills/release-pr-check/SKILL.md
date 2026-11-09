@@ -1,7 +1,7 @@
 ---
 name: release-pr-check
 description: Check every open (pending) pull request targeting the qa-release and master branches of Panteon-norway/duell-admin against the team's release-note format (the `- #<id> - <title>` list used in PR descriptions and GitHub Releases), report how many qa-release tickets QA has approved in Panteon Timeline (from each ticket's QA stage), and print one final summary. Can also prepare the two GitHub release notes: "Release note DD.MM.YYYY vX" for master and "QA Release note DD.MM.YYYY vX-qa" for qa-release, with not-approved tickets listed as held back. Run it from a duell-admin checkout. Use when asked to check pending PRs, review PRs before a QA or production release, prepare/draft a release note, or "what is waiting for qa-release / master". Report-only — never comments on, approves, edits or merges PRs, and never creates or edits GitHub releases.
-argument-hint: [qa-release | master | both | master-note | qa-note | release-notes] (default both)
+argument-hint: "[qa-release | master | both | master-note | qa-note | release-notes] (default both)"
 ---
 
 # Release PR Check
@@ -64,7 +64,7 @@ gh release view <tag> --repo Panteon-norway/duell-admin --json name,tagName,targ
 
 Rules observed in past releases:
 
-- One top-level bullet per ticket: `#<id> - <title>`. The title is copied from Timeline and keeps prefixes like `BUG:`, `CRM:`, `SA:`, `[PRI2] [962044]`.
+- One top-level bullet per ticket: `#<id> - <title>`. The PR author copies the title from Timeline, keeping prefixes like `BUG:`, `CRM:`, `SA:`, `[PRI2] [962044]`. Step 3 flags a title that differs from Timeline, but the release note always copies the PR's title as written (see "Building each entry").
 - Sub-bullets are indented 2 spaces and describe the visible change. They mention screens, columns, labels and Norwegian UI terms (`"Side 2 av 2"`, `Kontoplan`) where useful.
 - Big features may use `**Bold lead-in.**` sub-bullets, or a third indent level grouped by area (e.g. `Payout Report Settings` → its points).
 - No headings, no checklists, no "Testing" section, no PR numbers in the body.
@@ -224,10 +224,14 @@ A ticket in both C and B (a follow-up PR for a ticket already on QA) goes in B, 
 
 ### Building each entry
 
-- Reuse the ticket's entry from its PR description as-is when it passes step 3.
-- Otherwise, write it in the format from step 1: the Timeline title verbatim as the top line, then sub-bullets for the user-facing change. Base the sub-bullets on the PR description, the commit messages and the diff.
-- Mark every entry you wrote or rewrote with `(drafted)` in the chat summary, never in the body, so the user can review it.
+The PR entry is the source of truth for the note. The Timeline title is only used by the step 3 check.
+
+- Copy each ticket's entry from its PR description **verbatim**: the `- #<id> - <title>` line as written in the PR (never replaced by the Timeline title) and every sub-bullet under it, keeping spelling, capitalization, punctuation and nested bullets. Only change the indentation, to place the entry under its group.
+- Take the entry from the open `master` PR, else the newest merged `qa-release` PR, else the open `qa-release` PR.
+- Held-back tickets keep their full entry too, sub-bullets included. Approval and merge status (Timeline stage, "not on QA yet", "re-test") go in chat outside the code block, never inside a copied entry.
+- If a ticket has no entry, or the entry has no change bullets, put the bare line `- #<id> - <PR title without the PROD:/QA: prefix>` in the note, plus any bullets the entry does have, and list the ticket in chat as "missing release-note entry". Never invent, summarize, polish or rewrite text to fill the gap.
 - Every ticket in a note's scope must appear. Never drop one to keep the note short.
+- Before printing, compare every copied entry with its source PR line by line.
 
 ### Master release note (production)
 
@@ -236,17 +240,18 @@ Name: Release note <DD.MM.YYYY> v<next prod version>
 Tag:  v<next prod version>   Target: master
 
 ```markdown
-- #<id> - <title>
-  - <change>
+- #<id> - <PR entry title verbatim>
+  - <PR change description verbatim>
 - Hotfixes
   - <change>
 - Not approved (held back)
-  - #<id> - <title> — <Timeline stage>
+  - #<id> - <PR entry title verbatim>
+    - <PR change description verbatim>
 ```
 ````
 
 - Include buckets A and D, then E.
-- `Not approved (held back)` lists every bucket B ticket. Leave the group out only when B is empty.
+- `Not approved (held back)` includes every bucket B ticket's PR entry and change descriptions verbatim, indented under the group. List Timeline stages outside the code block. Leave the group out only when B is empty.
 - If a draft release already exists, compare it with the generated note and list the differences in chat: in the draft but not in scope, and in scope but missing from the draft.
 
 ### QA release note (qa-release)
@@ -256,18 +261,19 @@ Name: QA Release note <DD.MM.YYYY> v<next QA version>-qa
 Tag:  v<next QA version>-qa   Target: qa-release   Pre-release: yes
 
 ```markdown
-- #<id> - <title>
-  - <change>
+- #<id> - <PR entry title verbatim>
+  - <PR change description verbatim>
 - Hotfixes
   - <change>
 - Not approved (held back)
-  - #<id> - <title> — not on QA yet
+  - #<id> - <PR entry title verbatim>
+    - <PR change description verbatim>
 ```
 ````
 
 - The QA note is **cumulative**, as in past QA releases: it lists every ticket on `qa-release` not yet in `master` (buckets A and B), plus E.
 - Order the entries oldest first, new additions last.
-- `Not approved (held back)` lists the open bucket C PRs.
+- `Not approved (held back)` includes every open bucket C PR's entry and change descriptions verbatim, indented under the group. Explain "not on QA yet" outside the code block.
 - Then, outside the code block, list in chat the bucket B tickets that are still waiting for QA approval, with their Timeline stage.
 
 ### Closing line
