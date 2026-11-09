@@ -101,17 +101,20 @@ const HELP = {
         "An event that happened in Timeline but is not shown yet probably has not been synced: press Refresh.",
       ] },
     { key: "release", title: "Release", sources: ["cache", "git"],
-      purpose: "The pull requests waiting to go into qa-release and master (duell-admin), grouped by branch, with their release notes.",
+      purpose: "Three views of the next duell-admin release: Pending PRs (open PRs into qa-release and master), Prod release (which QA tickets are approved, held back or went direct to master, with the production note) and QA release (what is new, updated, carried over or shipped since the last QA release, with the QA note).",
       from: [
         ["Pull requests with their release notes", "git", "GitHub (gh) and the duell-admin checkout on this computer: git fetch, git log, gh pr list."],
+        ["Last QA release", "git", "The latest published -qa release on GitHub (gh release list) and its git tag, plus the production release before it."],
         ["QA approval of each ticket", "live", "Timeline, one request per ticket, at the moment the report is built."],
       ],
       use: [
         "Press Check again to build a new report. It takes about 10 seconds because it fetches from GitHub.",
         "The page shows when the report was built. Until you press the button the page shows the last one, or nothing after a restart.",
+        "Switch between Pending PRs, Prod release and QA release with the tabs under the button; switching doesn't rebuild the report.",
+        "Each release view ends with its note, ready to paste into GitHub: Copy note copies it. Entries are copied from the PRs word for word; a ticket whose PR has no entry is named in red.",
       ],
       refresh: "Never automatic. The report is built only when you ask, and kept in the server's memory until then (or until the service restarts).",
-      how: "Read only: fixed git and gh commands (no shell), only git remote/fetch/log/rev-list and gh pr list / release list. A ticket is on QA when its merge is in qa-release but not in master. A master PR went \"via QA\" when it carries no commits that are outside qa-release and master.",
+      how: "Read only: fixed git and gh commands (no shell), only git remote/fetch/log/rev-list and gh pr list / release list. A ticket is on QA when its merge is in qa-release but not in master. A master PR went \"via QA\" when it carries no commits that are outside qa-release and master. The QA release view compares with the last QA release's tag: a ticket was in it when its merge is in the tag but not in the production release before it; new = first merged after the tag, updated = in the tag and merged again since, shipped = in the tag and now in master.",
       know: [
         "The checkout comes from DUELL_ADMIN_DIR, or --repo-dir, or ../duell-admin, and its origin must be Panteon-norway/duell-admin.",
         "If Timeline cannot be reached, the report still appears, with a note that QA approval is missing.",

@@ -893,16 +893,136 @@ function prCard(pr) {
     pr.body ? h("pre", { class: "body pr-body" }, pr.body) : h("p", { class: "note" }, "No description."));
 }
 
-function renderPrs(report, results) {
-  put(results, h("div", { class: "pr-columns" }, ["qa-release", "master"].map((base) => {
+function renderPrs(report) {
+  return h("div", { class: "pr-columns" }, ["qa-release", "master"].map((base) => {
     const prs = report.prs[base];
     return h("section", { class: "lane" },
       h("h2", {}, `Into ${base}`, h("span", { class: "count" }, prs.length)),
       prs.length ? prs.map(prCard) : h("p", { class: "note" }, "No pending PRs."));
-  })));
+  }));
 }
 
-async function checkRelease(results, stamp, button, fetchFresh) {
+// ---- release views: Prod release and QA release ----
+const RELEASE_VIEWS = [
+  { key: "prs", label: "Pending PRs" },
+  { key: "prod", label: "Prod release" },
+  { key: "qa", label: "QA release" },
+];
+const STATE_TONE = { "qa approved": "ok", live: "ok", "in qa": "soon", "qa blocked": "overdue", "before qa": "muted" };
+
+function stateChip(status) {
+  if (!status) return chip("No Timeline status", "muted");
+  if (status.error) return chip(status.error, "overdue");
+  const state = status.release_state;
+  return chip(RELEASE_LABEL[state] || state || "Unknown", STATE_TONE[state] || "muted", status.stage_status || null);
+}
+
+function ticketRow(t, ...extra) {
+  const stage = t.status && !t.status.error ? t.status.stage_status : null;
+  return h("li", { class: "rel-row" },
+    h("a", { href: `#/task/${t.issue_id}`, class: "issue" }, `#${t.issue_id}`),
+    h("span", { class: "rel-title" }, t.title || (t.branches && t.branches[0]) || "(title unknown)"),
+    stateChip(t.status),
+    stage ? h("small", { class: "note" }, stage) : null,
+    ...extra);
+}
+
+function prLink(pr) {
+  return h("a", { href: pr.url, target: "_blank", rel: "noopener noreferrer", class: "issue" }, `PR ${pr.number} ↗`);
+}
+
+function relGroup(title, hint, items, row) {
+  return h("section", { class: "rel-group" },
+    h("h3", {}, title, h("span", { class: "count" }, items.length)),
+    hint ? h("p", { class: "note" }, hint) : null,
+    items.length ? h("ul", { class: "rel-list" }, items.map(row)) : h("p", { class: "note" }, "None."));
+}
+
+function noteBlock(note, drafted, preRelease) {
+  const missing = (drafted || []).filter((id) => new RegExp(`#${id}\\b`).test(note.body || ""));
+  const copy = h("button", { type: "button", class: "btn ghost small" }, "Copy note");
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(note.body || ""); toast(`Copied ${note.name || "the note"}.`); }
+    catch { toast("Couldn't copy — clipboard not available.", true); }
+  });
+  return h("section", { class: "rel-note" },
+    h("h3", {}, "Release note"),
+    h("div", { class: "wf-doc-head" },
+      h("strong", {}, note.name || "No version found"),
+      h("small", {}, [note.tag && `Tag ${note.tag}`, `Target ${note.target}`, preRelease && "Pre-release"].filter(Boolean).join(" · ")),
+      copy),
+    (note.held || []).length ? h("p", { class: "note" }, "Held back: ",
+      note.held.map((x) => `#${x.issue_id} (${x.reason})`).join(", ")) : null,
+    missing.length ? h("p", { class: "error" }, `Missing release-note entry in the PR: ${missing.map((id) => `#${id}`).join(", ")}. Copied as a bare line; ask the author to add it.`) : null,
+    h("pre", { class: "body pr-body" }, note.body || "(empty)"));
+}
+
+function renderProd(report) {
+  const v = report.releases || {};
+  const ready = report.tickets.filter((t) => t.approved);
+  const held = report.tickets.filter((t) => !t.approved);
+  const direct = report.prs.master.filter((p) => p.issue_id && p.via_qa !== "yes");
+  const hotfixes = report.prs.master.filter((p) => !p.issue_id);
+  const masterPr = new Map(report.prs.master.map((p) => [p.issue_id, p]));
+  return [
+    h("p", { class: "note" }, [
+      v.latest_prod && `Latest production release ${v.latest_prod.tag} (${v.latest_prod.date})`,
+      `${report.approval.approved} of ${report.approval.total} QA tickets approved in Timeline`,
+    ].filter(Boolean).join(" · ")),
+    report.timeline_error ? h("p", { class: "error", role: "alert" }, `Timeline: ${report.timeline_error}`) : null,
+    h("div", { class: "rel-columns" },
+      h("div", {},
+        relGroup("Ready for production", "On qa-release and approved by QA. These go in the note.", ready, (t) => ticketRow(t,
+          masterPr.get(t.issue_id) ? prLink(masterPr.get(t.issue_id)) : h("small", { class: "badge overdue" }, "no open PR into master"))),
+        relGroup("Held back", "On qa-release but not approved yet. Listed under \u201cNot approved (held back)\u201d.", held, (t) => ticketRow(t)),
+        relGroup("Direct to master", "Open PRs into master whose code didn't go through qa-release.", direct, (p) => ticketRow(
+          { issue_id: p.issue_id, title: p.title, status: p.status }, prLink(p),
+          h("small", { class: "badge soon" }, p.via_qa === "partly" ? "partly via QA" : "not via QA"))),
+        hotfixes.length ? relGroup("Hotfixes", "Open PRs into master without a ticket.", hotfixes, (p) => h("li", { class: "rel-row" }, prLink(p), h("span", { class: "rel-title" }, p.title))) : null,
+        report.mismatches.length ? relGroup("Git and Timeline disagree", null, report.mismatches, (m) => h("li", { class: "rel-row" },
+          h("a", { href: `#/task/${m.issue_id}`, class: "issue" }, `#${m.issue_id}`), h("span", { class: "rel-title" }, m.title || ""), h("small", { class: "badge overdue" }, m.detail))) : null),
+      noteBlock(report.notes.master, report.notes.drafted, false)),
+  ];
+}
+
+function renderQa(report) {
+  const cmp = report.qa_compare || { tickets: [] };
+  const by = (change) => cmp.tickets.filter((t) => t.change === change);
+  const qaPr = new Map(report.prs["qa-release"].map((p) => [p.issue_id, p]));
+  const last = cmp.last_qa ? cmp.last_qa.tag : "the last QA release";
+  return [
+    cmp.last_qa ? h("p", { class: "note" },
+      `Compared with ${cmp.last_qa.tag} (${cmp.last_qa.date})`,
+      cmp.prod_base ? `, cut after production ${cmp.prod_base.tag} (${cmp.prod_base.date})` : "", ".") : null,
+    cmp.error ? h("p", { class: "error", role: "alert" }, `Comparison with the last QA release failed: ${cmp.error}`) : null,
+    report.timeline_error ? h("p", { class: "error", role: "alert" }, `Timeline: ${report.timeline_error}`) : null,
+    h("div", { class: "rel-columns" },
+      h("div", {},
+        relGroup(`New since ${last}`, "Merged into qa-release after the last QA release.", by("new"), (t) => ticketRow(t)),
+        relGroup("Updated since", "Were in the last QA release and got another merge since (QA should re-test).", by("updated"), (t) => ticketRow(t)),
+        relGroup("Carried over", `Already in ${last}; their current QA status.`, by("carried"), (t) => ticketRow(t)),
+        relGroup("Shipped to production", `Were in ${last}, now in master, so they leave the QA note.`, by("shipped"), (t) => ticketRow(t)),
+        relGroup("Not on QA yet", "Open PRs into qa-release. Listed under \u201cNot approved (held back)\u201d.", report.pending_qa, (p) => ticketRow(
+          { issue_id: p.issue_id, title: p.title, status: (qaPr.get(p.issue_id) || {}).status }, qaPr.get(p.issue_id) ? prLink(qaPr.get(p.issue_id)) : null))),
+      noteBlock(report.notes.qa, report.notes.drafted, true)),
+  ];
+}
+
+function renderRelease(report, results, which) {
+  const counts = {
+    prs: report.prs["qa-release"].length + report.prs.master.length,
+    prod: report.tickets.filter((t) => t.approved).length,
+    qa: ((report.qa_compare || {}).tickets || []).filter((t) => t.change === "new" || t.change === "updated").length,
+  };
+  const body = which === "prod" ? renderProd(report) : which === "qa" ? renderQa(report) : [renderPrs(report)];
+  put(results,
+    h("nav", { class: "subtabs", "aria-label": "Release views" }, RELEASE_VIEWS.map((v) => h("a", {
+      class: "subtab", href: `#/release/${v.key}`, "aria-current": v.key === which ? "page" : null,
+    }, v.label, h("span", { class: "count", title: { prs: "open PRs", prod: "approved tickets", qa: "new or updated since the last QA release" }[v.key] }, counts[v.key])))),
+    ...body);
+}
+
+async function checkRelease(results, stamp, button, fetchFresh, which) {
   button.disabled = true;
   stamp.textContent = fetchFresh ? "Fetching from GitHub… (about 10 s)" : "Loading…";
   try {
@@ -911,7 +1031,7 @@ async function checkRelease(results, stamp, button, fetchFresh) {
       ({ report } = await api("/api/release", { method: "POST", headers: { "X-Timeline-Desk": "1" } }));
     }
     await getWorkflows(true);
-    renderPrs(report, results);
+    renderRelease(report, results, which);
     stamp.textContent = `Checked at ${clock(report.generated_at)}`;
   } catch (error) {
     stamp.textContent = "";
@@ -921,13 +1041,14 @@ async function checkRelease(results, stamp, button, fetchFresh) {
   }
 }
 
-async function showRelease(force) {
+async function showRelease(force, arg) {
+  const which = RELEASE_VIEWS.some((v) => v.key === arg) ? arg : "prs";
   const results = h("div", { id: "release-results" });
   const stamp = h("span", { class: "note" });
   const check = h("button", { type: "button", class: "btn" }, "Check again");
-  check.addEventListener("click", () => checkRelease(results, stamp, check, true));
+  check.addEventListener("click", () => checkRelease(results, stamp, check, true, which));
   put(view, h("div", { class: "toolbar" }, check, stamp), results);
-  await checkRelease(results, stamp, check, Boolean(force));
+  await checkRelease(results, stamp, check, Boolean(force), which);
 }
 
 // ---- worktrees -------------------------------------------------------------
@@ -2296,7 +2417,7 @@ async function route(force) {
   try {
     if (name === "changes") await showChanges(false, force);
     else if (name === "timeline") await showTimeline(force);
-    else if (name === "release") await showRelease(force);
+    else if (name === "release") await showRelease(force, arg);
     else if (name === "work") await showWork();
     else if (name === "jira") await showJira();
     else if (name === "workflows") await showWorkflows(arg);

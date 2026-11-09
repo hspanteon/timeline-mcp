@@ -215,6 +215,66 @@ def test_release_entry_lines_are_verbatim():
     assert entry["lines"] == ["- #1234 - BUG: Fix  the Kontoplan", "  - **Bold.** Kept as-is!", "    - nested"]
 
 
+def _qa_tag_runner(calls, at_tag_log):
+    """fake_runner plus a QA release v1.0.3.2-qa cut after production v1.0.3.1."""
+    base = fake_runner(calls)
+    releases = [{"tagName": "v1.0.3.1", "isDraft": False, "publishedAt": "2026-10-16T01:00:00Z"},
+                {"tagName": "v1.0.3.2-qa", "isDraft": False, "publishedAt": "2026-10-16T05:00:00Z"}]
+
+    def run(args, cwd, timeout):
+        a = tuple(args)
+        if a[:2] == ("gh", "release"):
+            calls.append(a)
+            return 0, json.dumps(releases), ""
+        if a[:2] == ("git", "log") and a[-1] == "refs/tags/v1.0.3.2-qa..origin/qa-release":
+            calls.append(a)
+            return 0, "m4\n", ""  # only the 2222 merge came after the QA tag
+        if a[:2] == ("git", "log") and a[-1] == "refs/tags/v1.0.3.1..refs/tags/v1.0.3.2-qa":
+            calls.append(a)
+            return 0, at_tag_log, ""
+        if a == ("git", "rev-list", "refs/tags/v1.0.3.1"):
+            calls.append(a)
+            return 0, "b0\n", ""
+        return base(args, cwd, timeout)
+    return run
+
+
+def _changes(report):
+    return {t["issue_id"]: t["change"] for t in report["qa_compare"]["tickets"]}
+
+
+def test_qa_compare_against_last_qa_release(repo):
+    at_tag = "\n".join([
+        "m1\x1fq0 b1\x1f2026-10-13T12:00:00+02:00\x1fMerge branch '1111-one' into qa-release",
+        "m6\x1fqy b2\x1f2026-10-11T12:00:00+02:00\x1fMerge branch '6666-gone' into qa-release",  # b2 is in master now
+        "m5\x1fqz b0\x1f2026-10-10T12:00:00+02:00\x1fMerge branch '3333-shipped' into qa-release",  # already in v1.0.3.1
+    ])
+    calls = []
+    report = rc.build_report(repo, status_lookup=lambda ids: [STATUSES[i] for i in ids if i in STATUSES],
+                             runner=_qa_tag_runner(calls, at_tag), today=date(2026, 10, 16))
+    cmp = report["qa_compare"]
+    assert cmp["error"] is None
+    assert cmp["last_qa"] == {"tag": "v1.0.3.2-qa", "date": "2026-10-16"}
+    assert cmp["prod_base"] == {"tag": "v1.0.3.1", "date": "2026-10-16"}
+    assert _changes(report) == {"1111": "carried", "2222": "new", "6666": "shipped"}
+    row = {t["issue_id"]: t for t in cmp["tickets"]}["1111"]
+    assert row["title"] == "One" and row["approved"] is True
+    assert ("git", "fetch", "--quiet", "--no-tags", "origin",
+            "+refs/tags/v1.0.3.2-qa:refs/tags/v1.0.3.2-qa", "+refs/tags/v1.0.3.1:refs/tags/v1.0.3.1") in calls
+
+
+def test_qa_compare_marks_follow_up_merges_as_updated(repo):
+    at_tag = "m9\x1fq9 b9\x1f2026-10-09T12:00:00+02:00\x1fMerge branch '2222-two' into qa-release"
+    report = rc.build_report(repo, status_lookup=None, runner=_qa_tag_runner([], at_tag), today=date(2026, 10, 16))
+    assert _changes(report) == {"1111": "new", "2222": "updated"}
+
+
+def test_qa_compare_without_qa_release_is_an_error_not_a_failure(repo):
+    report = rc.build_report(repo, status_lookup=None, runner=fake_runner([]), today=date(2026, 10, 16))
+    assert report["qa_compare"]["error"] == "No QA release found on GitHub."
+    assert report["qa_compare"]["tickets"] == [] and report["notes"]["qa"]["body"]
+
+
 def test_timeline_failure_keeps_git_side(repo):
     def lookup(ids):
         raise PermissionError("Panteon credentials rejected")

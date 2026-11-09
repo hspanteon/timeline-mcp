@@ -6,9 +6,10 @@ production yet, their QA approval in Timeline, and draft release notes.
 The same rules as skills/release-pr-check/SKILL.md, minus the parts that need
 judgement (rewriting notes, translation and migration checks).
 
-Read-only: it runs `git fetch`, `git log`, `git rev-list` and `gh pr/release
-list` with fixed argument lists (no shell), and never merges, pushes, comments
-or creates releases.
+Read-only: it runs `git fetch` (the two branches, and the tags of the last QA
+release and the production release before it), `git log`, `git rev-list` and
+`gh pr/release list` with fixed argument lists (no shell), and never merges,
+pushes, comments or creates releases.
 """
 import datetime as dt
 import os
@@ -234,10 +235,9 @@ def bump_version(tag: str) -> str:
 
 
 # ---- assembling the report -------------------------------------------------
-def qa_merges(repo: _Repo) -> List[Dict[str, Any]]:
-    """Merges into qa-release since master, newest first: {sha, merged, date, subject, branch}."""
-    out = repo.run("git", "log", "--first-parent", "--merges", "--format=%H%x1f%P%x1f%cI%x1f%s",
-                   "origin/master..origin/qa-release")
+def qa_merges(repo: _Repo, rev_range: str = "origin/master..origin/qa-release") -> List[Dict[str, Any]]:
+    """Merges into qa-release in `rev_range`, newest first: {sha, merged, date, subject, branch}."""
+    out = repo.run("git", "log", "--first-parent", "--merges", "--format=%H%x1f%P%x1f%cI%x1f%s", rev_range)
     merges = []
     for line in out.splitlines():
         parts = line.split("\x1f")
@@ -276,6 +276,69 @@ def tickets_on_qa(merges: List[Dict[str, Any]], in_master: Set[str]) -> Tuple[Li
         if not branch.isdigit() and branch not in entry["branches"]:
             entry["branches"].append(branch)
     return list(tickets.values()), list(no_ticket.values())
+
+
+def _released(r: Dict[str, Any]) -> str:
+    return r.get("publishedAt") or r.get("createdAt") or ""
+
+
+def qa_release_changes(repo: _Repo, releases: List[Dict[str, Any]], merges: List[Dict[str, Any]],
+                       tickets: List[Dict[str, Any]], fetch: bool) -> Dict[str, Any]:
+    """
+    Compares what is on QA now with the last QA release (the latest published
+    `-qa` tag). The tag is the record of what was on QA then: tickets merged
+    into it but not into the production release before it. Each ticket gets a
+    `change`:
+      new      first merged into qa-release after the last QA release
+      updated  was in the last QA release and merged again since (a follow-up)
+      carried  was in the last QA release, nothing new since
+      shipped  was in the last QA release and is in master now
+    Failures (tag missing, no earlier production release) set `error` and
+    leave `tickets` empty; the rest of the report is unaffected.
+    """
+    published = [r for r in releases if not r.get("isDraft") and r.get("tagName")]
+    qa = [r for r in published if r["tagName"].endswith("-qa")]
+    if not qa:
+        return {"last_qa": None, "prod_base": None, "tickets": [], "error": "No QA release found on GitHub."}
+    last = max(qa, key=lambda r: _version_key(r["tagName"]))
+    prods = [r for r in published if not r["tagName"].endswith("-qa") and _released(r) <= _released(last)]
+    result: Dict[str, Any] = {
+        "last_qa": {"tag": last["tagName"], "date": _released(last)[:10]},
+        "prod_base": None, "tickets": [], "error": None,
+    }
+    if not prods:
+        result["error"] = f"No production release before {last['tagName']} to compare with."
+        return result
+    base = max(prods, key=_released)
+    result["prod_base"] = {"tag": base["tagName"], "date": _released(base)[:10]}
+    qa_tag, prod_tag = f"refs/tags/{last['tagName']}", f"refs/tags/{base['tagName']}"
+    try:
+        if fetch:
+            repo.run("git", "fetch", "--quiet", "--no-tags", "origin",
+                     f"+{qa_tag}:{qa_tag}", f"+{prod_tag}:{prod_tag}", timeout=60)
+        since = set(repo.run("git", "log", "--first-parent", "--merges", "--format=%H",
+                             f"{qa_tag}..origin/qa-release").split())
+        in_prod = set(repo.run("git", "rev-list", prod_tag).split())
+        at_tag, _ = tickets_on_qa(qa_merges(repo, f"{prod_tag}..{qa_tag}"), in_prod)
+    except ReleaseCheckError as exc:
+        result["error"] = str(exc)
+        return result
+
+    at_ids = {t["issue_id"]: t for t in at_tag}
+    merged_since = {task_id_from_branch(m["branch"]) for m in merges if m["branch"] and m["sha"] in since}
+    rows = []
+    for t in tickets:
+        if t["issue_id"] not in at_ids:
+            change = "new"
+        else:
+            change = "updated" if t["issue_id"] in merged_since else "carried"
+        rows.append({"issue_id": t["issue_id"], "change": change, "branches": t["branches"], "last_merged": t["last_merged"]})
+    now = {t["issue_id"] for t in tickets}
+    for issue_id, t in at_ids.items():
+        if issue_id not in now:
+            rows.append({"issue_id": issue_id, "change": "shipped", "branches": t["branches"], "last_merged": t["last_merged"]})
+    result["tickets"] = rows
+    return result
 
 
 def shape_pr(pr: Dict[str, Any], base: str, today: dt.date) -> Dict[str, Any]:
@@ -376,11 +439,13 @@ def build_report(
 
     tickets, no_ticket = tickets_on_qa(merges, in_master)
     prs = {base: [shape_pr(p, base, today) for p in raw_prs[base]] for base in BASES}
+    qa_compare = qa_release_changes(repo, release_list, merges, tickets, fetch)
 
     # Every ticket we know about, for one status lookup.
     ids: List[str] = []
     for t in tickets:
         ids.append(t["issue_id"])
+    ids += [t["issue_id"] for t in qa_compare["tickets"]]
     for base in BASES:
         ids += [p["issue_id"] for p in prs[base] if p["issue_id"]]
     ids = list(dict.fromkeys(ids))
@@ -530,6 +595,10 @@ def build_report(
         "pending_qa": [{"issue_id": p["issue_id"], "number": p["number"], "title": title_of(p["issue_id"]) or p["title"]} for p in qa_open],
         "approval": {"approved": len(approved), "total": total},
         "mismatches": mismatches,
+        "qa_compare": {**qa_compare, "tickets": [
+            {**t, "title": (status_of(t["issue_id"]) or {}).get("title"), "status": statuses.get(t["issue_id"]),
+             "approved": bool((status_of(t["issue_id"]) or {}).get("qa_approved"))}
+            for t in qa_compare["tickets"]]},
         "timeline_error": timeline_error,
         "notes": {
             "master": {

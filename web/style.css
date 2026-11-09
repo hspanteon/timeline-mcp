@@ -338,6 +338,20 @@ textarea { width: 100%; min-height: 70px; resize: vertical; }
 
 /* ---- release ------------------------------------------------------------ */
 .badge.ok { color: var(--accent-ink); }
+.rel-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+.rel-group { margin-bottom: 18px; }
+.rel-group h3, .rel-note h3 { margin: 0 0 4px; font-size: 15px; }
+.rel-group h3 .count { margin-left: 8px; font: 600 12px var(--mono); color: var(--muted); }
+.rel-group > .note { margin: 0 0 6px; font-size: 13px; }
+.rel-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.rel-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; padding: 7px 10px; border-top: 1px solid var(--line); }
+.rel-row:first-child { border-top: 0; }
+.rel-row a.issue { font-family: var(--mono); text-decoration: none; }
+.rel-title { flex: 1 1 200px; min-width: 0; }
+.rel-note { position: sticky; top: 12px; }
+.rel-note .pr-body { max-height: 70vh; overflow: auto; }
+.chip.ok { color: var(--accent-ink); border-color: var(--accent); }
+@media (max-width: 900px) { .rel-columns { grid-template-columns: 1fr; } .rel-note { position: static; } }
 .pr-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; align-items: start; }
 .lane h2 .count { font-family: var(--mono); color: var(--muted); margin-left: 6px; }
 .card.pr a.issue { text-decoration: none; }
@@ -470,6 +484,7 @@ table.work code { font-family: var(--mono); font-size: 13px; }
   padding: 8px 14px; border-bottom: 2px solid transparent; margin-bottom: -1px;
 }
 .subtab:hover { color: var(--ink); }
+a.subtab { text-decoration: none; display: inline-block; }
 .subtab[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); font-weight: 700; }
 .subtab .count, .tgroup .count { margin-left: 8px; padding: 0 7px; border-radius: 999px; background: var(--surface-2); color: var(--muted); font: 600 12px var(--mono); }
 
