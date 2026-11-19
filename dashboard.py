@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import requests
 from starlette.applications import Starlette
@@ -47,6 +47,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 HOSTNAME = "timeline.localhost"
 ALLOWED_HOSTS = ["127.0.0.1", "localhost", HOSTNAME]
 MAX_STATUS_IDS = 100
+CHECK_TTL = 120  # seconds a pre-start check (git fetch, gh pr list) is reused
 # Polling is tiered so it feels live without spikes. Every HEARTBEAT the `now`
 # planner period (1 request) and the watched tasks' timelines (1 each) are read;
 # the full planner check (3 periods) runs when the heartbeat sees `now` change, or
@@ -367,7 +368,9 @@ def create_app(
         def start():
             row = stages_of(workflow._issue(issue))
             result = workflow.start_workflow(issue, body.get("code"), str(body.get("step") or ""), row.get("title") or "",
-                                             work_config(), base_dir, **git_kwargs)
+                                             work_config(), base_dir, branch=str(body.get("branch") or "") or None,
+                                             new_branch=bool(body.get("new")), **git_kwargs)
+            check_cache.clear()
             # Copy the task's Timeline history now (the heartbeat keeps it current), and
             # count it as seen: only what happens from here on is news.
             note = result.get("note")
@@ -378,6 +381,35 @@ def create_app(
             workflow.reset_baseline(issue, base_dir)
             return {**view_of(issue), "note": note}
         return await run_in_threadpool(_respond, start)
+
+    # The pre-start check runs `git fetch` and `gh pr list`, so it's a header-guarded
+    # POST, and kept for a couple of minutes so re-rendering the panel doesn't repeat it.
+    check_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+
+    async def api_workflow_check(request: Request):
+        denied = guarded(request)
+        if denied:
+            return denied
+        body = await json_body(request)
+        issue = request.path_params["issue"]
+
+        def check():
+            number = workflow._issue(issue)
+            config = work_config()
+            try:
+                row = stages_of(number)
+            except (LookupError, PermissionError, requests.RequestException):
+                row = {}
+            code = str(body.get("code") or work_session.board_for_project(config, row.get("project_id")) or "")
+            key = (number, code)
+            cached = check_cache.get(key)
+            if cached and not body.get("force") and time.monotonic() - cached[0] < CHECK_TTL:
+                return {**cached[1], "cached": True}
+            result = workflow.start_check(number, code, config, row.get("stages"), **git_kwargs)
+            result["checked_at"] = datetime.now().isoformat(timespec="seconds")
+            check_cache[key] = (time.monotonic(), result)
+            return result
+        return await run_in_threadpool(_respond, check)
 
     async def api_workflow_run(request: Request):
         denied = guarded(request)
@@ -643,6 +675,7 @@ def create_app(
         Route("/api/workflows", api_workflows),
         Route("/api/workflow/{issue}", api_workflow),
         Route("/api/workflow/{issue}/start", api_workflow_start, methods=["POST"]),
+        Route("/api/workflow/{issue}/check", api_workflow_check, methods=["POST"]),
         Route("/api/workflow/{issue}/run", api_workflow_run, methods=["POST"]),
         Route("/api/workflow/{issue}/resume", api_workflow_resume, methods=["POST"]),
         Route("/api/workflow/{issue}/decide", api_workflow_decide, methods=["POST"]),

@@ -965,3 +965,10 @@ a:hover > .tl-sha { border-color: #c4a5ff; }
   100% { box-shadow: var(--shadow); }
 }
 @media (prefers-reduced-motion: reduce) { .tl-event.tl-live .tl-card { animation: none; } }
+.wf-check { margin: 0 0 10px; font-size: 13px; }
+.wf-check p { margin: 4px 0; }
+.wf-check-warn { margin: 4px 0; padding-left: 18px; }
+.wf-check details ul { margin: 4px 0; padding-left: 18px; }
+.wf-check code { font-size: 12px; }
+.wf-branch-note { margin: -4px 0 8px; font-size: 13px; }
+.wf-branch-note:empty { display: none; }

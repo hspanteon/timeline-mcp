@@ -1753,26 +1753,98 @@ function startForm(el, issue, code, v) {
   if (!v.startable) return h("p", { class: "note" }, v.start_note);
   const select = h("select", { "aria-label": "Start at" }, v.steps.filter((s) => s.key !== "close" && !s.hidden)
     .map((s) => h("option", { value: s.key, selected: s.key === v.proposal.step ? true : null }, s.title)));
-  const button = h("button", { type: "button", class: "btn" }, "Start workflow");
+  const branchSelect = h("select", { "aria-label": "Branch", disabled: true }, h("option", { value: "" }, "Checking…"));
+  const button = h("button", { type: "button", class: "btn", disabled: true }, "Start workflow");
+  const suggestion = h("p", {});
+  const showProposal = (proposal) => {
+    put(suggestion, `Suggested start: ${v.steps.find((s) => s.key === proposal.step).title}. `, h("span", { class: "note" }, proposal.reason));
+  };
+  showProposal(v.proposal);
+  const checkBox = h("div", { class: "wf-check" }, h("p", { class: "note" }, "Checking for existing branches, PRs and commits…"));
+  let check = null;
+  const branchNote = h("p", { class: "warn-text wf-branch-note" });
+  const picked = () => check && check.branch_choice.options.find((o) => o.branch === branchSelect.value);
+  const canStart = () => {
+    const option = picked();
+    put(branchNote, option && (option.blocked || option.warning) || null);
+    button.disabled = !check || branchSelect.value === "\u0000" || Boolean(option && option.blocked);
+  };
+  branchSelect.addEventListener("change", canStart);
+
+  const runCheck = async (force) => {
+    check = null;
+    canStart();
+    put(checkBox, h("p", { class: "note" }, "Checking for existing branches, PRs and commits…"));
+    try {
+      check = await flowPost(issue, "check", { code: v.code, force: force || null });
+    } catch (error) {
+      // Without the check, Start still works with the usual branch rules.
+      check = { warnings: [], branch_choice: { options: [{ branch: "", label: "Usual rules: the task's worktree or <id>-… branch, else a new one" }], default: "", locked: false } };
+      put(checkBox, h("p", { class: "warn-text" }, `Couldn't check for existing work: ${error.message}`), againButton());
+      fillBranches();
+      return;
+    }
+    if (check.proposal && check.proposal.step !== v.proposal.step) {
+      select.value = check.proposal.step;
+      showProposal(check.proposal);
+    } else if (check.proposal) {
+      showProposal(check.proposal);
+    }
+    const found = [
+      ...check.branches.map((b) => h("li", {}, h("code", {}, b.name), ` ${b.ahead ? `${b.ahead} commit${b.ahead === 1 ? "" : "s"} beyond ${check.base}` : b.ahead === 0 ? `nothing beyond ${check.base}` : ""}`,
+        b.in_qa && b.ahead ? ", in qa-release" : "", b.last_commit ? h("small", { class: "note" }, ` · last commit ${when(b.last_commit)}`) : null)),
+      ...check.prs.map((p) => h("li", {}, h("a", { href: p.url, target: "_blank", rel: "noreferrer noopener" }, `PR #${p.number}`),
+        ` ${p.state.toLowerCase()}${p.isDraft ? " draft" : ""} · ${p.headRefName} → ${p.baseRefName} · ${p.title}`)),
+      ...check.commits.map((c) => h("li", {}, h("code", {}, c.sha), ` in ${c.ref} · ${c.subject}`)),
+    ];
+    put(checkBox,
+      check.warnings.length ? h("ul", { class: "warn-text wf-check-warn" }, check.warnings.map((w) => h("li", {}, w)))
+        : h("p", { class: "note" }, found.length ? "Nothing that blocks a start." : "No branch, PR or commit for this task yet."),
+      found.length ? h("details", {}, h("summary", {}, `Found: ${check.branches.length} branch${check.branches.length === 1 ? "" : "es"}, ${check.prs.length} PR${check.prs.length === 1 ? "" : "s"}, ${check.commits.length} commit${check.commits.length === 1 ? "" : "s"} in ${check.base} / qa-release`),
+        h("ul", {}, found)) : null,
+      h("p", { class: "note" }, `Checked ${when(check.checked_at)}${check.cached ? " (cached)" : ""}${check.fetched ? ", after fetching origin" : ""}. `, againButton()));
+    fillBranches();
+  };
+  function againButton() {
+    const again = h("button", { type: "button", class: "btn ghost small" }, "Check again");
+    again.addEventListener("click", () => runCheck(true));
+    return again;
+  }
+  function fillBranches() {
+    const choice = check.branch_choice;
+    const options = choice.options.map((o) => h("option", { value: o.branch, selected: o.branch === choice.default ? true : null }, o.label));
+    if (choice.default === null) options.unshift(h("option", { value: "\u0000", selected: true, disabled: true }, "Choose a branch…"));
+    put(branchSelect, options);
+    branchSelect.disabled = choice.locked || choice.options.length < 2;
+    canStart();
+  }
+
   button.addEventListener("click", async () => {
     const step = v.steps.find((s) => s.key === select.value);
     const first = v.steps.indexOf(step) === 0;
+    const branch = branchSelect.value === "\u0000" ? "" : branchSelect.value;
+    const option = picked();
+    const isNew = Boolean(option && option.new && check.branches.length);
+    const warn = check && check.warnings.length ? ` Check found: ${check.warnings.join(" ")}` : "";
     if (!await confirmDialog({ title: `Start a workflow for #${issue} at ${step.title}?`, ok: "Start workflow",
-      text: `The desk makes or reuses the task's worktree in ${v.repo}.${first ? "" : ` Steps before ${step.title} are recorded as skipped.`}` })) return;
+      text: `The desk ${branch ? `uses branch ${branch}` : isNew ? "makes a new branch from current code" : "makes or reuses the task's branch"} and its worktree in ${v.repo}.${first ? "" : ` Steps before ${step.title} are recorded as skipped.`}${warn}` })) return;
     button.disabled = true;
     try {
-      const r = await flowPost(issue, "start", { code: v.code, step: select.value });
+      const r = await flowPost(issue, "start", { code: v.code, step: select.value, branch: branch || null, new: isNew || null });
       if (r.note) toast(r.note, true);
     } catch (error) {
       toast(error.message, true);
     }
     await loadWorkflow(el, issue, code);
   });
+  runCheck(false);
   return h("div", { class: "wf-card" },
     h("h4", {}, "Start a workflow"),
-    h("p", {}, `Suggested start: ${v.steps.find((s) => s.key === v.proposal.step).title}. `, h("span", { class: "note" }, v.proposal.reason)),
+    suggestion,
     v.timeline_error ? h("p", { class: "warn-text" }, `Couldn't read Timeline's stages: ${v.timeline_error}`) : null,
-    h("div", { class: "wf-actions" }, h("label", { class: "note" }, "Start at ", select), button),
+    checkBox,
+    h("div", { class: "wf-actions" }, h("label", { class: "note" }, "Start at ", select), h("label", { class: "note" }, "Branch ", branchSelect), button),
+    branchNote,
     h("p", { class: "note" }, `Nothing runs until you click Run on a step. Every run and decision is kept in the history below.`));
 }
 

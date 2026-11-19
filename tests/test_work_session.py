@@ -8,6 +8,7 @@ from starlette.testclient import TestClient
 
 import dashboard
 import panteon_client as pc
+import release_check
 import work_session as ws
 
 
@@ -207,3 +208,106 @@ def test_work_endpoints(client, setup):
     removed = client.post("/api/work/remove", json={"path": listed[0]["path"]}, headers=h).json()
     assert removed["removed"] == listed[0]["path"]
     assert client.post("/api/work/remove", json={"path": "/etc"}, headers=h).status_code == 400
+
+
+# ---- existing work (the pre-start check) -----------------------------------
+def gh_runner(prs=None, fail=None):
+    """Real git; `gh pr list` answers with `prs` (or fails with `fail`), so no test reaches GitHub."""
+    calls = []
+
+    def runner(args, cwd, timeout):
+        calls.append(tuple(args))
+        if args[0] == "gh":
+            if fail:
+                return 1, "", fail
+            return 0, json.dumps(prs or []), ""
+        return release_check._subprocess_runner(args, cwd, timeout)
+    runner.calls = calls
+    return runner
+
+
+def pushed_elsewhere(setup, branch, message, files=None, base="master"):
+    """A colleague's clone pushes `branch` (after the desk's clone was made, so only a fetch sees it)."""
+    other = setup["tmp"] / "colleague"
+    if not other.exists():
+        git(setup["tmp"], "clone", "-q", str(setup["tmp"] / "origin.git"), str(other))
+        git(other, "config", "user.email", "c@example.com")
+        git(other, "config", "user.name", "C")
+    git(other, "fetch", "-q", "origin")
+    git(other, "checkout", "-q", "-B", branch, f"origin/{base}")
+    (other / (files or f"{branch.replace('/', '_')}.txt")).write_text(message + "\n")
+    git(other, "add", ".")
+    git(other, "commit", "-qm", message)
+    git(other, "push", "-q", "origin", branch)
+    return other
+
+
+def test_existing_work_finds_branches_prs_and_commits(setup):
+    repo = setup["config"]["repos"]["15033"]
+    other = pushed_elsewhere(setup, "feature/6034-other-try", "second try")
+    pushed_elsewhere(setup, "60345-unrelated", "another task")  # a longer number isn't #6034
+    # qa-release has 6034-existing merged; master has a TL #6034 commit.
+    git(other, "checkout", "-q", "-B", "qa-release", "origin/master")
+    git(other, "merge", "-q", "--no-ff", "-m", "Merge 6034 In qa-release", "origin/6034-existing")
+    git(other, "push", "-q", "origin", "qa-release")
+    pushed_elsewhere(setup, "master", "TL #6034 hotfix")
+    prs = [
+        {"number": 12, "title": "6034 Cannot delete course", "state": "OPEN", "isDraft": False, "headRefName": "6034-existing",
+         "baseRefName": "qa-release", "url": "https://github.com/o/r/pull/12", "updatedAt": "2026-11-01T10:00:00Z"},
+        {"number": 13, "title": "Other", "state": "MERGED", "isDraft": False, "headRefName": "60345-unrelated",
+         "baseRefName": "master", "url": "https://github.com/o/r/pull/13", "updatedAt": "2026-11-01T10:00:00Z"},
+    ]
+    runner = gh_runner(prs)
+    found = ws.existing_work(repo, "6034", runner)
+    assert found["fetched"] and found["fetch_error"] is None and found["worktree"] is None
+    by_name = {b["name"]: b for b in found["branches"]}
+    assert set(by_name) == {"6034-existing", "feature/6034-other-try"}  # fetched, so the colleague's branch is seen
+    assert by_name["6034-existing"]["remote"] and not by_name["6034-existing"]["local"]
+    assert by_name["6034-existing"]["ahead"] == 1 and by_name["6034-existing"]["in_qa"] is True
+    assert by_name["feature/6034-other-try"]["in_qa"] is False
+    assert [(c["ref"], c["subject"]) for c in found["commits"]] == [
+        ("master", "TL #6034 hotfix"), ("qa-release", "Merge 6034 In qa-release")]
+    assert [p["number"] for p in found["prs"]] == [12]
+    assert ("gh", "pr", "list") == runner.calls[-1][:3] and "--state" in runner.calls[-1]
+
+    ws.worktree_for(setup["config"], "15033", "6034", "x")
+    found = ws.existing_work(repo, "6034", gh_runner(fail="gh: not logged in"), fetch=False)
+    assert found["worktree"]["branch"] == "6034-existing" and not found["fetched"]
+    assert {b["name"]: b["worktree"] for b in found["branches"]}["6034-existing"] == found["worktree"]["path"]
+    assert found["prs"] == [] and "not logged in" in found["pr_error"]
+    with pytest.raises(ValueError):
+        ws.existing_work(repo, "60; x", runner)
+
+
+def test_existing_work_survives_a_failed_fetch(setup):
+    repo = setup["config"]["repos"]["15033"]
+    git(setup["repo"], "remote", "set-url", "origin", str(setup["tmp"] / "gone.git"))
+    found = ws.existing_work(repo, "6034", gh_runner())
+    assert not found["fetched"] and "fetch" in found["fetch_error"]
+    assert [b["name"] for b in found["branches"]] == ["6034-existing"]  # still the refs it has
+
+
+def test_worktree_on_a_chosen_branch(setup):
+    cfg = setup["config"]
+    pushed_elsewhere(setup, "feature/6034-other-try", "second try")
+    git(setup["repo"], "fetch", "-q", "origin")
+    with pytest.raises(ValueError, match="doesn't name #6034"):
+        ws.worktree_for(cfg, "15033", "6034", "x", branch="feature/9999-x", strict=True)
+    with pytest.raises(ws.WorkSessionError, match="no branch"):
+        ws.worktree_for(cfg, "15033", "6034", "x", branch="6034-gone", strict=True)
+    result = ws.worktree_for(cfg, "15033", "6034", "x", branch="feature/6034-other-try", strict=True)
+    assert result["branch"] == "feature/6034-other-try" and result["created"]
+    assert result["path"].endswith(os.sep + "duell-admin-6034")
+    assert git(result["path"], "rev-parse", "--abbrev-ref", "@{u}").strip() == "origin/feature/6034-other-try"
+    # Later runs find it by that branch; picking another one at start is refused.
+    assert ws.worktree_for(cfg, "15033", "6034", "x", branch="feature/6034-other-try")["path"] == result["path"]
+    with pytest.raises(ws.WorkSessionError, match="is on feature/6034-other-try"):
+        ws.worktree_for(cfg, "15033", "6034", "x", branch="6034-existing", strict=True)
+    # Not strict (a run whose branch is gone): the usual rules.
+    assert ws.worktree_for(cfg, "15033", "6034", "x", branch="6034-gone")["path"] == result["path"]
+
+
+def test_worktree_sees_a_task_branch_pushed_since_the_last_fetch(setup):
+    pushed_elsewhere(setup, "5001-started-elsewhere", "colleague's start")
+    result = ws.worktree_for(setup["config"], "15033", "5001", "New report")
+    assert result["branch"] == "5001-started-elsewhere"

@@ -494,6 +494,7 @@ Approve / Deny on the page. Only if the user wants to leave the terminal entirel
 | 2026-10-27 | Phase 1 built: `workflow.py`, schema v3, task workflow panel, badges; old Start launcher removed. 252 tests; sandbox click-through; real Claude run not yet tried. |
 | 2026-10-28 | Phases 2–5 built (§10). 269 tests; sandbox click-through of every phase; real Claude runs and the real Agent SDK not tried yet. |
 | 2026-10-28 | Phases 4 and 5 removed: terminal only, plus a live status of what the terminal is doing (§10.9). |
+| 2026-11-19 | Pre-start check: `work_session.existing_work` + `workflow.start_check` (`POST …/check`) look for the task's worktree, branches named with the issue number (after `git fetch`), PRs (`gh pr list`) and commits already in base / qa-release; `propose_start` uses them, Start takes a picked `branch`. |
 | next | Phase 1 corrections (§3.9) and the unverified items in §10.6. |
 
 

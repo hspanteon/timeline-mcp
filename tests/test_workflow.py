@@ -11,6 +11,7 @@ from starlette.testclient import TestClient
 
 import dashboard
 import panteon_client as pc
+import release_check
 import work_session as ws
 import workflow as wf
 
@@ -756,3 +757,165 @@ def test_no_background_run_modes_are_left(setup):
     started = run(setup)
     assert "-p" not in setup["launched"][-1] and "gnome-terminal" == setup["launched"][-1][0]
     assert "mode" not in started
+
+
+# ---- the pre-start check ---------------------------------------------------
+def fake_gh(prs=None):
+    def runner(args, cwd, timeout):
+        if args[0] == "gh":
+            return 0, json.dumps(prs or []), ""
+        return release_check._subprocess_runner(args, cwd, timeout)
+    return runner
+
+
+def branch_on_origin(setup, name, message="work"):
+    """Pushes a commit to `name` on origin (a new branch from master, or master itself) and keeps no local branch."""
+    if name == "master":
+        (setup["repo"] / "m.txt").write_text(message + "\n")
+        git(setup["repo"], "add", ".")
+        git(setup["repo"], "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", message)
+        git(setup["repo"], "push", "-q", "origin", "master")
+        return
+    git(setup["repo"], "checkout", "-q", "-b", name, "origin/master")
+    (setup["repo"] / f"{name.replace('/', '_')}.txt").write_text("x\n")
+    git(setup["repo"], "add", ".")
+    git(setup["repo"], "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", message)
+    git(setup["repo"], "push", "-q", "origin", name)
+    git(setup["repo"], "checkout", "-q", "master")
+    git(setup["repo"], "branch", "-q", "-D", name)
+
+
+OPEN_PR = {"number": 7, "title": "5001 New report", "state": "OPEN", "isDraft": True, "headRefName": "5001-new-report",
+           "baseRefName": "master", "url": "https://github.com/o/r/pull/7", "updatedAt": "2026-11-01T10:00:00Z"}
+
+
+def test_propose_start_with_existing_work():
+    dev = {"Development": "in progress"}
+    assert wf.propose_start(dev, True, {"prs": [OPEN_PR], "commits": [], "branches": []})["step"] == "review"
+    qa = {"prs": [], "commits": [{"ref": "qa-release", "sha": "a", "subject": "Merge 5001"}], "branches": []}
+    assert wf.propose_start(dev, True, qa)["step"] == "qa"
+    assert wf.propose_start({"Development": "done"}, True, qa)["step"] == "qa"
+    assert wf.propose_start(dev, False, qa)["step"] == "intake"  # every later step needs analysis.md
+    assert wf.propose_start({"QA": "done"}, True, qa)["step"] == "release_prod"  # later stages win
+    reason = wf.propose_start({"Development": "blocked"}, True, {"prs": [OPEN_PR], "commits": [], "branches": []})["reason"]
+    assert reason.startswith("PR #7 is open") and reason.endswith("Development blocked.")
+
+
+def test_start_check_nothing_yet(setup):
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh())
+    assert check["warnings"] == [] and check["branches"] == [] and check["proposal"]["step"] == "intake"
+    assert check["branch_choice"] == {"options": [{"branch": "", "new": True, "label": "New branch 5001-… from origin/master"}],
+                                      "default": "", "locked": False}
+    with pytest.raises(ValueError, match="no repo"):
+        wf.start_check("5001", "999", setup["config"], runner=fake_gh())
+
+
+def test_start_check_several_branches_then_start_on_one(setup):
+    branch_on_origin(setup, "5001-new-report")
+    branch_on_origin(setup, "feature/5001-second-go")
+    (docs(setup) / "analysis.md").write_text("plan\n")
+    check = wf.start_check("5001", "15033", setup["config"], {"Development": "in progress"}, runner=fake_gh([OPEN_PR]))
+    choice = check["branch_choice"]
+    assert choice["default"] is None and not choice["locked"]  # two branches with commits: you pick
+    assert {o["branch"] for o in choice["options"]} == {"5001-new-report", "feature/5001-second-go", ""}
+    assert any("2 branches with commits" in w for w in check["warnings"])
+    assert any(w.startswith("PR #7 (draft) 5001-new-report → master is open") for w in check["warnings"])
+    assert check["proposal"]["step"] == "review"
+
+    wf.start_workflow("5001", "15033", "develop", "x", setup["config"], setup["base"], now=NOW,
+                      branch="feature/5001-second-go")
+    v = view(setup)
+    assert v["workflow"]["branch"] == "feature/5001-second-go"
+    started = run(setup, stages={"Development": "in progress"})
+    assert started["branch"] == "feature/5001-second-go" and started["path"] == v["workflow"]["worktree"]
+
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh(), fetch=False)
+    assert check["branch_choice"]["locked"] and check["branch_choice"]["default"] == "feature/5001-second-go"
+    assert any("already has a worktree" in w for w in check["warnings"])
+
+
+def test_start_check_one_branch_and_commits_in_master(setup):
+    branch_on_origin(setup, "master", "TL #5001 earlier fix")
+    branch_on_origin(setup, "5001-new-report")
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh())
+    assert check["branch_choice"]["default"] == "5001-new-report"
+    assert any("1 commit is for #5001 already in master (newest: TL #5001 earlier fix)" in w for w in check["warnings"])
+
+
+def test_check_endpoint(setup, monkeypatch):
+    monkeypatch.setenv("PANTEON_BEARER_TOKEN", "tok")
+    monkeypatch.setattr(pc, "get_task_statuses", lambda ids, headers: [
+        {"issue_id": i, "title": "T", "project_id": 16, "stages": {}} for i in ids])
+    calls = []
+
+    def runner(args, cwd, timeout):
+        calls.append(args[:2])
+        return fake_gh()(args, cwd, timeout)
+    app = dashboard.create_app(user_id=135, base_dir=setup["base"], work_config=lambda: setup["config"],
+                               work_runner=runner, work_launcher=setup["launcher"])
+    client = TestClient(app, base_url="http://127.0.0.1:8765")
+    h = {"X-Timeline-Desk": "1"}
+    assert client.post("/api/workflow/5001/check", json={"code": "15033"}).status_code == 403
+    first = client.post("/api/workflow/5001/check", json={"code": "15033"}, headers=h).json()
+    assert first["fetched"] and not first.get("cached") and first["branch_choice"]["default"] == ""
+    fetches = calls.count(("git", "fetch"))
+    assert client.post("/api/workflow/5001/check", json={"code": "15033"}, headers=h).json()["cached"]
+    assert calls.count(("git", "fetch")) == fetches  # reused, no second fetch
+    assert not client.post("/api/workflow/5001/check", json={"code": "15033", "force": True}, headers=h).json().get("cached")
+    setup["config"]["repos"]["15033"]["id"] = 16
+    assert client.post("/api/workflow/5001/check", json={}, headers=h).json()["repo"] == "duell-admin"  # board from the project
+    assert client.post("/api/workflow/5001/check", json={"code": "999"}, headers=h).status_code == 400
+    v = client.post("/api/workflow/5001/start", json={"code": "15033", "step": "intake", "branch": "feature/9-x"},
+                    headers=h)
+    assert v.status_code == 400 and "doesn't name #5001" in v.json()["error"]
+
+
+def test_start_check_branch_in_the_main_checkout_is_refused(setup):
+    git(setup["repo"], "checkout", "-q", "-b", "5001-in-main")
+    (setup["repo"] / "m.txt").write_text("m\n")
+    git(setup["repo"], "add", "m.txt")
+    git(setup["repo"], "-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "work in main")
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh(), fetch=False)
+    assert check["worktree"] is None and check["main_checkout"]["branch"] == "5001-in-main"
+    assert any("checked out in your main checkout" in w for w in check["warnings"])
+    option = next(o for o in check["branch_choice"]["options"] if o["branch"] == "5001-in-main")
+    assert "git switch master" in option["blocked"] and "in your main checkout" in option["label"]
+    with pytest.raises(ws.WorkSessionError, match="main checkout"):
+        wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW)
+    with pytest.raises(ws.WorkSessionError, match="main checkout"):
+        wf.start_workflow("5001", "15033", "intake", "x", setup["config"], setup["base"], now=NOW, branch="5001-in-main")
+    assert view(setup)["workflow"] is None  # nothing was recorded
+    # A new branch is fine: it doesn't touch the main checkout's.
+    wf.start_workflow("5001", "15033", "intake", "New report", setup["config"], setup["base"], now=NOW, new_branch=True)
+    v = view(setup)["workflow"]
+    assert v["branch"] == "5001-new-report" and v["worktree"] != str(setup["repo"])
+    assert git(setup["repo"], "branch", "--show-current").strip() == "5001-in-main"
+
+
+def test_start_check_branch_behind_base(setup):
+    branch_on_origin(setup, "5001-new-report")     # 1 commit of its own
+    branch_on_origin(setup, "master", "later on master")
+    branch_on_origin(setup, "master", "and again")
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh())
+    b = check["branches"][0]
+    assert (b["ahead"], b["behind"]) == (1, 2)
+    option = check["branch_choice"]["options"][0]
+    assert "2 behind" in option["label"] and "2 commits behind origin/master" in option["warning"]
+    assert "rebase" in option["warning"] and "blocked" not in option
+    assert check["branch_choice"]["default"] == "5001-new-report"
+
+
+def test_old_merged_branch_suggests_a_new_one(setup):
+    branch_on_origin(setup, "5001-new-report")
+    git(setup["repo"], "fetch", "-q", "origin")
+    git(setup["repo"], "merge", "-q", "--no-ff", "-m", "Merge 5001", "origin/5001-new-report")
+    git(setup["repo"], "push", "-q", "origin", "master")
+    branch_on_origin(setup, "master", "later on master")
+    check = wf.start_check("5001", "15033", setup["config"], runner=fake_gh())
+    option = next(o for o in check["branch_choice"]["options"] if o["branch"] == "5001-new-report")
+    assert "old, merged branch" in option["warning"]
+    assert check["branch_choice"]["default"] == ""  # a new branch from current code
+    wf.start_workflow("5001", "15033", "intake", "New report", setup["config"], setup["base"], now=NOW, new_branch=True)
+    v = view(setup)["workflow"]
+    assert v["branch"] == "5001-new-report-2"  # the old name is taken
+    assert git(v["worktree"], "rev-parse", "HEAD") == git(setup["repo"], "rev-parse", "origin/master")

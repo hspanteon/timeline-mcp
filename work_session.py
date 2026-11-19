@@ -172,14 +172,37 @@ def _inside(path: str, folder: str) -> bool:
     return os.path.commonpath([path, folder]) == folder and path != folder
 
 
-def find_worktree(git: "_Git", issue_id: str) -> Optional[Dict[str, Any]]:
-    """The worktree already on a `<issue>-…` branch or in the task's folder, if any."""
+def find_worktree(git: "_Git", issue_id: str, branch: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    The worktree already on `branch` (when given), else on a `<issue>-…`
+    branch or in the task's folder, if any.
+    """
     folder = os.path.realpath(worktree_dir(git.repo, issue_id))
-    for wt in git.worktrees():
+    main = os.path.realpath(git.repo["path"])
+    trees = git.worktrees()
+
+    def found(wt):
+        item = {"path": wt["path"], "branch": wt.get("branch", ""), "created": False}
+        return {**item, "main": True} if os.path.realpath(wt["path"]) == main else item
+    for wt in trees if branch else []:
+        if wt.get("branch") == branch:
+            return found(wt)
+    for wt in trees:
         if (wt.get("branch", "").startswith(f"{issue_id}-") or wt.get("branch") == issue_id
                 or os.path.realpath(wt["path"]) == folder):
-            return {"path": wt["path"], "branch": wt["branch"], "created": False}
+            return found(wt)
     return None
+
+
+def main_checkout_error(repo: Dict[str, Any], branch: str) -> str:
+    return (f"Branch {branch} is checked out in your main checkout ({repo['path']}). A workflow works in its own "
+            f"worktree, and git can't check one branch out twice: switch the main checkout to another branch "
+            f"(e.g. `git switch {repo['base']}`), then start.")
+
+
+def mentions(issue_id: str, text: str) -> bool:
+    """Whether `text` (a branch name, a PR title) names the issue as a whole number, not inside a longer one."""
+    return bool(re.search(rf"(?<![0-9]){re.escape(str(issue_id))}(?![0-9])", text or ""))
 
 
 def _merge_into(src: str, dst: str, prefix: str = "") -> List[str]:
@@ -251,7 +274,8 @@ def _with_timeline(git: "_Git", result: Dict[str, Any]) -> Dict[str, Any]:
     return {**result, "note": note} if note else result
 
 
-def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Runner = _subprocess_runner) -> Dict[str, Any]:
+def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Runner = _subprocess_runner,
+                     branch: Optional[str] = None, strict: bool = False, new: bool = False) -> Dict[str, Any]:
     """
     Returns {path, branch, created} for the task, reusing what exists:
     a worktree already on a `<issue>-…` branch, else a local or remote
@@ -260,19 +284,62 @@ def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Ru
     worktrees folder (worktree_dir), whatever the branch is called. Either way the
     worktree's timeline/ is linked to the main checkout's (link_timeline);
     `note` is added when that link couldn't be made.
+
+    `branch` names the branch to use (one existing_work found, or the
+    workflow's own): its worktree, else a new worktree on it. With `strict`
+    (starting a workflow on a branch you picked) it must exist, name the task
+    and match the task's worktree if there is one; without, it's a preference
+    and the rules above apply when it's gone. `new` (picked at start instead
+    of an old branch) always makes a new `<issue>-<title>` branch from
+    origin/<base>, with `-2`, `-3`, … when that name is taken.
+
+    A task branch checked out in the main checkout is refused
+    (main_checkout_error): the workflow must not work in your own checkout.
     """
     git = _Git(repo, runner)
     if not os.path.isdir(repo["path"]):
         raise WorkSessionError(f"No checkout at {repo['path']}. Fix the path in {CONFIG_NAME}.")
-    existing = find_worktree(git, issue_id)
+    if branch and strict and not mentions(issue_id, branch):
+        raise ValueError(f"Branch {branch} doesn't name #{issue_id}.")
+    existing = find_worktree(git, issue_id, branch)
+    if existing and existing.get("main"):
+        if (branch and strict and existing["branch"] != branch) or new:
+            existing = None  # another branch is in the main checkout; it isn't the one wanted
+        else:
+            raise WorkSessionError(main_checkout_error(repo, existing["branch"]))
+    if existing and new:
+        raise WorkSessionError(f"The task already has a worktree, {existing['path']} on {existing['branch']}. "
+                               "Remove it on the Work tab first to start on a new branch.")
     if existing:
+        if branch and strict and existing["branch"] != branch:
+            raise WorkSessionError(f"The task's worktree {existing['path']} is on {existing['branch'] or 'a detached HEAD'}, "
+                                   f"not {branch}. Pick that branch, or remove the worktree on the Work tab first.")
         return _with_timeline(git, existing)
     prefix = f"{issue_id}-"
 
-    git.run("fetch", "--quiet", "origin", repo["base"], timeout=120)
+    # The base and the task's own branches, so a branch pushed since the last fetch is seen.
+    git.run("fetch", "--quiet", "origin", repo["base"],
+            f"+refs/heads/{prefix}*:refs/remotes/origin/{prefix}*", timeout=120)
     local = git.branches(f"{prefix}*")
     remote = [b for b in git.branches(f"origin/{prefix}*", remote=True) if b.startswith("origin/")]
-    if local:
+    chosen = None
+    if new:
+        name, n = branch_name(issue_id, title), 1
+        while git.branches(name if n == 1 else f"{name}-{n}") or git.branches(
+                f"origin/{name if n == 1 else f'{name}-{n}'}", remote=True):
+            n += 1
+        chosen = (name if n == 1 else f"{name}-{n}", f"origin/{repo['base']}")
+    elif branch:
+        git.run("check-ref-format", "--branch", branch)
+        if git.branches(branch):
+            chosen = (branch, None)
+        elif git.branches(f"origin/{branch}", remote=True):
+            chosen = (branch, f"origin/{branch}")
+        elif strict:
+            raise WorkSessionError(f"There's no branch {branch} here or on origin any more. Check again.")
+    if chosen:
+        branch, start = chosen
+    elif local:
         branch, start = local[0], None
     elif remote:
         branch, start = remote[0][len("origin/"):], remote[0]
@@ -290,6 +357,117 @@ def prepare_worktree(repo: Dict[str, Any], issue_id: str, title: str, runner: Ru
     else:
         git.run("worktree", "add", "--no-track", "-b", branch, path, start)
     return _with_timeline(git, {"path": path, "branch": branch, "created": True})
+
+
+# ---- existing work (the check before a workflow starts) --------------------
+MAX_FOUND = 20
+
+
+def _log_pattern(issue_id: str) -> str:
+    """Commit messages that belong to the task: `TL #<id>`, a PR merge from an `<id>-…` branch, `Merge <id> …`."""
+    return rf"TL ?#?{issue_id}([^0-9]|$)|/{issue_id}-|^Merge {issue_id}([^0-9]|$)"
+
+
+def _ref_exists(git: "_Git", ref: str) -> bool:
+    code, _ = git.run("rev-parse", "--verify", "--quiet", ref + "^{commit}", ok_codes=(0, 1, 128))
+    return code == 0
+
+
+def existing_work(repo: Dict[str, Any], issue_id: str, runner: Runner = _subprocess_runner,
+                  fetch: bool = True, github: bool = True) -> Dict[str, Any]:
+    """
+    What already exists for a task before a workflow starts, read only (apart
+    from `git fetch`): the task's worktree, every local or origin branch whose
+    name has the issue number (commits ahead of origin/<base>, whether it's in
+    qa-release), commits for it already in origin/<base> and origin/qa-release
+    (`_log_pattern`), and GitHub PRs whose branch or title has the number.
+    A failed fetch or `gh` call is reported in `fetch_error` / `pr_error`, never raised.
+    """
+    issue_id = str(issue_id)
+    if not re.fullmatch(r"\d{1,7}", issue_id):
+        raise ValueError("Issue ID must be a number.")
+    git = _Git(repo, runner)
+    if not os.path.isdir(repo["path"]):
+        raise WorkSessionError(f"No checkout at {repo['path']}. Fix the path in {CONFIG_NAME}.")
+    found: Dict[str, Any] = {"repo": repo["name"], "base": repo["base"], "fetched": False, "fetch_error": None,
+                             "worktree": None, "main_checkout": None, "branches": [], "commits": [], "prs": [],
+                             "pr_error": None}
+    if fetch:
+        try:
+            git.run("fetch", "--quiet", "--prune", "origin", timeout=120)
+            found["fetched"] = True
+        except (WorkSessionError, ReleaseCheckError) as exc:
+            found["fetch_error"] = str(exc)
+    tree = find_worktree(git, issue_id)
+    if tree and tree.get("main"):
+        found["main_checkout"] = {"path": tree["path"], "branch": tree["branch"]}
+    else:
+        found["worktree"] = tree
+    main = os.path.realpath(repo["path"])
+    trees = {wt.get("branch"): wt["path"] for wt in git.worktrees() if wt.get("branch")}
+    base_ref = f"origin/{repo['base']}"
+    has_base = _ref_exists(git, base_ref)
+    qa_ref = "origin/qa-release" if repo["base"] != "qa-release" and _ref_exists(git, "origin/qa-release") else None
+
+    _, out = git.run("for-each-ref", "--sort=-committerdate",
+                     "--format=%(refname)%09%(committerdate:iso-strict)%09%(subject)", "refs/heads", "refs/remotes/origin")
+    branches: Dict[str, Dict[str, Any]] = {}
+    for line in out.splitlines():
+        ref, _, rest = line.partition("\t")
+        date, _, subject = rest.partition("\t")
+        if ref.startswith("refs/heads/"):
+            name, side = ref[len("refs/heads/"):], "local"
+        else:
+            name, side = ref[len("refs/remotes/origin/"):], "remote"
+        if name == "HEAD" or name in (repo["base"], "qa-release") or not mentions(issue_id, name):
+            continue
+        tree_path = trees.get(name)
+        item = branches.setdefault(name, {"name": name, "local": False, "remote": False, "last_commit": date,
+                                          "subject": subject, "worktree": tree_path,
+                                          "in_main": bool(tree_path) and os.path.realpath(tree_path) == main})
+        item[side] = True
+    for item in list(branches.values())[:MAX_FOUND]:
+        ref = item["name"] if item["local"] else f"origin/{item['name']}"
+        if has_base:
+            _, counts = git.run("rev-list", "--left-right", "--count", f"{ref}...{base_ref}")
+            ahead, _, behind = counts.strip().partition("\t")
+            item["ahead"], item["behind"] = int(ahead or 0), int(behind or 0)
+        else:
+            item["ahead"] = item["behind"] = None
+        if qa_ref:
+            code, _ = git.run("merge-base", "--is-ancestor", ref, qa_ref, ok_codes=(0, 1))
+            item["in_qa"] = code == 0
+        else:
+            item["in_qa"] = None
+        found["branches"].append(item)
+
+    seen = set()
+    for ref in [r for r in (base_ref if has_base else None, qa_ref) if r]:
+        _, out = git.run("log", "-E", "-i", f"--grep={_log_pattern(issue_id)}", f"-n{MAX_FOUND}",
+                         "--format=%h%x09%cI%x09%s", ref)
+        for line in out.splitlines():
+            sha, _, rest = line.partition("\t")
+            date, _, subject = rest.partition("\t")
+            if sha and sha not in seen:
+                seen.add(sha)
+                found["commits"].append({"ref": ref[len("origin/"):], "sha": sha, "date": date, "subject": subject})
+
+    if github:
+        try:
+            code, out, err = runner(("gh", "pr", "list", "--state", "all", "--search", issue_id, "--limit", "30",
+                                     "--json", "number,title,state,isDraft,headRefName,baseRefName,url,updatedAt"),
+                                    repo["path"], 60)
+            if code != 0:
+                detail = (err or out).strip().splitlines()
+                found["pr_error"] = f"`gh pr list` failed: {detail[-1] if detail else f'exit {code}'}"
+            else:
+                for pr in json.loads(out or "[]"):
+                    if mentions(issue_id, pr.get("headRefName", "")) or mentions(issue_id, pr.get("title", "")):
+                        found["prs"].append({k: pr.get(k) for k in ("number", "title", "state", "isDraft", "headRefName",
+                                                                    "baseRefName", "url", "updatedAt")})
+        except (ReleaseCheckError, ValueError) as exc:
+            found["pr_error"] = str(exc)
+    return found
 
 
 def _popen_launcher(args: List[str], env: Dict[str, str]) -> None:
@@ -362,7 +540,8 @@ def launch_env(config: Dict[str, Any]) -> Dict[str, str]:
 
 
 def worktree_for(config: Dict[str, Any], code: str, issue_id: str, title: str,
-                 runner: Runner = _subprocess_runner) -> Dict[str, Any]:
+                 runner: Runner = _subprocess_runner, branch: Optional[str] = None,
+                 strict: bool = False, new: bool = False) -> Dict[str, Any]:
     """The task's worktree on board `code`'s repo (see prepare_worktree), under the lock."""
     if not re.fullmatch(r"\d{1,7}", str(issue_id)):
         raise ValueError("Issue ID must be a number.")
@@ -370,7 +549,7 @@ def worktree_for(config: Dict[str, Any], code: str, issue_id: str, title: str,
     if not repo:
         raise ValueError(f"Board {code} has no repo. Add it to {CONFIG_NAME}.")
     with _lock:
-        return {**prepare_worktree(repo, str(issue_id), title, runner), "repo": repo["name"]}
+        return {**prepare_worktree(repo, str(issue_id), title, runner, branch, strict, new), "repo": repo["name"]}
 
 
 # ---- listing and removal ---------------------------------------------------

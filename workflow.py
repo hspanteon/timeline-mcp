@@ -792,11 +792,38 @@ def _public_finding(f: Dict[str, Any], wf: Optional[Dict[str, Any]], open_run: O
 
 
 # ---- what can happen next --------------------------------------------------
-def propose_start(stages: Optional[Dict[str, str]], has_analysis: bool) -> Dict[str, str]:
-    """Where a new workflow should start, from Timeline's stages and the task docs, with the reason."""
+def propose_start(stages: Optional[Dict[str, str]], has_analysis: bool,
+                  existing: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+    """
+    Where a new workflow should start, from Timeline's stages and the task
+    docs, with the reason; with `existing` (work_session.existing_work), work
+    already in git or GitHub moves a Develop or Review suggestion on: commits
+    in qa-release → Waiting on QA, an open PR → Review.
+    """
+    proposal = _propose_from_stages(stages, has_analysis)
+    if not existing or not has_analysis or proposal["step"] not in ("develop", "review"):
+        return proposal
+    in_qa = [c for c in existing.get("commits", []) if c["ref"] == "qa-release"]
+    branch_in_qa = [b for b in existing.get("branches", []) if b.get("in_qa") and b.get("ahead")]
+    if in_qa or branch_in_qa:
+        what = (f"{len(in_qa)} commit{'s' if len(in_qa) != 1 else ''} for the task are" if in_qa
+                else f"Branch {branch_in_qa[0]['name']} is")
+        return {"step": "qa", "reason": f"{what} already in qa-release." + _blocked_note(stages)}
+    open_prs = [p for p in existing.get("prs", []) if p.get("state") == "OPEN"]
+    if proposal["step"] == "develop" and open_prs:
+        return {"step": "review", "reason": f"PR #{open_prs[0]['number']} is open for this task, so review it."
+                + _blocked_note(stages)}
+    return proposal
+
+
+def _blocked_note(stages: Optional[Dict[str, str]]) -> str:
+    blocked = [name for name, progress in (stages or {}).items() if progress == "blocked"]
+    return f" Timeline shows {', '.join(blocked)} blocked." if blocked else ""
+
+
+def _propose_from_stages(stages: Optional[Dict[str, str]], has_analysis: bool) -> Dict[str, str]:
     s = stages or {}
-    blocked = [name for name, progress in s.items() if progress == "blocked"]
-    note = f" Timeline shows {', '.join(blocked)} blocked." if blocked else ""
+    note = _blocked_note(stages)
     if not has_analysis:
         return {"step": "intake", "reason": "There's no analysis.md yet, and every later step needs it." + note}
     if s.get("Live") in ("in progress", "done"):
@@ -808,6 +835,96 @@ def propose_start(stages: Optional[Dict[str, str]], has_analysis: bool) -> Dict[
     if s.get("Development") == "done":
         return {"step": "review", "reason": "Development is done in Timeline; review it before releasing to QA." + note}
     return {"step": "develop", "reason": "analysis.md exists and development hasn't finished." + note}
+
+
+def start_check(issue: Any, code: Any, config: Dict[str, Any], stages: Optional[Dict[str, str]] = None,
+                runner: Runner = _subprocess_runner, fetch: bool = True, github: bool = True) -> Dict[str, Any]:
+    """
+    The check before a workflow starts: what already exists for the task
+    (work_session.existing_work), the warnings to show, the suggested first
+    step with that in mind, and the branch choice for Start. `branch_choice`:
+    `options` (each found branch, see _branch_option, plus "" = a new branch),
+    `default` (None when you have to pick), `locked` when the task already has
+    a worktree (its branch is the one).
+    """
+    issue = _issue(issue)
+    repo = config["repos"].get(str(code)) if code else None
+    if not repo:
+        raise ValueError(f"Board {code} has no repo. Add it to {work_session.CONFIG_NAME}.")
+    found = work_session.existing_work(repo, issue, runner, fetch=fetch, github=github)
+    has_analysis = any(d["name"] == "analysis.md" for d in list_docs(repo, issue))
+    base = repo["base"]
+    warnings = []
+    if found["fetch_error"]:
+        warnings.append(f"Couldn't fetch origin, so branches and commits may be out of date: {found['fetch_error']}")
+    tree = found["worktree"]
+    if found["main_checkout"]:
+        warnings.append(work_session.main_checkout_error(repo, found["main_checkout"]["branch"]))
+    if tree:
+        warnings.append(f"The task already has a worktree, {tree['path']} on {tree['branch'] or 'a detached HEAD'}. "
+                        "The workflow will use it.")
+    working = [b for b in found["branches"] if b.get("ahead")]
+    if not tree and len(working) > 1:
+        warnings.append(f"{len(working)} branches with commits name #{issue}. Pick the one to work on.")
+    for pr in found["prs"]:
+        if pr["state"] == "OPEN":
+            warnings.append(f"PR #{pr['number']}{' (draft)' if pr.get('isDraft') else ''} {pr['headRefName']} → "
+                            f"{pr['baseRefName']} is open: {pr['title']}")
+    in_base = [c for c in found["commits"] if c["ref"] == base]
+    if in_base:
+        warnings.append(f"{len(in_base)} commit{'s are' if len(in_base) != 1 else ' is'} for #{issue} already in {base} "
+                        f"(newest: {in_base[0]['subject']}). Check that the task needs new work.")
+    if found["pr_error"]:
+        warnings.append(f"Couldn't list PRs: {found['pr_error']}")
+
+    options = [_branch_option(b, repo) for b in found["branches"]]
+    options.append({"branch": "", "new": True, "label": f"New branch {issue}-… from origin/{base}"})
+    if tree:
+        default, locked = tree["branch"], True
+        if not any(o["branch"] == default for o in options):
+            options.insert(0, {"branch": default, "label": f"{default} (the task's worktree)"})
+    else:
+        locked = False
+        pr_heads = [p["headRefName"] for p in found["prs"] if p["state"] == "OPEN"]
+        names = [b["name"] for b in found["branches"]]
+        if len(working) > 1:
+            default = None
+        elif working:
+            default = working[0]["name"]
+        elif any(h in names for h in pr_heads):
+            default = next(h for h in pr_heads if h in names)
+        else:
+            # Only old branches (nothing of their own): a new one from current code.
+            default = ""
+    return {**found, "warnings": warnings, "proposal": propose_start(stages, has_analysis, found),
+            "branch_choice": {"options": options, "default": default, "locked": locked}}
+
+
+def _branch_option(branch: Dict[str, Any], repo: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    One branch in the Start card's picker: its label, `blocked` (Start refuses
+    it: checked out in the main checkout) and `warning` (behind the base, so a
+    step would work on old code).
+    """
+    base = repo["base"]
+    where = "local and origin" if branch["local"] and branch["remote"] else ("local" if branch["local"] else "origin")
+    ahead, behind = branch.get("ahead"), branch.get("behind")
+    commits = (f"{ahead} commit{'s' if ahead != 1 else ''} beyond {base}" if ahead
+               else f"nothing beyond {base}" if ahead == 0 else "")
+    extra = [where, commits, f"{behind} behind" if behind else "",
+             "in qa-release" if branch.get("in_qa") and ahead else "",
+             "in your main checkout" if branch.get("in_main") else "has a worktree" if branch.get("worktree") else ""]
+    option: Dict[str, Any] = {"branch": branch["name"], "label": f"{branch['name']} ({', '.join(x for x in extra if x)})"}
+    if branch.get("in_main"):
+        option["blocked"] = work_session.main_checkout_error(repo, branch["name"])
+    if behind:
+        s = "s" if behind != 1 else ""
+        option["warning"] = (
+            f"{branch['name']} is {behind} commit{s} behind origin/{base}"
+            + (" and has nothing of its own: it's an old, merged branch. A new branch from current code may be better."
+               if ahead == 0 else
+               f". Steps work on it as it is; merge or rebase origin/{base} in the worktree first if the task needs current code."))
+    return option
 
 
 def _gate(step: Dict[str, Any], has_analysis: bool, issue: str, findings: Optional[List[Dict[str, Any]]] = None) -> Optional[str]:
@@ -1083,11 +1200,15 @@ def list_workflows(base_dir: Optional[str] = None, me: Optional[str] = None) -> 
 # ---- changes ---------------------------------------------------------------
 def start_workflow(issue: Any, code: Any, step: str, title: str, config: Dict[str, Any],
                    base_dir: Optional[str] = None, runner: Runner = _subprocess_runner,
-                   now: Optional[datetime] = None) -> Dict[str, Any]:
+                   now: Optional[datetime] = None, branch: Optional[str] = None,
+                   new_branch: bool = False) -> Dict[str, Any]:
     """
     Starts tracking a task: makes (or reuses) its worktree and puts the
     workflow at `step`. Steps before it are recorded as skipped, with that
     reason. A done or stopped workflow can be started again; its history stays.
+    `branch` is the existing branch picked after start_check (None: the usual
+    `<id>-…` rules in work_session.prepare_worktree); `new_branch` makes a new
+    branch from the base even when old ones exist.
     """
     issue = _issue(issue)
     if step not in STEPS:
@@ -1104,7 +1225,8 @@ def start_workflow(issue: Any, code: Any, step: str, title: str, config: Dict[st
             existing = _workflow(conn, issue)
             if existing and existing["state"] == "active":
                 raise ValueError(f"#{issue} already has a workflow, at {STEPS[existing['step']]['title']}.")
-            tree = work_session.worktree_for(config, str(code), issue, title, runner)
+            tree = work_session.worktree_for(config, str(code), issue, title, runner,
+                                             branch=branch or None, strict=bool(branch), new=new_branch)
             stamp = _now(now)
             floors = _floors(conn, issue, now)
             conn.execute(
@@ -1206,7 +1328,7 @@ def run_step(issue: Any, config: Dict[str, Any], base_dir: Optional[str] = None,
             blocked = [name for name, progress in (stages or {}).items() if progress == "blocked"]
             if step.get("checks_blocked") and blocked:
                 raise ValueError(f"Timeline shows {', '.join(blocked)} blocked. Sort that out in Timeline first.")
-            tree = work_session.worktree_for(config, wf["code"], issue, wf["title"], runner)
+            tree = work_session.worktree_for(config, wf["code"], issue, wf["title"], runner, branch=wf["branch"] or None)
             session = str(uuid.uuid4())
             cur = conn.execute(
                 "INSERT INTO workflow_runs (issue_number, step, session_id, cwd, prompt, started_at, finding_id) "

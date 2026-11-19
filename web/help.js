@@ -22,7 +22,7 @@ const HELP = {
     ["Watch", "Tell the desk to copy a task's full history (comments, status changes, commits …) into its database. Only watched tasks appear on the Timeline page. Tasks with a workflow are watched automatically."],
     ["Snapshot", "A saved copy of your planner at one moment. The Changes page compares snapshots."],
     ["Heartbeat", "The short background check that runs every few minutes. See Background checks."],
-    ["Worktree", "A separate checkout of a repository for one task, so work on a task never disturbs your main checkout. Created as <worktrees folder>/<repo>-<issue>, on a branch named <issue>-<task title>."],
+    ["Worktree", "A separate checkout of a repository for one task, so work on a task never disturbs your main checkout. Created as <worktrees folder>/<repo>-<issue>, on a branch named <issue>-<task title>, or on an existing branch for the task you pick when the workflow starts."],
     ["Workflow", "The fixed route a task follows in the desk: intake, estimate, develop, self-review, release to QA, QA, fix QA findings, release to production, close."],
     ["Run", "One Claude Code session started by a workflow step, in a terminal, in the task's worktree."],
     ["Finding", "One point QA raised that needs a fix. The Fix QA step handles one finding per run."],
@@ -55,6 +55,7 @@ const HELP = {
         ["Stage bars", "live", "Timeline, per task, when the page opens."],
         ["Deadline, period, support chips", "cache", "The same in-memory planner copy as the Planner page."],
         ["What a terminal run is doing", "git", "Claude Code's session log on this computer; no Timeline call."],
+        ["Existing branches, PRs and commits (Start card)", "git", "git fetch and git on this computer, and gh pr list, when the Start card opens (kept 2 minutes)."],
       ],
       use: [
         "Pick a workflow on the left; its panel opens on the right. The panel is the same as on the task's own page.",
@@ -66,6 +67,7 @@ const HELP = {
       know: [
         "Runs are normal Claude Code sessions. Claude's own permission prompts in the terminal are the only approvals; the page never approves anything for it.",
         "If you close the terminal without finishing, the desk notices when no process carries the session any more, and shows the run as ended without a result.",
+        "Before a workflow starts, the Start card checks for work that already exists: it fetches origin, then lists the task's worktree, every branch with the issue number in its name, open or merged PRs (gh) and commits for the task already in the base branch or qa-release. Warnings show above Start, the suggested step takes them into account, and when several branches have commits you pick the one to work on. A branch behind the base branch says by how much; an old, merged branch suggests a new branch from current code. A task branch checked out in your main checkout can't be used: switch the main checkout to another branch first. The result is kept for 2 minutes; Check again repeats it.",
       ] },
     { key: "changes", title: "Changes", sources: ["db"],
       purpose: "What changed in your planner: tasks that are new, left, moved between periods, or changed deadline or stage.",
